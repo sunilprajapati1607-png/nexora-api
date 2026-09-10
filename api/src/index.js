@@ -1,0 +1,115 @@
+/**
+ * Nexora — licence, trial and costing service
+ * ======================================================================
+ * One Neon Function serving three audiences:
+ *
+ *   the app        /v1/activate  /v1/heartbeat  /v1/bom
+ *   the owner      /admin  (a page)  + /admin/api/*
+ *   anyone         /health
+ *
+ * Every protected route re-reads the licence row. A token proves WHO is
+ * asking; only the row — and the server's own clock — decides what they
+ * may do. That is the difference between a trial you can move the PC's
+ * date past and one you cannot.
+ */
+import { ensureSchema } from './db.js';
+import { activate, authorise, touch, issueToken } from './licence.js';
+import { runBom } from './engine.js';
+import { adminAuthorised, listLicences, licenceAction, saveSettings, recentEvents, ADMIN_HTML } from './admin.js';
+
+const CORS = {
+  'access-control-allow-origin': '*',
+  'access-control-allow-headers': 'authorization, content-type, x-admin-key',
+  'access-control-allow-methods': 'GET, POST, OPTIONS'
+};
+
+function json(body, status) {
+  return new Response(JSON.stringify(body), {
+    status: status || 200,
+    headers: Object.assign({ 'content-type': 'application/json; charset=utf-8' }, CORS)
+  });
+}
+async function readJson(request) {
+  try { return await request.json(); } catch (e) { return {}; }
+}
+
+export default {
+  async fetch(request) {
+    const url = new URL(request.url);
+    const path = url.pathname.replace(/\/+$/, '') || '/';
+    const method = request.method.toUpperCase();
+
+    if (method === 'OPTIONS') return new Response(null, { status: 204, headers: CORS });
+
+    try {
+      /* ---- open ---------------------------------------------------- */
+      if (path === '/health' || path === '/') {
+        await ensureSchema();
+        return json({ ok: true, service: 'nexora-api', version: '1.0.0', time: new Date().toISOString() });
+      }
+
+      /* ---- the app ------------------------------------------------- */
+      if (path === '/v1/activate' && method === 'POST') {
+        await ensureSchema();
+        const body = await readJson(request);
+        const out = await activate(body);
+        return json(out.body, out.httpStatus);
+      }
+
+      if (path === '/v1/heartbeat' && method === 'POST') {
+        await ensureSchema();
+        const a = await authorise(request);
+        if (!a.ok) return json(a.error, a.httpStatus);
+        const body = await readJson(request);
+        await touch(a.row.device_id, body.appVersion);
+        return json({ token: issueToken(a.row), licence: a.licence });
+      }
+
+      if (path === '/v1/bom' && method === 'POST') {
+        await ensureSchema();
+        const a = await authorise(request);
+        if (!a.ok) return json(a.error, a.httpStatus);
+
+        /* THE GATE. 402 Payment Required is the honest status here, and
+           the client shows the licence message rather than an error. */
+        if (!a.licence.canCalculate) {
+          return json({ error: 'LICENCE_REQUIRED', licence: a.licence, message: a.licence.message }, 402);
+        }
+
+        const payload = await readJson(request);
+        let out;
+        try {
+          out = runBom(payload);
+        } catch (e) {
+          return json({ error: 'ENGINE_ERROR',
+            message: 'The route could not be costed. ' + (e && e.message ? e.message : '') }, 400);
+        }
+        return json({ licence: a.licence, ...out });
+      }
+
+      /* ---- the owner ----------------------------------------------- */
+      if (path === '/admin') {
+        return new Response(ADMIN_HTML, { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } });
+      }
+      if (path.startsWith('/admin/api/')) {
+        await ensureSchema();
+        if (!adminAuthorised(request)) return json({ error: 'UNAUTHORISED' }, 401);
+
+        if (path === '/admin/api/licences' && method === 'GET') return json(await listLicences());
+        if (path === '/admin/api/licence' && method === 'POST') return json(await licenceAction(await readJson(request)));
+        if (path === '/admin/api/settings' && method === 'POST') return json(await saveSettings(await readJson(request)));
+        if (path === '/admin/api/events' && method === 'GET') return json({ events: await recentEvents(url.searchParams.get('deviceId')) });
+        return json({ error: 'NOT_FOUND' }, 404);
+      }
+
+      return json({ error: 'NOT_FOUND', path }, 404);
+    } catch (e) {
+      /* Rule #35: an error a person can read, and never a bare 500. */
+      return json({
+        error: 'SERVER_ERROR',
+        message: 'The licence service could not complete that request. Your work is safe on this computer; try again shortly.',
+        detail: (e && e.message) ? String(e.message).slice(0, 300) : undefined
+      }, 500);
+    }
+  }
+};

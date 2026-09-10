@@ -1,0 +1,14 @@
+{
+  "name": "nexora-api",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Nexora — licence, trial clock and costing-engine service",
+  "main": "server.js",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node server.js",
+    "test": "node local-test.mjs",
+    "build:function": "esbuild src/index.js --bundle --platform=node --format=esm --target=node22 --minify --legal-comments=none --outfile=build/index.js"
+  }
+}
