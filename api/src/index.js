@@ -13,9 +13,9 @@
  * date past and one you cannot.
  */
 import { ensureSchema } from './db.js';
-import { activate, authorise, touch, issueToken } from './licence.js';
+import { activate, authorise, touch, issueToken, reportUsage, companyUsage, describe } from './licence.js';
 import { runBom } from './engine.js';
-import { adminAuthorised, listLicences, licenceAction, saveSettings, recentEvents, ADMIN_HTML } from './admin.js';
+import { adminAuthorised, listLicences, licenceAction, companyAction, saveSettings, recentEvents, ADMIN_HTML } from './admin.js';
 
 const CORS = {
   'access-control-allow-origin': '*',
@@ -62,7 +62,22 @@ export default {
         if (!a.ok) return json(a.error, a.httpStatus);
         const body = await readJson(request);
         await touch(a.row.device_id, body.appVersion);
-        return json({ token: issueToken(a.row), licence: a.licence });
+
+        /* 4.3.0 — the heartbeat is where a machine reports what it has
+           committed. Counts only: no calculation, material or price ever
+           leaves the plant.
+
+           The licence is then RE-DESCRIBED against the figures just
+           written, so a machine that reaches its limit is told on the
+           same call rather than being allowed one more transaction than
+           it is entitled to. */
+        if (body.usage) {
+          await reportUsage(a.row.device_id, body.usage);
+          const fresh = await companyUsage(a.row.company_id || null);
+          const lic = describe(a.row, a.company, a.settings, fresh);
+          return json({ token: issueToken(a.row), licence: lic, usage: fresh });
+        }
+        return json({ token: issueToken(a.row), licence: a.licence, usage: a.usage });
       }
 
       if (path === '/v1/bom' && method === 'POST') {
@@ -97,6 +112,7 @@ export default {
 
         if (path === '/admin/api/licences' && method === 'GET') return json(await listLicences());
         if (path === '/admin/api/licence' && method === 'POST') return json(await licenceAction(await readJson(request)));
+        if (path === '/admin/api/company' && method === 'POST') return json(await companyAction(await readJson(request)));
         if (path === '/admin/api/settings' && method === 'POST') return json(await saveSettings(await readJson(request)));
         if (path === '/admin/api/events' && method === 'GET') return json({ events: await recentEvents(url.searchParams.get('deviceId')) });
         return json({ error: 'NOT_FOUND' }, 404);

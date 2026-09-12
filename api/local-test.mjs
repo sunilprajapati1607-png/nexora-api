@@ -31,6 +31,17 @@ console.log('HEALTH / schema bootstrap');
 let r = await call('/health');
 ok('health ok, schema created on demand', r.status === 200 && r.body.ok, r.body);
 
+/* This suite ends by revoking DEV and leaving trial_days at 14 — both
+   deliberate. Running it twice, or after company-test.mjs, therefore used
+   to fail on leftovers rather than on anything real. Start clean, so the
+   order the suites are run in never changes the answer. */
+{
+  const { q: q0 } = await import('./src/db.js');
+  await q0(`TRUNCATE licences, companies, activation_log RESTART IDENTITY CASCADE`);
+  await call('/admin/api/settings', { method: 'POST', headers: AK,
+    body: { trialDays: 7, demoGraceDays: 0, sessionMinutes: 30, expiredMode: 'READONLY', signupsOpen: true } });
+}
+
 console.log('\nACTIVATION');
 r = await call('/v1/activate', { method: 'POST', headers: J,
   body: { deviceId: DEV, deviceName: 'SUNIL-SAP', company: 'Nexora Demo Plant', email: 'a@b.com', appVersion: '1.4.0' } });
@@ -95,10 +106,20 @@ ok('carries settings', r.body.settings.trialDays === 7 && r.body.settings.expire
 
 console.log('\nEXPIRY — the whole point');
 const { q } = await import('./src/db.js');
-await q(`UPDATE licences SET expires_at = now() - interval '1 hour' WHERE device_id=$1`, [DEV]);
+
+/* 4.0.0 — THE COMPANY OWNS THE CLOCK. Backdating the device row must now
+   change nothing at all: two clocks that can disagree is precisely what
+   the company table exists to remove, so it is asserted rather than
+   assumed. */
+await q(`UPDATE licences SET expires_at = now() - interval '400 days' WHERE device_id=$1`, [DEV]);
 r = await call('/v1/bom', { method: 'POST', headers: { ...J, authorization: 'Bearer ' + TOKEN }, body: payload });
-ok('*** an expired trial cannot calculate -> 402 ***', r.status === 402, r.status);
-ok('and says why, readably', /trial has ended/i.test(r.body.message || ''), r.body.message);
+ok('*** the device row no longer carries a clock of its own ***', r.status === 200, r.status);
+
+await q(`UPDATE companies SET expires_at = now() - interval '1 hour'
+          WHERE id = (SELECT company_id FROM licences WHERE device_id=$1)`, [DEV]);
+r = await call('/v1/bom', { method: 'POST', headers: { ...J, authorization: 'Bearer ' + TOKEN }, body: payload });
+ok('*** an expired demo cannot calculate -> 402 ***', r.status === 402, r.status);
+ok('and says why, readably', /demo has ended/i.test(r.body.message || ''), r.body.message);
 ok('and reports READONLY mode', r.body.licence.mode === 'READONLY', r.body.licence);
 
 console.log('\nTHE OWNER CAN FIX IT');
