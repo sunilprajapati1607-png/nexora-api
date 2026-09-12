@@ -77,7 +77,18 @@ export function runBom(payload) {
     reconcile = BomReconcile.build({
       result, groupOf, nameOf,
       components: Array.isArray(p.components) ? p.components : [],
-      bags: p.bags
+      /* The bag count the reconciliation reports against is the one the
+         ROLL-UP actually costed — result.totals.bags — not the order
+         quantity that was sent in.
+
+         These are the same number on the ORDER basis, which is why the
+         local-vs-server equivalence check passed: it only ever exercised
+         that basis. On any other basis (a typed bag count, or finished
+         kilograms) they diverge, and the costed card then showed the
+         right TOTAL divided by the wrong bag count. Reported from a live
+         screen: header Rs 9.334/bag over 18,378 basis bags, costed card
+         Rs 1.715 over the 100,000-bag order. */
+      bags: result.totals.bags
     });
   }
 

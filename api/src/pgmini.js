@@ -166,7 +166,27 @@ function parseError(body) {
 }
 
 function parseUrl(url) {
-  const u = new URL(url);
+  /* A missing DATABASE_URL used to surface to the user as the bare
+     message "Invalid URL" from the URL constructor, which says nothing
+     about what is actually wrong. Name the real problem instead. */
+  if (typeof url !== 'string' || url.trim() === '') {
+    const e = new Error('The database connection string is not configured on this server (DATABASE_URL is empty).');
+    e.code = 'DATABASE_URL_MISSING';
+    throw e;
+  }
+  let u;
+  try {
+    u = new URL(url);
+  } catch (_) {
+    const e = new Error('The database connection string is not a valid postgres:// URL.');
+    e.code = 'DATABASE_URL_INVALID';
+    throw e;
+  }
+  if (!/^postgres(ql)?:$/.test(u.protocol)) {
+    const e = new Error('The database connection string must begin with postgres:// or postgresql:// (found "' + u.protocol + '//").');
+    e.code = 'DATABASE_URL_INVALID';
+    throw e;
+  }
   return {
     host: u.hostname,
     port: u.port ? Number(u.port) : 5432,
