@@ -130,6 +130,47 @@ export function ensureSchema() {
     await q(`ALTER TABLE licences ADD COLUMN IF NOT EXISTS usage_base INTEGER NOT NULL DEFAULT 0`);
     await q(`ALTER TABLE licences ADD COLUMN IF NOT EXISTS usage_reset_at TIMESTAMPTZ`);
 
+    /* ---- 4.8.0 — COMPANY USERS AND COMPANY-WIDE SYNC -----------------
+       A person signs in on any seat of their company with name + PIN. The
+       company is the seat's company (licences.company_id), never typed.
+       role ADMIN manages users; scope ALL sees every calculation, OWN
+       sees only their own. See sync.js. */
+    await q(`
+      CREATE TABLE IF NOT EXISTS company_users (
+        id            BIGSERIAL PRIMARY KEY,
+        company_id    BIGINT NOT NULL,
+        name          TEXT NOT NULL,
+        name_key      TEXT NOT NULL,
+        pin_hash      TEXT NOT NULL,
+        role          TEXT NOT NULL DEFAULT 'USER',
+        scope         TEXT NOT NULL DEFAULT 'OWN',
+        permissions   JSONB,
+        active        BOOLEAN NOT NULL DEFAULT true,
+        created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+        last_login_at TIMESTAMPTZ,
+        UNIQUE (company_id, name_key)
+      )`);
+    /* One row per synced record. kind master|calc|bom; id is the storage
+       key for a master, the calculation id otherwise. seq is taken fresh
+       on EVERY write (see the upsert in sync.js), so "everything since
+       seq N" is exact and cheap. Full bodies as JSONB — the owner chose to
+       store whole calculations, trace included. */
+    await q(`
+      CREATE TABLE IF NOT EXISTS sync_records (
+        seq        BIGSERIAL PRIMARY KEY,
+        company_id BIGINT NOT NULL,
+        kind       TEXT NOT NULL,
+        id         TEXT NOT NULL,
+        body       JSONB,
+        owner_id   BIGINT,
+        deleted    BOOLEAN NOT NULL DEFAULT false,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_by BIGINT,
+        UNIQUE (company_id, kind, id)
+      )`);
+    await q(`CREATE INDEX IF NOT EXISTS sync_records_company_seq_idx ON sync_records (company_id, seq)`);
+    await q(`CREATE INDEX IF NOT EXISTS sync_records_calcnumber_idx ON sync_records (company_id, (body->>'calcNumber')) WHERE kind = 'calc'`);
+
     /* Defaults, written once. ON CONFLICT DO NOTHING means an operator's
        later change is never overwritten by a cold start. */
     await q(`INSERT INTO settings (key, value) VALUES

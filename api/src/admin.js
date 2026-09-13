@@ -13,6 +13,7 @@
  */
 import { q, getSettings, logEvent } from './db.js';
 import { newLicenceKey } from './licence.js';
+import { ensureAdmin, usersSummary } from './sync.js';
 
 const ADMIN_KEY = process.env.NEXORA_ADMIN_KEY || '';
 
@@ -53,7 +54,7 @@ export async function listLicences() {
    extended, suspended and restored together and can never drift apart. */
 
 export async function listCompanies() {
-  return q(`
+  const rows = await q(`
     SELECT c.id, c.name, c.licence_key, c.email, c.phone, c.state, c.seats, c.gstin,
            c.grace_days, c.is_demo, c.expires_at, c.created_at, c.notes, c.txn_limit,
            GREATEST(0, CEIL(EXTRACT(EPOCH FROM (c.expires_at - now())) / 86400.0))::int AS days_left,
@@ -69,6 +70,13 @@ export async function listCompanies() {
       FROM companies c
      ORDER BY c.is_demo ASC, c.created_at DESC
      LIMIT 500`);
+  /* 4.8.0 — who can sign in on this company's seats. */
+  for (const c of rows) {
+    const u = await usersSummary(c.id);
+    c.users_count = u.count;
+    c.admin_names = u.admins;
+  }
+  return rows;
 }
 
 export async function companyAction(body) {
@@ -189,6 +197,16 @@ export async function companyAction(body) {
                 SET txn_base = txn_count, usage_base = usage_minutes, usage_reset_at = now()
               WHERE company_id = $1`, [id]);
     await logEvent(null, 'ADMIN_COMPANY_RESETUSAGE', { id });
+
+  } else if (action === 'adminuser') {
+    /* 4.8.0 — the owner creates (or resets the PIN of) the company's
+       administrator. Everything else about users happens inside the
+       application, by that administrator. */
+    const out = await ensureAdmin(id, { name: body.name, pin: body.pin });
+    if (out.error) return { error: out.error };
+    return { ok: true, user: out.user, warning: out.reset
+      ? 'The PIN for ' + out.user.name + ' was reset and they are the administrator.'
+      : out.user.name + ' can now sign in as the administrator on any of this company\'s seats.' };
 
   } else if (action === 'note') {
     await q(`UPDATE companies SET notes = $2 WHERE id = $1`, [id, String(body.notes || '')]);
@@ -391,7 +409,7 @@ code{font:12px ui-monospace,Menlo,Consolas,monospace;color:var(--muted)}
       <div id="coMsg"></div>
       <div style="overflow-x:auto"><table id="cotbl">
         <thead><tr><th>Company</th><th>Licence key</th><th>State</th><th>Seats</th><th>Days left</th>
-        <th>Offline</th><th>Transactions</th><th>Hours</th><th>Actions</th></tr></thead><tbody></tbody></table></div>
+        <th>Offline</th><th>Transactions</th><th>Hours</th><th>Users</th><th>Actions</th></tr></thead><tbody></tbody></table></div>
       <div class="sub" style="margin:10px 0 0;font-size:12px">
         <b>Transactions</b> are committed records — a calculation saved, a revision raised, a BOM saved — summed over the
         company's machines; <b>Hours</b> is time the application was actually in use. <b>Limit</b> sets how many
@@ -469,8 +487,10 @@ function renderCompanies(){
       '<td>'+(c.grace_days>0?c.grace_days+' d':'<span title="Stops as soon as it cannot reach the service">none</span>')+'</td>'+
       '<td>'+txnCell(c.txn_used,c.txn_limit)+'</td>'+
       '<td>'+hoursText(c.usage_minutes)+'</td>'+
+      '<td>'+usersCell(c)+'</td>'+
       '<td><div class="tools">'+
         '<button onclick="coDays('+c.id+')">Days…</button>'+
+        '<button onclick="coAdmin('+c.id+',\''+esc(c.name).replace(/'/g,'')+'\')">Admin user…</button>'+
         '<button onclick="coAct('+c.id+',\\'extend\\',365)">+1 yr</button>'+
         (c.is_demo?'<button class="primary" onclick="coAct('+c.id+',\\'licence\\',365)">Make licensed</button>':'')+
         '<button onclick="coSeats('+c.id+','+seats+')">Seats</button>'+
@@ -481,7 +501,25 @@ function renderCompanies(){
           ?'<button onclick="coAct('+c.id+',\\'restore\\',0)">Restore</button>'
           :'<button onclick="coAct('+c.id+',\\'suspend\\',0)">Suspend</button>')+
       '</div></td></tr>';
-  }).join('')||'<tr><td colspan="9" style="color:var(--muted)">No companies yet. Every demo creates one automatically.</td></tr>';
+  }).join('')||'<tr><td colspan="10" style="color:var(--muted)">No companies yet. Every demo creates one automatically.</td></tr>';
+}
+/* 4.8.0 — who can sign in on this company's seats. The owner creates the
+   first administrator here; that person adds everyone else from inside
+   the application (Settings → Users & Access). */
+function usersCell(c){
+  const n=+c.users_count||0;
+  if(!n)return '<span style="color:var(--warn)">none yet</span><br><span style="color:var(--muted);font-size:11px">Admin user… creates the first</span>';
+  return '<b>'+n+'</b>'+(c.admin_names?'<br><span style="color:var(--muted);font-size:11px">admin: '+esc(c.admin_names)+'</span>':'<br><span style="color:var(--bad);font-size:11px">no administrator</span>');
+}
+async function coAdmin(id,name){
+  const who=prompt('Administrator for '+name+'\n\nName the person who will manage users and see every calculation. If a user of that name exists, they become the administrator and get the new PIN.','Administrator');
+  if(who===null||!who.trim())return;
+  const pin=prompt('PIN for '+who.trim()+' (at least 4 characters). Tell it to them directly; it is not shown again.');
+  if(pin===null)return;
+  const r=await api('/admin/api/company',{method:'POST',body:JSON.stringify({id,action:'adminuser',name:who.trim(),pin})});
+  if(r.error){say('<div class="msg err">'+esc(r.error)+'</div>');return;}
+  say('<div class="msg ok">'+esc(r.warning||'Done.')+'</div>');
+  await load();
 }
 /* 4.6.0 — usage, shown the way the app shows it: used of limit with a
    bar, amber inside 10% of the limit, red at it; blue when no limit. */

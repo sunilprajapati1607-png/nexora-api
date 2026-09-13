@@ -68,11 +68,12 @@ function sign(payloadB64) {
   return b64u(createHmac('sha256', SECRET).update(payloadB64).digest());
 }
 
-export function issueToken(lic) {
+export function issueToken(lic, userId) {
   const body = {
     d: lic.device_id,
     s: lic.state,
     c: lic.company_id || null,                                 // 4.0.0 — who this device belongs to
+    u: userId ? Number(userId) : null,                         // 4.8.0 — the person signed in on it
     x: Math.floor(new Date(lic.expires_at).getTime() / 1000),  // licence expiry
     e: Math.floor(Date.now() / 1000) + TOKEN_TTL_SEC           // token expiry
   };
@@ -492,9 +493,20 @@ export async function authorise(request) {
      to decide whether the client may continue. */
   const usage = await companyUsage(row.company_id || null);
 
+  /* 4.8.0 — the person, if the token names one. Re-read from the table
+     like everything else: a user switched off by their admin, or moved
+     to scope OWN, is refused or narrowed on the very next call, whatever
+     the token still says. A user row that no longer matches the seat's
+     company is treated as signed out. */
+  let user = null;
+  if (body.u && row.company_id) {
+    const urows = await q(`SELECT * FROM company_users WHERE id = $1 AND company_id = $2`, [body.u, row.company_id]);
+    if (urows.length && urows[0].active !== false) user = urows[0];
+  }
+
   const lic = describe(row, co, settings, usage);
   return {
-    ok: true, row, company: co, licence: lic, settings, usage,
+    ok: true, row, company: co, licence: lic, settings, usage, user,
     /* Every data route must filter on this and nothing else. It comes
        from the database, so a client cannot ask for another company's
        rows by editing anything it holds. */

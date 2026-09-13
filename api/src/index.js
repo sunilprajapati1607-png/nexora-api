@@ -16,6 +16,7 @@ import { ensureSchema } from './db.js';
 import { activate, authorise, touch, issueToken, reportUsage, companyUsage, describe } from './licence.js';
 import { runBom } from './engine.js';
 import { adminAuthorised, listLicences, licenceAction, companyAction, saveSettings, recentEvents, ADMIN_HTML } from './admin.js';
+import { login, listUsers, userAction, pull, push, describeUser } from './sync.js';
 
 const CORS = {
   'access-control-allow-origin': '*',
@@ -71,13 +72,59 @@ export default {
            written, so a machine that reaches its limit is told on the
            same call rather than being allowed one more transaction than
            it is entitled to. */
+        /* 4.8.0 — the re-issued token keeps the signed-in person, and the
+           answer carries their current role and scope so an admin's change
+           reaches the seat at the next heartbeat. */
+        const uid = a.user ? a.user.id : null;
         if (body.usage) {
           await reportUsage(a.row.device_id, body.usage);
           const fresh = await companyUsage(a.row.company_id || null);
           const lic = describe(a.row, a.company, a.settings, fresh);
-          return json({ token: issueToken(a.row), licence: lic, usage: fresh });
+          return json({ token: issueToken(a.row, uid), licence: lic, usage: fresh, user: describeUser(a.user) });
         }
-        return json({ token: issueToken(a.row), licence: a.licence, usage: a.usage });
+        return json({ token: issueToken(a.row, uid), licence: a.licence, usage: a.usage, user: describeUser(a.user) });
+      }
+
+      /* ---- 4.8.0 — people and company-wide sync ---------------------- */
+      if (path === '/v1/login' && method === 'POST') {
+        await ensureSchema();
+        const a = await authorise(request);
+        if (!a.ok) return json(a.error, a.httpStatus);
+        const body = await readJson(request);
+        const out = await login(a.companyId, body);
+        if (out.httpStatus !== 200) return json(out.body, out.httpStatus);
+        return json({ token: issueToken(a.row, out.body.user.id), user: out.body.user, licence: a.licence,
+          company: a.company ? { id: a.company.id, name: a.company.name } : null });
+      }
+      if (path === '/v1/logout' && method === 'POST') {
+        await ensureSchema();
+        const a = await authorise(request);
+        if (!a.ok) return json(a.error, a.httpStatus);
+        return json({ token: issueToken(a.row, null), licence: a.licence });
+      }
+      if (path === '/v1/users' && (method === 'GET' || method === 'POST')) {
+        await ensureSchema();
+        const a = await authorise(request);
+        if (!a.ok) return json(a.error, a.httpStatus);
+        if (!a.user) return json({ error: 'SIGN_IN', message: 'Sign in to see the company\'s users.' }, 401);
+        if (method === 'GET') return json({ users: await listUsers(a.companyId), me: describeUser(a.user) });
+        const out = await userAction(a.companyId, a.user, await readJson(request));
+        return json(out.body, out.httpStatus);
+      }
+      if (path === '/v1/sync/pull' && method === 'GET') {
+        await ensureSchema();
+        const a = await authorise(request);
+        if (!a.ok) return json(a.error, a.httpStatus);
+        if (!a.user) return json({ error: 'SIGN_IN', message: 'Sign in to synchronise.' }, 401);
+        return json(await pull(a.companyId, a.user, url.searchParams.get('since'), url.searchParams.get('limit')));
+      }
+      if (path === '/v1/sync/push' && method === 'POST') {
+        await ensureSchema();
+        const a = await authorise(request);
+        if (!a.ok) return json(a.error, a.httpStatus);
+        if (!a.user) return json({ error: 'SIGN_IN', message: 'Sign in to synchronise.' }, 401);
+        const body = await readJson(request);
+        return json(await push(a.companyId, a.user, body.records));
       }
 
       if (path === '/v1/bom' && method === 'POST') {
