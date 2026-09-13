@@ -120,6 +120,15 @@ export function ensureSchema() {
        stored, so it cannot drift out of step with the rows it came from. */
     await q(`ALTER TABLE licences ADD COLUMN IF NOT EXISTS txn_count INTEGER NOT NULL DEFAULT 0`);
     await q(`ALTER TABLE licences ADD COLUMN IF NOT EXISTS usage_minutes INTEGER NOT NULL DEFAULT 0`);
+    /* 4.6.0 — an owner's RESET of a machine's usage. The reported counts
+       are monotonic (a reinstall must not lower them), so a reset cannot
+       simply zero txn_count: the next heartbeat would put it straight
+       back. Instead the reset records where the count stood, and every
+       figure shown or enforced is count − base. The raw report is never
+       altered, so the monotonic guarantee survives the reset. */
+    await q(`ALTER TABLE licences ADD COLUMN IF NOT EXISTS txn_base INTEGER NOT NULL DEFAULT 0`);
+    await q(`ALTER TABLE licences ADD COLUMN IF NOT EXISTS usage_base INTEGER NOT NULL DEFAULT 0`);
+    await q(`ALTER TABLE licences ADD COLUMN IF NOT EXISTS usage_reset_at TIMESTAMPTZ`);
 
     /* Defaults, written once. ON CONFLICT DO NOTHING means an operator's
        later change is never overwritten by a cold start. */

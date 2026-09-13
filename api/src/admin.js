@@ -30,7 +30,11 @@ export async function listLicences() {
     SELECT l.device_id, l.device_name, l.company, l.email, l.state, l.trial_started_at,
            l.created_at, l.last_seen_at, l.seen_count, l.app_version, l.notes,
            l.company_id, l.seat_no,
-           l.txn_count, l.usage_minutes,
+           /* 4.6.0 — net of any owner reset, the same figure the licence
+              is judged on. The raw report stays in the row. */
+           GREATEST(0, l.txn_count - l.txn_base)::int         AS txn_count,
+           GREATEST(0, l.usage_minutes - l.usage_base)::int  AS usage_minutes,
+           l.usage_reset_at,
            c.name AS co_name, c.licence_key AS co_key, c.state AS co_state,
            c.seats AS co_seats, c.is_demo AS co_is_demo,
            COALESCE(c.expires_at, l.expires_at) AS expires_at,
@@ -58,9 +62,9 @@ export async function listCompanies() {
            /* 4.3.0 — what this licence has used, summed across its seats.
               Computed here rather than stored, so it cannot disagree with
               the device rows it is made of. */
-           (SELECT COALESCE(SUM(l.txn_count), 0)::int FROM licences l
+           (SELECT COALESCE(SUM(GREATEST(0, l.txn_count - l.txn_base)), 0)::int FROM licences l
              WHERE l.company_id = c.id) AS txn_used,
-           (SELECT COALESCE(SUM(l.usage_minutes), 0)::int FROM licences l
+           (SELECT COALESCE(SUM(GREATEST(0, l.usage_minutes - l.usage_base)), 0)::int FROM licences l
              WHERE l.company_id = c.id) AS usage_minutes
       FROM companies c
      ORDER BY c.is_demo ASC, c.created_at DESC
@@ -166,7 +170,7 @@ export async function companyAction(body) {
     const lim = Math.max(0, Math.min(10000000, parseInt(body.txnLimit, 10) || 0));
     await q(`UPDATE companies SET txn_limit = $2 WHERE id = $1`, [id, lim]);
     const u = (await q(
-      `SELECT COALESCE(SUM(txn_count), 0)::int AS n FROM licences WHERE company_id = $1`, [id]))[0];
+      `SELECT COALESCE(SUM(GREATEST(0, txn_count - txn_base)), 0)::int AS n FROM licences WHERE company_id = $1`, [id]))[0];
     const used = Number(u && u.n) || 0;
     await logEvent(null, 'ADMIN_COMPANY_TXNLIMIT', { id, txnLimit: lim, used });
     if (lim > 0 && used >= lim) {
@@ -174,6 +178,17 @@ export async function companyAction(body) {
         ' transactions, which is at or over the new limit of ' + lim +
         '. Nothing saved was touched, but its machines cannot commit anything new until the limit is raised.' };
     }
+
+  } else if (action === 'resetusage') {
+    /* 4.6.0 — start this licence's count and hours again from zero, on
+       every seat. The machines' own reports are not altered (they are
+       monotonic by design); the point they stood at is recorded and
+       everything is read as count − base from here on. A limit that was
+       reached is therefore no longer reached, on the very next heartbeat. */
+    await q(`UPDATE licences
+                SET txn_base = txn_count, usage_base = usage_minutes, usage_reset_at = now()
+              WHERE company_id = $1`, [id]);
+    await logEvent(null, 'ADMIN_COMPANY_RESETUSAGE', { id });
 
   } else if (action === 'note') {
     await q(`UPDATE companies SET notes = $2 WHERE id = $1`, [id, String(body.notes || '')]);
@@ -216,6 +231,13 @@ export async function licenceAction(body) {
       { days, scope: 'company', companyId });
     return { ok: true, scope: 'company', companyId,
       warning: 'This applied to the whole company — every machine on that licence.' };
+
+  } else if (action === 'resetusage') {
+    /* 4.6.0 — one machine's count and hours, from zero. Same base
+       mechanism as the company-wide reset; the report itself is untouched. */
+    await q(`UPDATE licences SET txn_base = txn_count, usage_base = usage_minutes, usage_reset_at = now()
+              WHERE device_id = $1`, [deviceId]);
+    await logEvent(deviceId, 'ADMIN_RESETUSAGE', {});
 
   } else if (action === 'revoke') {
     await q(`UPDATE licences SET state = 'REVOKED' WHERE device_id = $1`, [deviceId]);
@@ -369,7 +391,14 @@ code{font:12px ui-monospace,Menlo,Consolas,monospace;color:var(--muted)}
       <div id="coMsg"></div>
       <div style="overflow-x:auto"><table id="cotbl">
         <thead><tr><th>Company</th><th>Licence key</th><th>State</th><th>Seats</th><th>Days left</th>
-        <th>Offline</th><th>Actions</th></tr></thead><tbody></tbody></table></div>
+        <th>Offline</th><th>Transactions</th><th>Hours</th><th>Actions</th></tr></thead><tbody></tbody></table></div>
+      <div class="sub" style="margin:10px 0 0;font-size:12px">
+        <b>Transactions</b> are committed records — a calculation saved, a revision raised, a BOM saved — summed over the
+        company's machines; <b>Hours</b> is time the application was actually in use. <b>Limit</b> sets how many
+        transactions the licence may commit (0 = no limit; reaching it is read-only, never a shutdown). <b>Days</b> adds
+        licence days. <b>Reset usage</b> starts the count and hours again from zero without touching anything saved.
+        Each machine's own figures are in the Installations list below.
+      </div>
     </div>
 
     <div class="card">
@@ -380,7 +409,7 @@ code{font:12px ui-monospace,Menlo,Consolas,monospace;color:var(--muted)}
       </div>
       <div style="overflow-x:auto"><table id="tbl">
         <thead><tr><th>Company</th><th>State</th><th>Email</th><th>Days left</th><th>Started</th>
-        <th>Last seen</th><th>Version</th><th>Actions</th></tr></thead><tbody></tbody></table></div>
+        <th>Last seen</th><th>Version</th><th>Transactions</th><th>Hours</th><th>Actions</th></tr></thead><tbody></tbody></table></div>
       <div class="sub" style="margin:10px 0 0;font-size:12px">
         The clock belongs to the <b>company</b>, not the machine — extend or suspend it above and every
         seat follows. Revoking one machine only frees its seat so another can take it.
@@ -438,16 +467,55 @@ function renderCompanies(){
         '<i><b style="width:'+pct+'%"></b></i></span></td>'+
       '<td>'+(state==='EXPIRED'||state==='SUSPENDED'?fmt(c.expires_at):c.days_left+'<br><code>'+fmt(c.expires_at)+'</code>')+'</td>'+
       '<td>'+(c.grace_days>0?c.grace_days+' d':'<span title="Stops as soon as it cannot reach the service">none</span>')+'</td>'+
+      '<td>'+txnCell(c.txn_used,c.txn_limit)+'</td>'+
+      '<td>'+hoursText(c.usage_minutes)+'</td>'+
       '<td><div class="tools">'+
+        '<button onclick="coDays('+c.id+')">Days…</button>'+
         '<button onclick="coAct('+c.id+',\\'extend\\',365)">+1 yr</button>'+
         (c.is_demo?'<button class="primary" onclick="coAct('+c.id+',\\'licence\\',365)">Make licensed</button>':'')+
         '<button onclick="coSeats('+c.id+','+seats+')">Seats</button>'+
         '<button onclick="coGrace('+c.id+','+c.grace_days+')">Offline</button>'+
+        '<button onclick="coLimit('+c.id+','+(c.txn_limit||0)+')">Limit</button>'+
+        '<button onclick="coReset('+c.id+',\\''+esc(c.name).replace(/'/g,'')+'\\')">Reset usage</button>'+
         (c.state==='SUSPENDED'
           ?'<button onclick="coAct('+c.id+',\\'restore\\',0)">Restore</button>'
           :'<button onclick="coAct('+c.id+',\\'suspend\\',0)">Suspend</button>')+
       '</div></td></tr>';
-  }).join('')||'<tr><td colspan="7" style="color:var(--muted)">No companies yet. Every demo creates one automatically.</td></tr>';
+  }).join('')||'<tr><td colspan="9" style="color:var(--muted)">No companies yet. Every demo creates one automatically.</td></tr>';
+}
+/* 4.6.0 — usage, shown the way the app shows it: used of limit with a
+   bar, amber inside 10% of the limit, red at it; blue when no limit. */
+function txnCell(used,limit){
+  used=+used||0;limit=+limit||0;
+  if(!limit)return '<b>'+used+'</b> <span style="color:var(--muted)">· no limit</span>';
+  const pct=Math.min(100,Math.round(used/limit*100));
+  const cls=used>=limit?' full':'';
+  const col=used>=limit?'var(--bad)':(used>=limit*0.9?'var(--warn)':'var(--accent)');
+  return '<span class="seatbar'+cls+'"><b>'+used+'</b> of '+limit+'<i><b style="width:'+pct+'%;background:'+col+'"></b></i></span>'+
+    (used>=limit?'<br><span style="color:var(--bad);font-size:11px">limit reached — read-only</span>':'');
+}
+function hoursText(mins){mins=+mins||0;const h=Math.floor(mins/60),m=mins%60;return h?h+' h '+m+' m':m+' m';}
+async function coDays(id){
+  const v=prompt('Add how many days to this licence?\\n\\nThe company\\'s clock moves; every seat follows.','30');
+  if(v===null)return;
+  const days=parseInt(v,10);
+  if(!(days>0)){say('<div class="msg err">Enter a number of days.</div>');return;}
+  await coAct(id,'extend',days);
+}
+async function coLimit(id,now){
+  const v=prompt('How many transactions may this licence commit?\\n\\n0 = no limit. Reaching the limit makes the machines READ-ONLY: everything saved still opens and prints.',now);
+  if(v===null)return;
+  const r=await api('/admin/api/company',{method:'POST',body:JSON.stringify({id,action:'txnlimit',txnLimit:+v})});
+  if(r.error){say('<div class="msg err">'+esc(r.error)+'</div>');return;}
+  if(r.warning)say('<div class="msg warn">'+esc(r.warning)+'</div>');else say('');
+  await load();
+}
+async function coReset(id,name){
+  if(!confirm('Start '+name+'\\'s transaction count and hours again from zero, on every machine?\\n\\nNothing saved is touched. A limit that was reached is no longer reached.'))return;
+  const r=await api('/admin/api/company',{method:'POST',body:JSON.stringify({id,action:'resetusage'})});
+  if(r.error){say('<div class="msg err">'+esc(r.error)+'</div>');return;}
+  say('<div class="msg ok">Usage reset for <b>'+esc(name)+'</b>.</div>');
+  await load();
 }
 function copyKey(k){
   try{navigator.clipboard.writeText(k);say('<div class="msg ok">Copied '+esc(k)+'</div>');
@@ -523,15 +591,19 @@ function render(){
       '<td>'+fmt(l.trial_started_at)+'</td>'+
       '<td>'+fmt(l.last_seen_at)+'</td>'+
       '<td>'+esc(l.app_version||'—')+'</td>'+
+      '<td><b>'+(+l.txn_count||0)+'</b>'+(l.usage_reset_at?'<br><span style="font-size:11px;color:var(--muted)">reset '+fmt(l.usage_reset_at)+'</span>':'')+'</td>'+
+      '<td>'+hoursText(l.usage_minutes)+'</td>'+
       '<td><div class="tools">'+
+        '<button onclick="act(\\''+l.device_id+'\\',\\'resetusage\\',0)">Reset usage</button>'+
         (l.state==='REVOKED'
           ?'<button onclick="act(\\''+l.device_id+'\\',\\'restore\\',0)">Restore</button>'
           :'<button onclick="act(\\''+l.device_id+'\\',\\'revoke\\',0)">Revoke — frees the seat</button>')+
       '</div></td></tr>';
-  }).join('')||'<tr><td colspan="8" style="color:var(--muted)">Nothing yet — no one has installed it.</td></tr>';
+  }).join('')||'<tr><td colspan="10" style="color:var(--muted)">Nothing yet — no one has installed it.</td></tr>';
 }
 async function act(deviceId,action,days){
   if(action==='revoke'&&!confirm('Revoke this installation? It stops calculating at its next check, and its seat is freed for another machine.'))return;
+  if(action==='resetusage'&&!confirm('Start this machine\\'s transaction count and hours again from zero? Nothing saved is touched.'))return;
   const r=await api('/admin/api/licence',{method:'POST',body:JSON.stringify({deviceId,action,days})});
   if(r.error){say('<div class="msg err">'+esc(r.error)+'</div>');return;}
   if(r.warning)say('<div class="msg warn">'+esc(r.warning)+'</div>');else say('');

@@ -152,10 +152,11 @@ export async function reportUsage(deviceId, usage) {
 export async function companyUsage(companyId) {
   if (!companyId) return { txnUsed: 0, usageMinutes: 0, seatsReporting: 0 };
   try {
+    /* 4.6.0 — net of any owner reset (count − base), never below zero. */
     const rows = await q(
-      `SELECT COALESCE(SUM(txn_count), 0)::int     AS txns,
-              COALESCE(SUM(usage_minutes), 0)::int AS mins,
-              COUNT(*) FILTER (WHERE txn_count > 0)::int AS reporting
+      `SELECT COALESCE(SUM(GREATEST(0, txn_count - txn_base)), 0)::int         AS txns,
+              COALESCE(SUM(GREATEST(0, usage_minutes - usage_base)), 0)::int  AS mins,
+              COUNT(*) FILTER (WHERE txn_count - txn_base > 0)::int            AS reporting
          FROM licences WHERE company_id = $1`, [companyId]);
     const r = rows.length ? rows[0] : {};
     return {
