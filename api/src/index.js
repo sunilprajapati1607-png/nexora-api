@@ -17,6 +17,7 @@ import { activate, authorise, touch, issueToken, reportUsage, companyUsage, desc
 import { runBom } from './engine.js';
 import { adminAuthorised, listLicences, licenceAction, companyAction, saveSettings, recentEvents, ADMIN_HTML } from './admin.js';
 import { login, listUsers, userAction, pull, push, describeUser } from './sync.js';
+import { ensureInkSchema, getModel, listModels, train as inkTrain, estimate as inkEstimate, reset as inkReset } from './inkstore.js';
 
 const CORS = {
   'access-control-allow-origin': '*',
@@ -125,6 +126,43 @@ export default {
         if (!a.user) return json({ error: 'SIGN_IN', message: 'Sign in to synchronise.' }, 401);
         const body = await readJson(request);
         return json(await push(a.companyId, a.user, body.records));
+      }
+
+      /* ---- 4.16.0 BETA — the ink assumption -------------------------
+         The artwork is measured on the computer and never leaves it; what
+         arrives here is coverage. The engine — substrates, physics, the
+         fitting — lives on this service and is not shipped in the EXE.
+         Gated by the licence exactly as costing is. */
+      if (path.indexOf('/v1/ink') === 0) {
+        await ensureSchema();
+        await ensureInkSchema();
+        const a = await authorise(request);
+        if (!a.ok) return json(a.error, a.httpStatus);
+        if (!a.licence.canCalculate) {
+          return json({ error: 'LICENCE_REQUIRED', licence: a.licence, message: a.licence.message }, 402);
+        }
+        const companyId = a.companyId || null;
+        const userId = a.user ? a.user.id : null;
+
+        if (path === '/v1/ink/model' && method === 'GET') {
+          const sub = url.searchParams.get('substrate');
+          if (sub) return json(await getModel(companyId, sub));
+          return json({ models: await listModels(companyId) });
+        }
+        if (path === '/v1/ink/predict' && method === 'POST') {
+          const out = await inkEstimate(companyId, await readJson(request));
+          return json(out.body, out.httpStatus);
+        }
+        if (path === '/v1/ink/train' && method === 'POST') {
+          const out = await inkTrain(companyId, userId, await readJson(request));
+          return json(out.body, out.httpStatus);
+        }
+        if (path === '/v1/ink/reset' && method === 'POST') {
+          const body = await readJson(request);
+          const out = await inkReset(companyId, body.substrate);
+          return json(out.body, out.httpStatus);
+        }
+        return json({ error: 'NOT_FOUND', message: 'No such ink route.' }, 404);
       }
 
       if (path === '/v1/bom' && method === 'POST') {
