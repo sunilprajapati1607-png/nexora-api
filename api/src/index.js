@@ -18,6 +18,7 @@ import { runBom } from './engine.js';
 import { adminAuthorised, listLicences, licenceAction, companyAction, saveSettings, recentEvents, ADMIN_HTML } from './admin.js';
 import { login, listUsers, userAction, pull, push, describeUser } from './sync.js';
 import { ensureInkSchema, getModel, listModels, train as inkTrain, estimate as inkEstimate, reset as inkReset } from './inkstore.js';
+import { register, gstAction } from './register.js';
 
 const CORS = {
   'access-control-allow-origin': '*',
@@ -55,6 +56,15 @@ export default {
         await ensureSchema();
         const body = await readJson(request);
         const out = await activate(body);
+        return json(out.body, out.httpStatus);
+      }
+      /* 4.23.0 — a plant registers itself. Open like activate, because it
+         is how a company comes to exist; everything it creates is a demo
+         until the owner licenses it in the console. */
+      if (path === '/v1/register' && method === 'POST') {
+        await ensureSchema();
+        const body = await readJson(request);
+        const out = await register(body, request);
         return json(out.body, out.httpStatus);
       }
 
@@ -197,6 +207,7 @@ export default {
 
         if (path === '/admin/api/licences' && method === 'GET') return json(await listLicences());
         if (path === '/admin/api/licence' && method === 'POST') return json(await licenceAction(await readJson(request)));
+        if (path === '/admin/api/gst' && method === 'POST') { const out = await gstAction(await readJson(request)); return json(out.body, out.httpStatus); }
         if (path === '/admin/api/company' && method === 'POST') return json(await companyAction(await readJson(request)));
         if (path === '/admin/api/settings' && method === 'POST') return json(await saveSettings(await readJson(request)));
         if (path === '/admin/api/events' && method === 'GET') return json({ events: await recentEvents(url.searchParams.get('deviceId')) });

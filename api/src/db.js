@@ -98,6 +98,25 @@ export function ensureSchema() {
 
     /* ADD COLUMN IF NOT EXISTS is the safe form: it does nothing on a
        database that already has them, so this runs on every cold start. */
+    /* ---- 4.23.0 — SELF-REGISTRATION ---------------------------------
+       A plant registers itself: company + GSTIN + email + mobile, a
+       company login id and passcode its other machines activate with,
+       the IP and device it registered from, and what the GST check
+       said. Every one an ALTER of its own, because CREATE TABLE IF NOT
+       EXISTS above does nothing for a database that already has the
+       table (the 4.19.0 lesson). DEFAULTs are chosen so every company
+       that already exists reads as: not self-registered, GST not yet
+       verified — which is the truth. */
+    await q(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS login_id TEXT`);
+    await q(`CREATE UNIQUE INDEX IF NOT EXISTS companies_login_idx ON companies (login_id) WHERE login_id IS NOT NULL`);
+    await q(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS passcode_hash TEXT`);
+    await q(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS self_registered BOOLEAN NOT NULL DEFAULT false`);
+    await q(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS registered_ip TEXT`);
+    await q(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS registered_device TEXT`);
+    await q(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS registered_at TIMESTAMPTZ`);
+    await q(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS gst_status TEXT NOT NULL DEFAULT 'UNVERIFIED'`);
+    await q(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS gst_checked_at TIMESTAMPTZ`);
+    await q(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS gst_note TEXT`);
     await q(`ALTER TABLE licences ADD COLUMN IF NOT EXISTS company_id BIGINT`);
     await q(`ALTER TABLE licences ADD COLUMN IF NOT EXISTS seat_no INTEGER`);
     await q(`CREATE INDEX IF NOT EXISTS licences_company_idx ON licences (company_id)`);

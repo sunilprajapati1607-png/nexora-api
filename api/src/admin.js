@@ -57,6 +57,10 @@ export async function listCompanies() {
   const rows = await q(`
     SELECT c.id, c.name, c.licence_key, c.email, c.phone, c.state, c.seats, c.gstin,
            c.grace_days, c.is_demo, c.expires_at, c.created_at, c.notes, c.txn_limit,
+           /* 4.23.0 — self-registration: who registered, from where, and
+              what the GST check said. The passcode hash is never listed. */
+           c.login_id, c.self_registered, c.registered_ip, c.registered_device, c.registered_at,
+           c.gst_status, c.gst_checked_at, c.gst_note,
            GREATEST(0, CEIL(EXTRACT(EPOCH FROM (c.expires_at - now())) / 86400.0))::int AS days_left,
            (SELECT COUNT(*)::int FROM licences l
              WHERE l.company_id = c.id AND l.state <> 'REVOKED') AS seats_used,
@@ -467,6 +471,22 @@ async function load(){
 function showNew(){const n=document.getElementById('newco');n.style.display=n.style.display==='none'?'':'none';}
 function say(html){document.getElementById('coMsg').innerHTML=html;}
 
+function gstPill(c){
+  const s=c.gst_status||'UNVERIFIED';
+  const title=(c.gst_note?esc(c.gst_note)+' · ':'')+(c.gst_checked_at?'checked '+new Date(c.gst_checked_at).toLocaleString():'never checked');
+  return '<span class="pill '+(s==='VERIFIED'?'s-LICENSED':s==='FAILED'?'s-SUSPENDED':'s-EXPIRED')+'" title="'+title+'">'+
+    (s==='VERIFIED'?'GST verified':s==='FAILED'?'GST failed':'GST not yet verified')+'</span>';
+}
+async function gstVerify(id){
+  const r=await fetch('/admin/api/gst',{method:'POST',headers:{'content-type':'application/json','x-admin-key':KEY},body:JSON.stringify({action:'gstverify',id})});
+  const b=await r.json(); if(!r.ok){alert(b.message||'Refused');return;}
+  alert('GST: '+b.gst.status+(b.gst.reason?' — '+b.gst.reason:b.gst.legalName?' — '+b.gst.legalName:'')); load();
+}
+async function gstMark(id,status){
+  const note=status==='VERIFIED'?(prompt('How was it checked? (a note for the record)','Checked on the GST portal by hand')||''):'';
+  const r=await fetch('/admin/api/gst',{method:'POST',headers:{'content-type':'application/json','x-admin-key':KEY},body:JSON.stringify({action:'gstmark',id,status,note})});
+  if(!r.ok){const b=await r.json();alert(b.message||'Refused');return;} load();
+}
 function renderCompanies(){
   const cos=DATA.companies||[];
   const fmt=d=>d?new Date(d).toLocaleDateString(undefined,{day:'2-digit',month:'short',year:'2-digit'}):'—';
@@ -476,8 +496,12 @@ function renderCompanies(){
     const pct=Math.min(100,Math.round(used/Math.max(1,seats)*100));
     return '<tr>'+
       '<td><b>'+esc(c.name)+'</b>'+(c.is_demo?' <span class="pill s-DEMO">demo</span>':'')+
-        (c.gstin?'<br><code>GSTIN '+esc(c.gstin)+'</code>':'')+
-        (c.email?'<br><code>'+esc(c.email)+'</code>':'')+'</td>'+
+        (c.self_registered?' <span class="pill s-TRIAL" title="Registered by the plant itself on '+esc(fmt(c.registered_at))+(c.registered_ip?' from '+esc(c.registered_ip):'')+'">self-registered</span>':'')+
+        (c.gstin?'<br><code>GSTIN '+esc(c.gstin)+'</code> '+gstPill(c):'')+
+        (c.email?'<br><code>'+esc(c.email)+'</code>':'')+
+        (c.phone?'<br><code>'+esc(c.phone)+'</code>':'')+
+        (c.login_id?'<br><code>id '+esc(c.login_id)+'</code>':'')+
+        (c.registered_ip?'<br><code title="The address this company registered from">IP '+esc(c.registered_ip)+'</code>':'')+'</td>'+
       '<td><span class="keycell">'+esc(c.licence_key)+'</span> '+
         '<button title="Copy" onclick="copyKey(\\''+c.licence_key+'\\')">Copy</button></td>'+
       '<td><span class="pill s-'+state+'">'+state+'</span></td>'+
@@ -490,6 +514,9 @@ function renderCompanies(){
       '<td>'+usersCell(c)+'</td>'+
       '<td><div class="tools">'+
         '<button onclick="coDays('+c.id+')">Days…</button>'+
+        (c.gstin?'<button onclick="gstVerify('+c.id+')" title="Ask the configured GST verification service again">Verify GST</button>'+
+          (c.gst_status!=='VERIFIED'?'<button onclick="gstMark('+c.id+',\'VERIFIED\')" title="Record that you checked this GSTIN by hand">GST ok</button>'
+            :'<button onclick="gstMark('+c.id+',\'UNVERIFIED\')" title="Take the verified mark off">Unverify</button>'):'')+
         '<button onclick="coAdmin('+c.id+',\''+esc(c.name).replace(/'/g,'')+'\')">Admin user…</button>'+
         '<button onclick="coAct('+c.id+',\\'extend\\',365)">+1 yr</button>'+
         (c.is_demo?'<button class="primary" onclick="coAct('+c.id+',\\'licence\\',365)">Make licensed</button>':'')+

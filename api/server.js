@@ -22,7 +22,12 @@ function toRequest(req) {
   const host = req.headers.host || 'localhost';
   const url = proto + '://' + host + req.url;
   const headers = new Headers();
+  /* 4.23.0 — the connection's own address. Behind Render's proxy the
+     client is in x-forwarded-for; with no proxy at all this is the only
+     place it exists. Set FIRST so a client cannot supply it. */
+  try { const ra = req.socket && req.socket.remoteAddress; if (ra) headers.set('x-nexora-remote', String(ra)); } catch (e) { /* no socket */ }
   for (const [k, v] of Object.entries(req.headers)) {
+    if (k.toLowerCase() === 'x-nexora-remote') continue;
     if (Array.isArray(v)) v.forEach((x) => headers.append(k, x));
     else if (v !== undefined) headers.set(k, v);
   }

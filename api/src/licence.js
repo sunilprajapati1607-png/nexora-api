@@ -336,9 +336,10 @@ function describeState(row, company, settings) {
 }
 
 /* ---- activation ----------------------------------------------------- */
+import { passcodeMatches } from './passcode.js';
 const DEVICE_RE = /^[a-f0-9]{16,64}$/i;
 
-export async function activate({ deviceId, deviceName, company, email, appVersion, licenceKey }) {
+export async function activate({ deviceId, deviceName, company, email, appVersion, licenceKey, loginId, passcode }) {
   if (!DEVICE_RE.test(String(deviceId || ''))) {
     return { httpStatus: 400, body: { error: 'BAD_DEVICE_ID',
       message: 'This installation could not identify the computer it is running on.' } };
@@ -359,6 +360,26 @@ export async function activate({ deviceId, deviceName, company, email, appVersio
       await logEvent(deviceId, 'KEY_REJECTED', { key: wanted });
       return { httpStatus: 404, body: { error: 'UNKNOWN_KEY',
         message: 'That licence key is not recognised. Check it and try again, or contact Nexora.' } };
+    }
+    keyed = found[0];
+    if (keyed.state === 'SUSPENDED') {
+      return { httpStatus: 403, body: { error: 'COMPANY_SUSPENDED',
+        message: 'The licence for ' + keyed.name + ' has been suspended. Contact Nexora to restore it.' } };
+    }
+  }
+
+  /* 4.23.0 — a company that registered itself has no key to type; its
+     other machines join with the company login id and passcode. Resolved
+     exactly like a key: a wrong one is a clear refusal, and one refusal
+     covers "no such id" and "wrong passcode" alike, so a stranger learns
+     nothing about which half was wrong. */
+  const lid = String(loginId || '').trim().toLowerCase();
+  if (!keyed && lid) {
+    const found = await q(`SELECT * FROM companies WHERE login_id = $1`, [lid]);
+    if (!found.length || !passcodeMatches(passcode, found[0].passcode_hash)) {
+      await logEvent(deviceId, 'PASSCODE_REJECTED', { loginId: lid });
+      return { httpStatus: 401, body: { error: 'BAD_PASSCODE',
+        message: 'That company id and passcode do not match. Check them with the person who registered your company.' } };
     }
     keyed = found[0];
     if (keyed.state === 'SUSPENDED') {
