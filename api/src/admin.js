@@ -515,9 +515,9 @@ function renderCompanies(){
       '<td><div class="tools">'+
         '<button onclick="coDays('+c.id+')">Days…</button>'+
         (c.gstin?'<button onclick="gstVerify('+c.id+')" title="Ask the configured GST verification service again">Verify GST</button>'+
-          (c.gst_status!=='VERIFIED'?'<button onclick="gstMark('+c.id+',\'VERIFIED\')" title="Record that you checked this GSTIN by hand">GST ok</button>'
-            :'<button onclick="gstMark('+c.id+',\'UNVERIFIED\')" title="Take the verified mark off">Unverify</button>'):'')+
-        '<button onclick="coAdmin('+c.id+',\''+esc(c.name).replace(/'/g,'')+'\')">Admin user…</button>'+
+          (c.gst_status!=='VERIFIED'?'<button onclick="gstMark('+c.id+',\\'VERIFIED\\')" title="Record that you checked this GSTIN by hand">GST ok</button>'
+            :'<button onclick="gstMark('+c.id+',\\'UNVERIFIED\\')" title="Take the verified mark off">Unverify</button>'):'')+
+        '<button onclick="coAdmin('+c.id+',\\''+esc(c.name).replace(/'/g,'')+'\\')">Admin user…</button>'+
         '<button onclick="coAct('+c.id+',\\'extend\\',365)">+1 yr</button>'+
         (c.is_demo?'<button class="primary" onclick="coAct('+c.id+',\\'licence\\',365)">Make licensed</button>':'')+
         '<button onclick="coSeats('+c.id+','+seats+')">Seats</button>'+
@@ -539,7 +539,7 @@ function usersCell(c){
   return '<b>'+n+'</b>'+(c.admin_names?'<br><span style="color:var(--muted);font-size:11px">admin: '+esc(c.admin_names)+'</span>':'<br><span style="color:var(--bad);font-size:11px">no administrator</span>');
 }
 async function coAdmin(id,name){
-  const who=prompt('Administrator for '+name+'\n\nName the person who will manage users and see every calculation. If a user of that name exists, they become the administrator and get the new PIN.','Administrator');
+  const who=prompt('Administrator for '+name+'\\n\\nName the person who will manage users and see every calculation. If a user of that name exists, they become the administrator and get the new PIN.','Administrator');
   if(who===null||!who.trim())return;
   const pin=prompt('PIN for '+who.trim()+' (at least 4 characters). Tell it to them directly; it is not shown again.');
   if(pin===null)return;
