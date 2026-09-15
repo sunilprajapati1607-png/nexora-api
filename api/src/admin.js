@@ -212,6 +212,33 @@ export async function companyAction(body) {
       ? 'The PIN for ' + out.user.name + ' was reset and they are the administrator.'
       : out.user.name + ' can now sign in as the administrator on any of this company\'s seats.' };
 
+  } else if (action === 'delete') {
+    /* The one action that cannot be undone from here. It takes the
+       company and everything that hangs off it — its machines, its
+       people, the records its seats synced, its ink models — so nothing
+       is left pointing at a company that no longer exists. The owner
+       types the company's name to confirm; an id in a button is not a
+       decision, a name typed out is. */
+    const co = (await q(`SELECT id, name FROM companies WHERE id = $1`, [id]))[0];
+    if (!co) return { error: 'No such company.' };
+    if (String(body.confirmName || '').trim() !== String(co.name).trim()) {
+      return { error: 'Type the company name exactly — ' + co.name + ' — to delete it.' };
+    }
+    const count = async (sql) => Number((await q(sql, [id]))[0].n);
+    const removed = {
+      installations: await count(`SELECT COUNT(*)::int AS n FROM licences WHERE company_id = $1`),
+      users: await count(`SELECT COUNT(*)::int AS n FROM company_users WHERE company_id = $1`),
+      records: await count(`SELECT COUNT(*)::int AS n FROM sync_records WHERE company_id = $1`),
+      inkModels: await count(`SELECT COUNT(*)::int AS n FROM ink_models WHERE company_id = $1`)
+    };
+    await q(`DELETE FROM licences WHERE company_id = $1`, [id]);
+    await q(`DELETE FROM company_users WHERE company_id = $1`, [id]);
+    await q(`DELETE FROM sync_records WHERE company_id = $1`, [id]);
+    await q(`DELETE FROM ink_models WHERE company_id = $1`, [id]);
+    await q(`DELETE FROM companies WHERE id = $1`, [id]);
+    await logEvent(null, 'ADMIN_COMPANY_DELETE', { id, name: co.name, removed });
+    return { ok: true, removed, name: co.name };
+
   } else if (action === 'note') {
     await q(`UPDATE companies SET notes = $2 WHERE id = $1`, [id, String(body.notes || '')]);
 
@@ -312,141 +339,152 @@ export async function recentEvents(deviceId) {
 /* ------------------------------------------------------------------ */
 export const ADMIN_HTML = `<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Nexora — Licences</title>
+<title>Nexora — Licence console</title>
 <style>
-:root{--bg:#f4f6fb;--surface:#fff;--border:#e1e5ee;--text:#1a2233;--muted:#667085;--accent:#4f7cff;
+:root{--bg:#f4f6fb;--surface:#fff;--border:#e1e5ee;--text:#1a2233;--muted:#667085;--accent:#4f7cff;--accentbg:#eaf1fe;
       --ok:#16a34a;--warn:#d97706;--bad:#dc2626;--okbg:#e8f7ee;--warnbg:#fef3e2;--badbg:#fdeaea;}
 @media(prefers-color-scheme:dark){:root{--bg:#12141c;--surface:#1b1e29;--border:#2a2e3e;--text:#e8ebf2;--muted:#98a2b3;
-      --okbg:#123222;--warnbg:#3a2a10;--badbg:#3a1717;}}
+      --accentbg:#1c2740;--okbg:#123222;--warnbg:#3a2a10;--badbg:#3a1717;}}
 *{box-sizing:border-box}
 body{margin:0;font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--text)}
-.wrap{max-width:1200px;margin:0 auto;padding:24px 16px}
-h1{font-size:20px;margin:0 0 4px}.sub{color:var(--muted);margin:0 0 20px}
-.card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:16px;margin-bottom:16px}
+.wrap{max-width:1180px;margin:0 auto;padding:20px 16px 60px}
+h1{font-size:20px;margin:0}h2{font-size:15px;margin:0}
+.sub{color:var(--muted);margin:0}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:16px;margin-bottom:14px}
+.top{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:14px}
+.top .grow{flex:1}
+.kpis{display:flex;gap:8px;flex-wrap:wrap}
+.kpi{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:8px 14px;min-width:96px}
+.kpi b{display:block;font-size:20px;line-height:1.1}.kpi span{color:var(--muted);font-size:12px}
+.pill{display:inline-block;padding:2px 9px;border-radius:99px;font-size:12px;font-weight:600;white-space:nowrap}
+.s-TRIAL,.s-DEMO{background:var(--okbg);color:var(--ok)}.s-LICENSED{background:var(--accentbg);color:var(--accent)}
+.s-EXPIRED{background:var(--warnbg);color:var(--warn)}.s-REVOKED,.s-SUSPENDED,.s-FAILED{background:var(--badbg);color:var(--bad)}
+.s-SELF{background:var(--accentbg);color:var(--accent)}.s-UNVERIFIED{background:var(--warnbg);color:var(--warn)}
+.key{font:13px ui-monospace,Menlo,Consolas,monospace;letter-spacing:.03em}
+code{font:12px ui-monospace,Menlo,Consolas,monospace;color:var(--muted)}
+button{font:inherit;padding:6px 11px;border:1px solid var(--border);border-radius:7px;background:var(--surface);color:var(--text);cursor:pointer}
+button:hover{border-color:var(--accent);color:var(--accent)}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff}button.primary:hover{color:#fff;opacity:.92}
+button.danger{border-color:var(--bad);color:var(--bad)}button.danger:hover{background:var(--badbg)}
+button.small{padding:3px 8px;font-size:12px}
+input,select{font:inherit;padding:7px 9px;border:1px solid var(--border);border-radius:7px;background:var(--surface);color:var(--text)}
+label{display:inline-flex;flex-direction:column;gap:3px;font-size:12px;color:var(--muted)}
+label input,label select{font-size:14px;color:var(--text)}
+.row{display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap}
+.msg{padding:10px 12px;border-radius:8px;margin:8px 0}
+.msg.err{background:var(--badbg);color:var(--bad)}.msg.warn{background:var(--warnbg);color:var(--warn)}.msg.ok{background:var(--okbg);color:var(--ok)}
+.help{color:var(--muted);font-size:12.5px;margin:6px 0 0}
+#gate{max-width:400px;margin:12vh auto}
+/* companies */
+.co{border:1px solid var(--border);border-radius:12px;padding:14px 16px;margin-bottom:10px;background:var(--surface)}
+.co.suspended{border-color:var(--bad)}
+.co-head{display:flex;gap:12px;align-items:flex-start;flex-wrap:wrap}
+.co-name{font-size:16px;font-weight:700;margin-right:4px}
+.co-meta{color:var(--muted);font-size:12.5px;display:flex;gap:14px;flex-wrap:wrap;margin-top:6px}
+.co-facts{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-top:12px}
+.fact{border:1px solid var(--border);border-radius:9px;padding:8px 10px}
+.fact span{display:block;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em}
+.fact b{font-size:15px}
+.fact small{color:var(--muted)}
+.bar{display:block;height:5px;border-radius:3px;background:var(--border);margin-top:5px;overflow:hidden}
+.bar i{display:block;height:100%;background:var(--accent)}.bar.full i{background:var(--bad)}
+.manage{margin-top:12px;border-top:1px dashed var(--border);padding-top:12px;display:none}
+.manage.open{display:block}
+.group{margin-bottom:10px}
+.group h4{margin:0 0 6px;font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+.acts{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.acts .why{color:var(--muted);font-size:12px;margin-left:4px}
 table{width:100%;border-collapse:collapse;font-size:13px}
 th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--border);vertical-align:middle}
 th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.04em}
-.pill{display:inline-block;padding:2px 9px;border-radius:99px;font-size:12px;font-weight:600}
-.s-TRIAL{background:var(--okbg);color:var(--ok)}.s-LICENSED{background:#eaf1fe;color:var(--accent)}
-.s-DEMO{background:var(--okbg);color:var(--ok)}
-.s-EXPIRED{background:var(--warnbg);color:var(--warn)}.s-REVOKED{background:var(--badbg);color:var(--bad)}
-.s-SUSPENDED{background:var(--badbg);color:var(--bad)}
-.keycell{font:13px ui-monospace,Menlo,Consolas,monospace;letter-spacing:.03em;color:var(--text)}
-.seatbar{display:inline-block;min-width:78px}
-.seatbar i{display:block;height:5px;border-radius:3px;background:var(--border);margin-top:3px;overflow:hidden}
-.seatbar i b{display:block;height:100%;background:var(--accent)}
-.seatbar.full i b{background:var(--bad)}
-.msg.warn{background:var(--warnbg);color:var(--warn)}
-.msg.ok{background:var(--okbg);color:var(--ok)}
-button{font:inherit;padding:5px 10px;border:1px solid var(--border);border-radius:6px;background:var(--surface);
-       color:var(--text);cursor:pointer}
-button:hover{border-color:var(--accent);color:var(--accent)}
-button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
-input,select{font:inherit;padding:7px 9px;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--text)}
-code{font:12px ui-monospace,Menlo,Consolas,monospace;color:var(--muted)}
-.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
-.tools{display:flex;gap:6px;flex-wrap:wrap}
-#gate{max-width:380px;margin:12vh auto}
-.msg{padding:10px 12px;border-radius:8px;margin-bottom:12px}
-.msg.err{background:var(--badbg);color:var(--bad)}
-.kpi{display:flex;gap:20px;flex-wrap:wrap;margin-bottom:4px}
-.kpi div b{display:block;font-size:22px}
-.kpi div span{color:var(--muted);font-size:12px}
-@media(max-width:640px){th:nth-child(3),td:nth-child(3),th:nth-child(7),td:nth-child(7){display:none}}
+.legend{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:10px;margin-top:10px}
+.legend div{background:var(--bg);border-radius:9px;padding:9px 11px;font-size:12.5px}
+.legend b{display:block}
 </style></head><body>
 <div class="wrap">
   <div id="gate" class="card">
-    <h1>Nexora — Licences</h1>
-    <p class="sub">Enter your admin key.</p>
+    <h1>Nexora — Licence console</h1>
+    <p class="sub" style="margin:4px 0 12px">Enter the admin key (NEXORA_ADMIN_KEY on the service).</p>
     <div id="gateErr"></div>
-    <div class="row"><input id="key" type="password" placeholder="Admin key" style="flex:1"
-      onkeydown="if(event.key==='Enter')load()"><button class="primary" onclick="load()">Open</button></div>
+    <div class="row"><input id="key" type="password" placeholder="Admin key" style="flex:1" onkeydown="if(event.key==='Enter')load()"><button class="primary" onclick="load()">Open</button></div>
   </div>
+
   <div id="app" style="display:none">
-    <h1>Nexora — Licences</h1>
-    <p class="sub" id="sub"></p>
-    <div class="card">
-      <div class="kpi" id="kpi"></div>
+    <div class="top">
+      <div class="grow"><h1>Nexora — Licence console</h1><p class="sub" id="sub"></p></div>
+      <div class="kpis" id="kpi"></div>
+      <button onclick="load()">Refresh</button>
+      <button data-target="settings" onclick="toggle(this)">Service settings</button>
+      <button onclick="signOut()" title="Forget the key in this browser tab">Sign out</button>
     </div>
-    <div class="card">
-      <div class="row" style="margin-bottom:10px">
-        <b style="flex:1">Settings</b>
-        <label>Demo days <input id="sTrial" type="number" min="1" max="365" style="width:70px"></label>
-        <label>Demo offline days <input id="sGrace" type="number" min="0" max="365" style="width:70px"></label>
-        <label>Working window (min) <input id="sSession" type="number" min="5" max="720" style="width:70px"></label>
-        <label>On expiry
-          <select id="sMode"><option value="READONLY">Read-only</option><option value="HARDSTOP">Hard stop</option></select>
-        </label>
-        <label><input id="sOpen" type="checkbox"> Accept new demos</label>
-        <button class="primary" onclick="saveSettings()">Save</button>
+
+    <div class="card" id="settings" style="display:none">
+      <h2>Service settings <span class="sub" style="font-weight:400">— apply to every installation from its next check</span></h2>
+      <div class="row" style="margin-top:10px">
+        <label>Demo length, days<input id="sTrial" type="number" min="1" max="365" style="width:90px"></label>
+        <label>Demo may work offline, days<input id="sGrace" type="number" min="0" max="365" style="width:90px"></label>
+        <label>Working window, minutes<input id="sSession" type="number" min="5" max="720" style="width:90px"></label>
+        <label>When a licence ends<select id="sMode"><option value="READONLY">Read-only — saved work still opens and prints</option><option value="HARDSTOP">Hard stop</option></select></label>
+        <label style="flex-direction:row;align-items:center;gap:8px;color:var(--text)"><input id="sOpen" type="checkbox">Accept new registrations and demos</label>
+        <button class="primary" onclick="saveSettings()">Save settings</button>
       </div>
-      <div class="sub" style="margin:0;font-size:12px">
-        Applies to every installation from its next check — no new build needed.
-        <b>Demo offline days 0</b> means a demo stops the moment it cannot reach this service;
-        the working window is only how long a good answer is reused before asking again, so the
-        app is not calling on every keystroke. Per-customer offline days are set on the company.
-      </div>
+      <p class="help">A demo with 0 offline days stops the moment it cannot reach this service. The working window is only how long a good answer is reused before the application asks again. Offline days for a paying customer are set on the company.</p>
     </div>
 
     <div class="card">
-      <div class="row" style="margin-bottom:8px">
-        <b style="flex:1">Companies</b>
-        <button class="primary" onclick="showNew()">New company</button>
-        <button onclick="load()">Refresh</button>
+      <div class="top" style="margin-bottom:6px">
+        <h2 class="grow">Companies</h2>
+        <input id="cq" placeholder="Find a company, key, email, GSTIN…" oninput="renderCompanies()" style="min-width:240px">
+        <button class="primary" data-target="newco" onclick="toggle(this)">New company</button>
       </div>
-      <div id="newco" style="display:none;border:1px solid var(--border);border-radius:8px;padding:12px;margin-bottom:12px">
+      <div id="newco" style="display:none;border:1px solid var(--border);border-radius:10px;padding:12px;margin:8px 0 12px">
         <div class="row">
-          <label>Name <input id="nName" placeholder="Satyendra Packaging" style="min-width:200px"></label>
-          <label>Seats <input id="nSeats" type="number" min="1" max="500" value="1" style="width:70px"></label>
-          <label>Days <input id="nDays" type="number" min="1" max="3650" value="365" style="width:80px"></label>
-          <label>Offline days <input id="nGrace" type="number" min="0" max="365" value="0" style="width:70px"></label>
-          <label>GSTIN <input id="nGst" placeholder="optional" maxlength="15" style="min-width:170px;text-transform:uppercase"></label>
-          <label>Email <input id="nEmail" placeholder="optional" style="min-width:160px"></label>
-          <button class="primary" onclick="createCo()">Create</button>
-          <button onclick="document.getElementById('newco').style.display='none'">Cancel</button>
+          <label>Company name<input id="nName" placeholder="Company name" style="min-width:220px"></label>
+          <label>Seats<input id="nSeats" type="number" min="1" max="500" value="1" style="width:80px"></label>
+          <label>Licence days<input id="nDays" type="number" min="1" max="3650" value="365" style="width:90px"></label>
+          <label>Offline days<input id="nGrace" type="number" min="0" max="365" value="0" style="width:90px"></label>
+          <label>GSTIN<input id="nGst" placeholder="15 characters" maxlength="15" style="min-width:170px;text-transform:uppercase"></label>
+          <label>Email<input id="nEmail" placeholder="address" style="min-width:170px"></label>
+          <button class="primary" onclick="createCo()">Create licensed company</button>
+          <button data-target="newco" onclick="toggle(this)">Cancel</button>
         </div>
-        <div class="sub" style="margin:8px 0 0;font-size:12px">
-          A key is generated. Give it to the customer — every machine they install types the same key
-          and takes one seat.
-        </div>
+        <p class="help">For a customer you set up yourself. A licence key is generated; every machine they install types the same key and takes one seat. A plant that registers itself from the application appears here on its own, as a demo.</p>
       </div>
       <div id="coMsg"></div>
-      <div style="overflow-x:auto"><table id="cotbl">
-        <thead><tr><th>Company</th><th>Licence key</th><th>State</th><th>Seats</th><th>Days left</th>
-        <th>Offline</th><th>Transactions</th><th>Hours</th><th>Users</th><th>Actions</th></tr></thead><tbody></tbody></table></div>
-      <div class="sub" style="margin:10px 0 0;font-size:12px">
-        <b>Transactions</b> are committed records — a calculation saved, a revision raised, a BOM saved — summed over the
-        company's machines; <b>Hours</b> is time the application was actually in use. <b>Limit</b> sets how many
-        transactions the licence may commit (0 = no limit; reaching it is read-only, never a shutdown). <b>Days</b> adds
-        licence days. <b>Reset usage</b> starts the count and hours again from zero without touching anything saved.
-        Each machine's own figures are in the Installations list below.
+      <div id="colist"></div>
+      <div class="legend">
+        <div><b>Suspend</b>stops every machine of the company at its next check. Nothing is deleted; Restore puts it all back. Use it when a customer has not paid.</div>
+        <div><b>Revoke</b>(on one installation) stops that one machine and frees its seat for another. The company keeps running.</div>
+        <div><b>Delete</b>removes the company, its machines, its people and everything its seats synced. It cannot be undone from here — the name must be typed to confirm.</div>
+        <div><b>Transactions and hours</b>are what the company has used — saved records, and time in the application — summed over its machines. A limit of 0 means none.</div>
       </div>
     </div>
 
     <div class="card">
-      <div class="row" style="margin-bottom:8px">
-        <b style="flex:1">Installations</b>
-        <input id="q" placeholder="Search company, key, email, device" oninput="render()" style="min-width:200px">
-        <button onclick="load()">Refresh</button>
+      <div class="top" style="margin-bottom:6px">
+        <h2 class="grow">Installations <span class="sub" style="font-weight:400" id="instsub"></span></h2>
+        <input id="q" placeholder="Search company, key, email, device…" oninput="render()" style="min-width:240px">
+        <button class="small" id="clearFilter" style="display:none" onclick="clearCompanyFilter()">Show all companies</button>
       </div>
       <div style="overflow-x:auto"><table id="tbl">
-        <thead><tr><th>Company</th><th>State</th><th>Email</th><th>Days left</th><th>Started</th>
-        <th>Last seen</th><th>Version</th><th>Transactions</th><th>Hours</th><th>Actions</th></tr></thead><tbody></tbody></table></div>
-      <div class="sub" style="margin:10px 0 0;font-size:12px">
-        The clock belongs to the <b>company</b>, not the machine — extend or suspend it above and every
-        seat follows. Revoking one machine only frees its seat so another can take it.
-      </div>
+        <thead><tr><th>Company · machine</th><th>State</th><th>Email</th><th>Days left</th><th>Started</th><th>Last seen</th><th>Version</th><th>Transactions</th><th>Hours</th><th></th></tr></thead><tbody></tbody></table></div>
+      <p class="help">The clock belongs to the company, not the machine. Revoke one machine to free its seat; suspend the company to stop all of them.</p>
     </div>
   </div>
 </div>
 <script>
-let KEY='', DATA={licences:[],companies:[],settings:{}};
-function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+let KEY='', DATA={licences:[],companies:[],settings:{}}, OPEN=null, COFILTER=null;
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function fmt(d){return d?new Date(d).toLocaleDateString(undefined,{day:'2-digit',month:'short',year:'2-digit'}):'—'}
+function toggle(btn){const id=typeof btn==='string'?btn:btn.dataset.target;const n=document.getElementById(id);n.style.display=n.style.display==='none'?'':'none';}
+function say(html){document.getElementById('coMsg').innerHTML=html;if(html)setTimeout(()=>{if(document.getElementById('coMsg').innerHTML===html)say('')},6000);}
+function signOut(){try{sessionStorage.removeItem('nexora_admin_key')}catch(e){}location.reload();}
 async function api(path,opts){
   const r=await fetch(path,Object.assign({headers:{'x-admin-key':KEY,'content-type':'application/json'}},opts||{}));
   if(r.status===401)throw new Error('That admin key was not accepted.');
-  if(!r.ok)throw new Error('Request failed ('+r.status+')');
-  return r.json();
+  let b={};try{b=await r.json()}catch(e){}
+  if(!r.ok&&!b.error)throw new Error('Request failed ('+r.status+')');
+  return b;
 }
 async function load(){
   KEY=KEY||document.getElementById('key').value.trim();
@@ -468,143 +506,170 @@ async function load(){
     document.getElementById('gateErr').innerHTML='<div class="msg err">'+esc(e.message)+'</div>';
   }
 }
-function showNew(){const n=document.getElementById('newco');n.style.display=n.style.display==='none'?'':'none';}
-function say(html){document.getElementById('coMsg').innerHTML=html;}
-
+/* ---------- companies ---------- */
 function gstPill(c){
   const s=c.gst_status||'UNVERIFIED';
   const title=(c.gst_note?esc(c.gst_note)+' · ':'')+(c.gst_checked_at?'checked '+new Date(c.gst_checked_at).toLocaleString():'never checked');
-  return '<span class="pill '+(s==='VERIFIED'?'s-LICENSED':s==='FAILED'?'s-SUSPENDED':'s-EXPIRED')+'" title="'+title+'">'+
+  return '<span class="pill s-'+(s==='VERIFIED'?'LICENSED':s)+'" title="'+title+'">'+
     (s==='VERIFIED'?'GST verified':s==='FAILED'?'GST failed':'GST not yet verified')+'</span>';
 }
-async function gstVerify(id){
-  const r=await fetch('/admin/api/gst',{method:'POST',headers:{'content-type':'application/json','x-admin-key':KEY},body:JSON.stringify({action:'gstverify',id})});
-  const b=await r.json(); if(!r.ok){alert(b.message||'Refused');return;}
-  alert('GST: '+b.gst.status+(b.gst.reason?' — '+b.gst.reason:b.gst.legalName?' — '+b.gst.legalName:'')); load();
-}
-async function gstMark(id,status){
-  const note=status==='VERIFIED'?(prompt('How was it checked? (a note for the record)','Checked on the GST portal by hand')||''):'';
-  const r=await fetch('/admin/api/gst',{method:'POST',headers:{'content-type':'application/json','x-admin-key':KEY},body:JSON.stringify({action:'gstmark',id,status,note})});
-  if(!r.ok){const b=await r.json();alert(b.message||'Refused');return;} load();
-}
-function renderCompanies(){
-  const cos=DATA.companies||[];
-  const fmt=d=>d?new Date(d).toLocaleDateString(undefined,{day:'2-digit',month:'short',year:'2-digit'}):'—';
-  document.querySelector('#cotbl tbody').innerHTML=cos.map(c=>{
-    const state=(c.days_left<=0&&c.state!=='SUSPENDED')?'EXPIRED':c.state;
-    const used=c.seats_used, seats=c.seats;
-    const pct=Math.min(100,Math.round(used/Math.max(1,seats)*100));
-    return '<tr>'+
-      '<td><b>'+esc(c.name)+'</b>'+(c.is_demo?' <span class="pill s-DEMO">demo</span>':'')+
-        (c.self_registered?' <span class="pill s-TRIAL" title="Registered by the plant itself on '+esc(fmt(c.registered_at))+(c.registered_ip?' from '+esc(c.registered_ip):'')+'">self-registered</span>':'')+
-        (c.gstin?'<br><code>GSTIN '+esc(c.gstin)+'</code> '+gstPill(c):'')+
-        (c.email?'<br><code>'+esc(c.email)+'</code>':'')+
-        (c.phone?'<br><code>'+esc(c.phone)+'</code>':'')+
-        (c.login_id?'<br><code>id '+esc(c.login_id)+'</code>':'')+
-        (c.registered_ip?'<br><code title="The address this company registered from">IP '+esc(c.registered_ip)+'</code>':'')+'</td>'+
-      '<td><span class="keycell">'+esc(c.licence_key)+'</span> '+
-        '<button title="Copy" onclick="copyKey(\\''+c.licence_key+'\\')">Copy</button></td>'+
-      '<td><span class="pill s-'+state+'">'+state+'</span></td>'+
-      '<td><span class="seatbar'+(used>=seats?' full':'')+'">'+used+' of '+seats+
-        '<i><b style="width:'+pct+'%"></b></i></span></td>'+
-      '<td>'+(state==='EXPIRED'||state==='SUSPENDED'?fmt(c.expires_at):c.days_left+'<br><code>'+fmt(c.expires_at)+'</code>')+'</td>'+
-      '<td>'+(c.grace_days>0?c.grace_days+' d':'<span title="Stops as soon as it cannot reach the service">none</span>')+'</td>'+
-      '<td>'+txnCell(c.txn_used,c.txn_limit)+'</td>'+
-      '<td>'+hoursText(c.usage_minutes)+'</td>'+
-      '<td>'+usersCell(c)+'</td>'+
-      '<td><div class="tools">'+
-        '<button onclick="coDays('+c.id+')">Days…</button>'+
-        (c.gstin?'<button onclick="gstVerify('+c.id+')" title="Ask the configured GST verification service again">Verify GST</button>'+
-          (c.gst_status!=='VERIFIED'?'<button onclick="gstMark('+c.id+',\\'VERIFIED\\')" title="Record that you checked this GSTIN by hand">GST ok</button>'
-            :'<button onclick="gstMark('+c.id+',\\'UNVERIFIED\\')" title="Take the verified mark off">Unverify</button>'):'')+
-        '<button onclick="coAdmin('+c.id+',\\''+esc(c.name).replace(/'/g,'')+'\\')">Admin user…</button>'+
-        '<button onclick="coAct('+c.id+',\\'extend\\',365)">+1 yr</button>'+
-        (c.is_demo?'<button class="primary" onclick="coAct('+c.id+',\\'licence\\',365)">Make licensed</button>':'')+
-        '<button onclick="coSeats('+c.id+','+seats+')">Seats</button>'+
-        '<button onclick="coGrace('+c.id+','+c.grace_days+')">Offline</button>'+
-        '<button onclick="coLimit('+c.id+','+(c.txn_limit||0)+')">Limit</button>'+
-        '<button onclick="coReset('+c.id+',\\''+esc(c.name).replace(/'/g,'')+'\\')">Reset usage</button>'+
-        (c.state==='SUSPENDED'
-          ?'<button onclick="coAct('+c.id+',\\'restore\\',0)">Restore</button>'
-          :'<button onclick="coAct('+c.id+',\\'suspend\\',0)">Suspend</button>')+
-      '</div></td></tr>';
-  }).join('')||'<tr><td colspan="10" style="color:var(--muted)">No companies yet. Every demo creates one automatically.</td></tr>';
-}
-/* 4.8.0 — who can sign in on this company's seats. The owner creates the
-   first administrator here; that person adds everyone else from inside
-   the application (Settings → Users & Access). */
 function usersCell(c){
   const n=+c.users_count||0;
-  if(!n)return '<span style="color:var(--warn)">none yet</span><br><span style="color:var(--muted);font-size:11px">Admin user… creates the first</span>';
-  return '<b>'+n+'</b>'+(c.admin_names?'<br><span style="color:var(--muted);font-size:11px">admin: '+esc(c.admin_names)+'</span>':'<br><span style="color:var(--bad);font-size:11px">no administrator</span>');
+  if(!n)return '<b style="color:var(--warn)">none yet</b><small> — set an administrator under People</small>';
+  return '<b>'+n+'</b>'+(c.admin_names?'<small> · admin '+esc(c.admin_names)+'</small>':'<small style="color:var(--bad)"> · no administrator</small>');
 }
-async function coAdmin(id,name){
-  const who=prompt('Administrator for '+name+'\\n\\nName the person who will manage users and see every calculation. If a user of that name exists, they become the administrator and get the new PIN.','Administrator');
-  if(who===null||!who.trim())return;
-  const pin=prompt('PIN for '+who.trim()+' (at least 4 characters). Tell it to them directly; it is not shown again.');
-  if(pin===null)return;
-  const r=await api('/admin/api/company',{method:'POST',body:JSON.stringify({id,action:'adminuser',name:who.trim(),pin})});
-  if(r.error){say('<div class="msg err">'+esc(r.error)+'</div>');return;}
-  say('<div class="msg ok">'+esc(r.warning||'Done.')+'</div>');
-  await load();
-}
-/* 4.6.0 — usage, shown the way the app shows it: used of limit with a
-   bar, amber inside 10% of the limit, red at it; blue when no limit. */
 function txnCell(used,limit){
   used=+used||0;limit=+limit||0;
-  if(!limit)return '<b>'+used+'</b> <span style="color:var(--muted)">· no limit</span>';
+  if(!limit)return '<b>'+used+'</b><small> · no limit</small>';
   const pct=Math.min(100,Math.round(used/limit*100));
-  const cls=used>=limit?' full':'';
   const col=used>=limit?'var(--bad)':(used>=limit*0.9?'var(--warn)':'var(--accent)');
-  return '<span class="seatbar'+cls+'"><b>'+used+'</b> of '+limit+'<i><b style="width:'+pct+'%;background:'+col+'"></b></i></span>'+
-    (used>=limit?'<br><span style="color:var(--bad);font-size:11px">limit reached — read-only</span>':'');
+  return '<b>'+used+'</b><small> of '+limit+'</small><span class="bar'+(used>=limit?' full':'')+'"><i style="width:'+pct+'%;background:'+col+'"></i></span>'+
+    (used>=limit?'<small style="color:var(--bad)">limit reached — read-only</small>':'');
 }
 function hoursText(mins){mins=+mins||0;const h=Math.floor(mins/60),m=mins%60;return h?h+' h '+m+' m':m+' m';}
-async function coDays(id){
+function renderCompanies(){
+  const term=(document.getElementById('cq').value||'').toLowerCase();
+  const cos=(DATA.companies||[]).filter(c=>!term||[c.name,c.licence_key,c.email,c.gstin,c.login_id,c.phone].some(v=>String(v||'').toLowerCase().includes(term)));
+  document.getElementById('colist').innerHTML=cos.map(c=>{
+    const state=(c.days_left<=0&&c.state!=='SUSPENDED')?'EXPIRED':c.state;
+    const used=c.seats_used, seats=c.seats, pct=Math.min(100,Math.round(used/Math.max(1,seats)*100));
+    const open=OPEN===c.id;
+    return '<div class="co'+(c.state==='SUSPENDED'?' suspended':'')+'" id="co-'+c.id+'">'+
+      '<div class="co-head">'+
+        '<div class="grow" style="flex:1">'+
+          '<span class="co-name">'+esc(c.name)+'</span> '+
+          '<span class="pill s-'+state+'">'+(state==='DEMO'?'demo':state.toLowerCase())+'</span> '+
+          (c.self_registered?'<span class="pill s-SELF" title="Registered by the plant itself on '+esc(fmt(c.registered_at))+(c.registered_ip?' from '+esc(c.registered_ip):'')+'">self-registered</span> ':'')+
+          (c.gstin?gstPill(c):'')+
+          '<div class="co-meta">'+
+            '<span>Key <span class="key">'+esc(c.licence_key)+'</span> <button class="small" data-key="'+esc(c.licence_key)+'" onclick="copyKey(this)">Copy</button></span>'+
+            (c.gstin?'<span>GSTIN <code>'+esc(c.gstin)+'</code></span>':'')+
+            (c.email?'<span><code>'+esc(c.email)+'</code></span>':'')+
+            (c.phone?'<span><code>'+esc(c.phone)+'</code></span>':'')+
+            (c.login_id?'<span>Login id <code>'+esc(c.login_id)+'</code></span>':'')+
+            (c.registered_ip?'<span title="The address this company registered from">IP <code>'+esc(c.registered_ip)+'</code></span>':'')+
+          '</div>'+
+        '</div>'+
+        '<div><button'+(open?' class="primary"':'')+' data-id="'+c.id+'" onclick="manage(this)">'+(open?'Close':'Manage')+'</button></div>'+
+      '</div>'+
+      '<div class="co-facts">'+
+        '<div class="fact"><span>Seats</span><b>'+used+' of '+seats+'</b><span class="bar'+(used>=seats?' full':'')+'"><i style="width:'+pct+'%"></i></span></div>'+
+        '<div class="fact"><span>'+(state==='EXPIRED'?'Ended':state==='SUSPENDED'?'Suspended · ends':'Days left')+'</span><b>'+(state==='EXPIRED'||state==='SUSPENDED'?fmt(c.expires_at):c.days_left)+'</b>'+(state==='EXPIRED'||state==='SUSPENDED'?'':'<small>'+fmt(c.expires_at)+'</small>')+'</div>'+
+        '<div class="fact"><span>Offline allowed</span><b>'+(c.grace_days>0?c.grace_days+' days':'none')+'</b>'+(c.grace_days>0?'':'<small>stops when it cannot reach the service</small>')+'</div>'+
+        '<div class="fact"><span>Transactions</span>'+txnCell(c.txn_used,c.txn_limit)+'</div>'+
+        '<div class="fact"><span>Hours in use</span><b>'+hoursText(c.usage_minutes)+'</b></div>'+
+        '<div class="fact"><span>People</span>'+usersCell(c)+'</div>'+
+      '</div>'+
+      '<div class="manage'+(open?' open':'')+'" id="mg-'+c.id+'">'+
+        '<div class="group"><h4>Licence</h4><div class="acts">'+
+          (c.is_demo?'<button class="primary" data-id="'+c.id+'" data-action="licence" data-days="365" onclick="coAct(this)">Make licensed for 1 year</button><span class="why">turns this demo into a paying customer</span>':'')+
+          '<button data-id="'+c.id+'" onclick="coDays(this)">Add days…</button>'+
+          '<button data-id="'+c.id+'" data-action="extend" data-days="365" onclick="coAct(this)">+1 year</button>'+
+        '</div></div>'+
+        '<div class="group"><h4>Machines</h4><div class="acts">'+
+          '<button data-id="'+c.id+'" data-now="'+seats+'" onclick="coSeats(this)">Seats…</button><span class="why">how many computers may run on this licence</span>'+
+          '<button data-id="'+c.id+'" data-now="'+c.grace_days+'" onclick="coGrace(this)">Offline days…</button>'+
+          '<button data-id="'+c.id+'" onclick="showInstallations(this)">Show its installations</button>'+
+        '</div></div>'+
+        '<div class="group"><h4>People</h4><div class="acts">'+
+          '<button data-id="'+c.id+'" data-name="'+esc(c.name)+'" onclick="coAdmin(this)">Set administrator…</button><span class="why">the person who adds everyone else from inside the application</span>'+
+        '</div></div>'+
+        (c.gstin?'<div class="group"><h4>GST</h4><div class="acts">'+
+          '<button data-id="'+c.id+'" onclick="gstVerify(this)">Verify online</button><span class="why">asks the verification service, if one is configured</span>'+
+          (c.gst_status!=='VERIFIED'?'<button data-id="'+c.id+'" data-status="VERIFIED" onclick="gstMark(this)">Mark checked by hand</button>':'<button data-id="'+c.id+'" data-status="UNVERIFIED" onclick="gstMark(this)">Take the verified mark off</button>')+
+        '</div></div>':'')+
+        '<div class="group"><h4>Usage</h4><div class="acts">'+
+          '<button data-id="'+c.id+'" data-now="'+(c.txn_limit||0)+'" onclick="coLimit(this)">Transaction limit…</button>'+
+          '<button data-id="'+c.id+'" data-name="'+esc(c.name)+'" onclick="coReset(this)">Reset usage</button><span class="why">count and hours from zero; nothing saved is touched</span>'+
+        '</div></div>'+
+        '<div class="group"><h4>Stop</h4><div class="acts">'+
+          (c.state==='SUSPENDED'
+            ?'<button data-id="'+c.id+'" data-action="restore" data-days="0" onclick="coAct(this)">Restore</button><span class="why">every machine runs again</span>'
+            :'<button class="danger" data-id="'+c.id+'" data-action="suspend" data-days="0" onclick="coAct(this)">Suspend</button><span class="why">every machine stops at its next check; nothing is deleted</span>')+
+          '<button class="danger" data-id="'+c.id+'" data-name="'+esc(c.name)+'" onclick="coDelete(this)">Delete…</button><span class="why">removes the company and everything that belongs to it</span>'+
+        '</div></div>'+
+      '</div>'+
+    '</div>';
+  }).join('')||'<p class="help">No companies yet. A plant that registers itself from the application appears here as a demo; a customer you set up yourself is created with New company.</p>';
+}
+function manage(btn){const id=+btn.dataset.id;OPEN=OPEN===id?null:id;renderCompanies();if(OPEN)document.getElementById('co-'+OPEN).scrollIntoView({block:'nearest'});}
+function copyKey(btn){const k=btn.dataset.key;try{navigator.clipboard.writeText(k);say('<div class="msg ok">Copied '+esc(k)+'</div>');}catch(e){prompt('Licence key',k);}}
+async function coAct(btn){
+  const id=+btn.dataset.id,action=btn.dataset.action,days=+btn.dataset.days||0;
+  if(action==='suspend'&&!confirm('Suspend this company?\\n\\nEVERY machine on this licence stops calculating at its next check. Nothing is deleted; Restore puts it back.'))return;
+  const r=await api('/admin/api/company',{method:'POST',body:JSON.stringify({id,action,days})});
+  if(r.error){say('<div class="msg err">'+esc(r.error)+'</div>');return;}
+  if(r.warning)say('<div class="msg warn">'+esc(r.warning)+'</div>');
+  await load();
+}
+async function coDays(btn){
   const v=prompt('Add how many days to this licence?\\n\\nThe company\\'s clock moves; every seat follows.','30');
   if(v===null)return;
   const days=parseInt(v,10);
   if(!(days>0)){say('<div class="msg err">Enter a number of days.</div>');return;}
-  await coAct(id,'extend',days);
+  btn.dataset.action='extend';btn.dataset.days=String(days);await coAct(btn);
 }
-async function coLimit(id,now){
-  const v=prompt('How many transactions may this licence commit?\\n\\n0 = no limit. Reaching the limit makes the machines READ-ONLY: everything saved still opens and prints.',now);
+async function coSeats(btn){
+  const v=prompt('How many machines may run on this licence?',btn.dataset.now);
   if(v===null)return;
-  const r=await api('/admin/api/company',{method:'POST',body:JSON.stringify({id,action:'txnlimit',txnLimit:+v})});
+  const r=await api('/admin/api/company',{method:'POST',body:JSON.stringify({id:+btn.dataset.id,action:'seats',seats:+v})});
   if(r.error){say('<div class="msg err">'+esc(r.error)+'</div>');return;}
-  if(r.warning)say('<div class="msg warn">'+esc(r.warning)+'</div>');else say('');
+  if(r.warning)say('<div class="msg warn">'+esc(r.warning)+'</div>');
   await load();
 }
-async function coReset(id,name){
-  if(!confirm('Start '+name+'\\'s transaction count and hours again from zero, on every machine?\\n\\nNothing saved is touched. A limit that was reached is no longer reached.'))return;
-  const r=await api('/admin/api/company',{method:'POST',body:JSON.stringify({id,action:'resetusage'})});
-  if(r.error){say('<div class="msg err">'+esc(r.error)+'</div>');return;}
-  say('<div class="msg ok">Usage reset for <b>'+esc(name)+'</b>.</div>');
-  await load();
-}
-function copyKey(k){
-  try{navigator.clipboard.writeText(k);say('<div class="msg ok">Copied '+esc(k)+'</div>');
-      setTimeout(()=>say(''),2500);}catch(e){prompt('Licence key',k);}
-}
-async function coAct(id,action,days){
-  if(action==='suspend'&&!confirm('Suspend this company? EVERY machine on this licence stops calculating at its next check.'))return;
-  const r=await api('/admin/api/company',{method:'POST',body:JSON.stringify({id,action,days})});
-  if(r.error){say('<div class="msg err">'+esc(r.error)+'</div>');return;}
-  if(r.warning)say('<div class="msg warn">'+esc(r.warning)+'</div>');else say('');
-  await load();
-}
-async function coSeats(id,now){
-  const v=prompt('How many machines may run on this licence?',now);
+async function coGrace(btn){
+  const v=prompt('How many days may this customer work with no contact with the service?\\n\\n0 = none: it stops as soon as it cannot reach us.',btn.dataset.now);
   if(v===null)return;
-  const r=await api('/admin/api/company',{method:'POST',body:JSON.stringify({id,action:'seats',seats:+v})});
-  if(r.error){say('<div class="msg err">'+esc(r.error)+'</div>');return;}
-  if(r.warning)say('<div class="msg warn">'+esc(r.warning)+'</div>');else say('');
+  await api('/admin/api/company',{method:'POST',body:JSON.stringify({id:+btn.dataset.id,action:'grace',graceDays:+v})});
   await load();
 }
-async function coGrace(id,now){
-  const v=prompt('How many days may this customer work with no contact with the service?\\n\\n0 = none: it stops as soon as it cannot reach us.',now);
+async function coLimit(btn){
+  const v=prompt('How many transactions may this licence commit?\\n\\n0 = no limit. Reaching the limit makes the machines READ-ONLY: everything saved still opens and prints.',btn.dataset.now);
   if(v===null)return;
-  await api('/admin/api/company',{method:'POST',body:JSON.stringify({id,action:'grace',graceDays:+v})});
+  const r=await api('/admin/api/company',{method:'POST',body:JSON.stringify({id:+btn.dataset.id,action:'txnlimit',txnLimit:+v})});
+  if(r.error){say('<div class="msg err">'+esc(r.error)+'</div>');return;}
+  if(r.warning)say('<div class="msg warn">'+esc(r.warning)+'</div>');
+  await load();
+}
+async function coReset(btn){
+  if(!confirm('Start '+btn.dataset.name+'\\'s transaction count and hours again from zero, on every machine?\\n\\nNothing saved is touched. A limit that was reached is no longer reached.'))return;
+  const r=await api('/admin/api/company',{method:'POST',body:JSON.stringify({id:+btn.dataset.id,action:'resetusage'})});
+  if(r.error){say('<div class="msg err">'+esc(r.error)+'</div>');return;}
+  say('<div class="msg ok">Usage reset for <b>'+esc(btn.dataset.name)+'</b>.</div>');
+  await load();
+}
+async function coAdmin(btn){
+  const name=btn.dataset.name;
+  const who=prompt('Administrator for '+name+'\\n\\nName the person who will manage users and see every calculation. If a user of that name exists, they become the administrator and get the new PIN.','Administrator');
+  if(who===null||!who.trim())return;
+  const pin=prompt('PIN for '+who.trim()+' (at least 4 characters). Tell it to them directly; it is not shown again.');
+  if(pin===null)return;
+  const r=await api('/admin/api/company',{method:'POST',body:JSON.stringify({id:+btn.dataset.id,action:'adminuser',name:who.trim(),pin})});
+  if(r.error){say('<div class="msg err">'+esc(r.error)+'</div>');return;}
+  say('<div class="msg ok">'+esc(r.warning||'Done.')+'</div>');
+  await load();
+}
+async function coDelete(btn){
+  const name=btn.dataset.name;
+  const typed=prompt('Delete '+name+'?\\n\\nThis removes the company, its machines, its people and everything its seats synced. It cannot be undone from here.\\n\\nType the company name exactly to confirm:');
+  if(typed===null)return;
+  const r=await api('/admin/api/company',{method:'POST',body:JSON.stringify({id:+btn.dataset.id,action:'delete',confirmName:typed})});
+  if(r.error){say('<div class="msg err">'+esc(r.error)+'</div>');return;}
+  const x=r.removed||{};
+  say('<div class="msg ok">Deleted <b>'+esc(r.name)+'</b> — '+(x.installations||0)+' installation(s), '+(x.users||0)+' user(s), '+(x.records||0)+' synced record(s), '+(x.inkModels||0)+' ink model(s).</div>');
+  OPEN=null;await load();
+}
+async function gstVerify(btn){
+  const r=await api('/admin/api/gst',{method:'POST',body:JSON.stringify({action:'gstverify',id:+btn.dataset.id})});
+  if(r.error){say('<div class="msg err">'+esc(r.message||r.error)+'</div>');return;}
+  say('<div class="msg '+(r.gst.status==='VERIFIED'?'ok':r.gst.status==='FAILED'?'err':'warn')+'">GST '+esc(r.gst.status.toLowerCase())+(r.gst.reason?' — '+esc(r.gst.reason):r.gst.legalName?' — '+esc(r.gst.legalName):'')+'</div>');
+  await load();
+}
+async function gstMark(btn){
+  const status=btn.dataset.status;
+  const note=status==='VERIFIED'?(prompt('How was it checked? (a note for the record)','Checked on the GST portal by hand')||''):'';
+  const r=await api('/admin/api/gst',{method:'POST',body:JSON.stringify({action:'gstmark',id:+btn.dataset.id,status,note})});
+  if(r.error){say('<div class="msg err">'+esc(r.message||r.error)+'</div>');return;}
   await load();
 }
 async function createCo(){
@@ -619,59 +684,56 @@ async function createCo(){
     email:document.getElementById('nEmail').value.trim()})});
   if(r.error){say('<div class="msg err">'+esc(r.error)+'</div>');return;}
   document.getElementById('newco').style.display='none';
-  document.getElementById('nName').value='';document.getElementById('nEmail').value='';
+  document.getElementById('nName').value='';document.getElementById('nEmail').value='';document.getElementById('nGst').value='';
   await load();
-  say('<div class="msg ok"><b>'+esc(r.company.name)+'</b> created. Licence key <span class="keycell">'+
-      esc(r.company.licence_key)+'</span> — give this to the customer; every machine types it at activation.</div>');
+  say('<div class="msg ok"><b>'+esc(r.company.name)+'</b> created. Licence key <span class="key">'+esc(r.company.licence_key)+'</span> — give this to the customer; every machine types it at activation.</div>');
 }
-
+/* ---------- installations ---------- */
+function showInstallations(btn){COFILTER=+btn.dataset.id;render();document.getElementById('tbl').scrollIntoView({behavior:'smooth',block:'start'});}
+function clearCompanyFilter(){COFILTER=null;render();}
 function render(){
   const term=(document.getElementById('q').value||'').toLowerCase();
-  const rows=DATA.licences.filter(l=>!term||
-    [l.company,l.co_name,l.co_key,l.email,l.device_id,l.device_name].some(v=>String(v||'').toLowerCase().includes(term)));
-  const all=DATA.licences;
-  const cos=DATA.companies||[];
-  const n=st=>all.filter(l=>l.state===st).length;
+  const all=DATA.licences, cos=DATA.companies||[];
+  const rows=all.filter(l=>(!COFILTER||l.company_id===COFILTER)&&(!term||[l.company,l.co_name,l.co_key,l.email,l.device_id,l.device_name].some(v=>String(v||'').toLowerCase().includes(term))));
   const live=all.filter(l=>l.days_left>0&&l.state!=='REVOKED').length;
   document.getElementById('kpi').innerHTML=
-    '<div><b>'+cos.filter(c=>!c.is_demo).length+'</b><span>Customers</span></div>'+
-    '<div><b>'+cos.filter(c=>c.is_demo).length+'</b><span>Demos</span></div>'+
-    '<div><b>'+all.length+'</b><span>Installations</span></div>'+
-    '<div><b>'+live+'</b><span>Running</span></div>'+
-    '<div><b>'+n('REVOKED')+'</b><span>Revoked</span></div>';
-  document.getElementById('sub').textContent=rows.length+' of '+all.length+' shown';
-  const fmt=d=>d?new Date(d).toLocaleDateString(undefined,{day:'2-digit',month:'short',year:'2-digit'}):'—';
+    '<div class="kpi"><b>'+cos.filter(c=>!c.is_demo).length+'</b><span>Customers</span></div>'+
+    '<div class="kpi"><b>'+cos.filter(c=>c.is_demo).length+'</b><span>Demos</span></div>'+
+    '<div class="kpi"><b>'+all.length+'</b><span>Installations</span></div>'+
+    '<div class="kpi"><b>'+live+'</b><span>Running</span></div>';
+  document.getElementById('sub').textContent=cos.length+' compan'+(cos.length===1?'y':'ies')+' · '+all.length+' installation'+(all.length===1?'':'s');
+  const fc=COFILTER?cos.find(c=>c.id===COFILTER):null;
+  document.getElementById('instsub').textContent=fc?'— '+fc.name+' only':'— '+rows.length+' of '+all.length;
+  document.getElementById('clearFilter').style.display=COFILTER?'':'none';
   document.querySelector('#tbl tbody').innerHTML=rows.map(l=>{
     let state=(l.state==='TRIAL'&&l.days_left<=0)?'EXPIRED':l.state;
     if(l.co_state==='SUSPENDED'&&state!=='REVOKED')state='SUSPENDED';
     return '<tr>'+
-      '<td><b>'+esc(l.co_name||l.company||'—')+'</b>'+
-        (l.seat_no?' <code>seat '+l.seat_no+' of '+(l.co_seats||1)+'</code>':'')+
-        (l.co_key?'<br><span class="keycell">'+esc(l.co_key)+'</span>':'')+
-        '<br><code>'+esc(String(l.device_id).slice(0,12))+'…</code>'+
-        (l.device_name?' <code>'+esc(l.device_name)+'</code>':'')+'</td>'+
-      '<td><span class="pill s-'+state+'">'+state+'</span></td>'+
+      '<td><b>'+esc(l.co_name||l.company||'—')+'</b>'+(l.seat_no?' <code>seat '+l.seat_no+' of '+(l.co_seats||1)+'</code>':'')+
+        '<br><code>'+esc(String(l.device_id).slice(0,12))+'…</code>'+(l.device_name?' <code>'+esc(l.device_name)+'</code>':'')+'</td>'+
+      '<td><span class="pill s-'+state+'">'+state.toLowerCase()+'</span></td>'+
       '<td>'+esc(l.email||'—')+'</td>'+
       '<td>'+(state==='EXPIRED'||state==='REVOKED'?'—':l.days_left)+'</td>'+
       '<td>'+fmt(l.trial_started_at)+'</td>'+
       '<td>'+fmt(l.last_seen_at)+'</td>'+
       '<td>'+esc(l.app_version||'—')+'</td>'+
-      '<td><b>'+(+l.txn_count||0)+'</b>'+(l.usage_reset_at?'<br><span style="font-size:11px;color:var(--muted)">reset '+fmt(l.usage_reset_at)+'</span>':'')+'</td>'+
+      '<td><b>'+(+l.txn_count||0)+'</b>'+(l.usage_reset_at?'<br><code>reset '+fmt(l.usage_reset_at)+'</code>':'')+'</td>'+
       '<td>'+hoursText(l.usage_minutes)+'</td>'+
-      '<td><div class="tools">'+
-        '<button onclick="act(\\''+l.device_id+'\\',\\'resetusage\\',0)">Reset usage</button>'+
+      '<td><div class="acts">'+
+        '<button class="small" data-device="'+esc(l.device_id)+'" data-action="resetusage" onclick="act(this)">Reset usage</button>'+
         (l.state==='REVOKED'
-          ?'<button onclick="act(\\''+l.device_id+'\\',\\'restore\\',0)">Restore</button>'
-          :'<button onclick="act(\\''+l.device_id+'\\',\\'revoke\\',0)">Revoke — frees the seat</button>')+
+          ?'<button class="small" data-device="'+esc(l.device_id)+'" data-action="restore" onclick="act(this)">Restore</button>'
+          :'<button class="small danger" data-device="'+esc(l.device_id)+'" data-action="revoke" onclick="act(this)" title="Stops this machine and frees its seat">Revoke</button>')+
       '</div></td></tr>';
-  }).join('')||'<tr><td colspan="10" style="color:var(--muted)">Nothing yet — no one has installed it.</td></tr>';
+  }).join('')||'<tr><td colspan="10" class="help">Nothing here yet.</td></tr>';
 }
-async function act(deviceId,action,days){
-  if(action==='revoke'&&!confirm('Revoke this installation? It stops calculating at its next check, and its seat is freed for another machine.'))return;
+async function act(btn){
+  const deviceId=btn.dataset.device,action=btn.dataset.action;
+  if(action==='revoke'&&!confirm('Revoke this installation?\\n\\nIt stops calculating at its next check, and its seat is freed for another machine. The company keeps running.'))return;
   if(action==='resetusage'&&!confirm('Start this machine\\'s transaction count and hours again from zero? Nothing saved is touched.'))return;
-  const r=await api('/admin/api/licence',{method:'POST',body:JSON.stringify({deviceId,action,days})});
+  const r=await api('/admin/api/licence',{method:'POST',body:JSON.stringify({deviceId,action,days:0})});
   if(r.error){say('<div class="msg err">'+esc(r.error)+'</div>');return;}
-  if(r.warning)say('<div class="msg warn">'+esc(r.warning)+'</div>');else say('');
+  if(r.warning)say('<div class="msg warn">'+esc(r.warning)+'</div>');
   await load();
 }
 async function saveSettings(){
@@ -681,6 +743,7 @@ async function saveSettings(){
     sessionMinutes:+document.getElementById('sSession').value,
     expiredMode:document.getElementById('sMode').value,
     signupsOpen:document.getElementById('sOpen').checked})});
+  say('<div class="msg ok">Settings saved.</div>');
   await load();
 }
 try{const k=sessionStorage.getItem('nexora_admin_key');if(k){KEY=k;load();}}catch(e){}
