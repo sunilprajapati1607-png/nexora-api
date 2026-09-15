@@ -1,13 +1,14 @@
 /**
- * Nexora API — ink models  (4.16.0, BETA)
+ * Nexora API — ink models  (4.19.0, BETA)
  * ======================================================================
  * A company's fitted ink coefficients, one row per substrate, and the
  * two calls the application makes against them: train, and predict.
  *
  * WHAT IS STORED, AND WHAT IS NOT
  * ----------------------------------------------------------------------
- * Stored: five coefficients, how many jobs they were fitted on, how well
- * they fit, and when. That is the whole row.
+ * Stored: five coefficients, the thinner ratio learned from the jobs that
+ * measured their solvent, how many jobs it was fitted on, how well it fits,
+ * and when. That is the whole row.
  *
  * NOT stored, not received, not logged: the artwork. The application
  * measures its own images and sends coverage — four fractions and a bare
@@ -37,10 +38,24 @@ export async function ensureInkSchema() {
       r2          REAL,
       rmse        REAL,
       confidence  TEXT,
+      thinner     REAL,
       updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
       updated_by  BIGINT,
       PRIMARY KEY (company_id, substrate)
     )`);
+  /* 4.19.0 — thinner.
+     CREATE TABLE IF NOT EXISTS does NOTHING to a table that already
+     exists, so the column above reaches a fresh database and no other.
+     Every installation that ran 4.16.0 already has this table without
+     it, and the very next SELECT would fail on a column that is not
+     there. A column added after the fact needs its own statement, and
+     that statement has to be safe to run on every boot — which ADD
+     COLUMN IF NOT EXISTS is.
+
+     Every migration from here on belongs in this list, in order. The
+     table definition above is only ever read by a database that has
+     never seen Nexora. */
+  await q('ALTER TABLE ink_models ADD COLUMN IF NOT EXISTS thinner REAL');
   return true;
 }
 
@@ -51,7 +66,7 @@ export async function getModel(companyId, substrateId) {
   const sub = SUB(substrateId);
   if (!companyId) return { coefficients: defaultCoefficients(sub), n: 0, source: 'DEFAULT', substrate: sub };
   const rows = await q(
-    `SELECT coeffs, samples, r2, rmse, confidence, updated_at FROM ink_models WHERE company_id = $1 AND substrate = $2`,
+    `SELECT coeffs, samples, r2, rmse, confidence, thinner, updated_at FROM ink_models WHERE company_id = $1 AND substrate = $2`,
     [companyId, sub]);
   const row = rows && rows[0];
   if (!row) return { coefficients: defaultCoefficients(sub), n: 0, source: 'DEFAULT', substrate: sub };
@@ -61,6 +76,7 @@ export async function getModel(companyId, substrateId) {
     n: row.samples || 0,
     r2: row.r2,
     rmse: row.rmse,
+    thinner: row.thinner == null ? null : Number(row.thinner),
     confidence: row.confidence || null,
     updatedAt: row.updated_at,
     source: 'TRAINED',
@@ -94,7 +110,9 @@ export async function train(companyId, userId, body) {
      at, and the count of what was used comes back. */
   const samples = raw.map((s) => {
     if (s && isFinite(Number(s.gsmPerM2)) && Number(s.gsmPerM2) > 0 && s.coverage) {
-      return { id: s.id || null, coverage: s.coverage, gsmPerM2: Number(s.gsmPerM2) };
+      const row = { id: s.id || null, coverage: s.coverage, gsmPerM2: Number(s.gsmPerM2) };
+      if (isFinite(Number(s.solventRatio)) && Number(s.solventRatio) >= 0) row.solventRatio = Number(s.solventRatio);
+      return row;
     }
     return sampleFromJob(s);
   }).filter(Boolean);
@@ -112,13 +130,16 @@ export async function train(companyId, userId, body) {
 
   if (companyId) {
     await q(
-      `INSERT INTO ink_models (company_id, substrate, coeffs, samples, r2, rmse, confidence, updated_at, updated_by)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, now(), $8)
+      `INSERT INTO ink_models (company_id, substrate, coeffs, samples, r2, rmse, confidence, thinner, updated_at, updated_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now(), $9)
        ON CONFLICT (company_id, substrate) DO UPDATE SET
          coeffs = EXCLUDED.coeffs, samples = EXCLUDED.samples, r2 = EXCLUDED.r2,
          rmse = EXCLUDED.rmse, confidence = EXCLUDED.confidence,
+         /* A run in which nobody measured the solvent must not erase
+            what earlier runs learned about it. */
+         thinner = COALESCE(EXCLUDED.thinner, ink_models.thinner),
          updated_at = now(), updated_by = EXCLUDED.updated_by`,
-      [companyId, sub, JSON.stringify(coeffs), result.n, result.r2, result.rmse, result.confidence, userId || null]);
+      [companyId, sub, JSON.stringify(coeffs), result.n, result.r2, result.rmse, result.confidence, result.thinner, userId || null]);
   }
 
   return {
@@ -134,6 +155,8 @@ export async function train(companyId, userId, body) {
       mape: result.mape,
       lambda: result.lambda,
       confidence: result.confidence,
+      thinner: result.thinner,
+      thinnerFrom: result.thinnerFrom,
       residuals: result.residuals,
       stored: !!companyId
     }
@@ -152,7 +175,12 @@ export async function estimate(companyId, body) {
   const out = predict({
     substrate: sub,
     analysis: analysis,
-    whiteMode: b.whiteMode,
+    /* 4.19.0 — the patch the plant chose, the laydown it stated, and its
+       own solvent figures where it has them. The white INSIDE the design
+       comes with the analysis, not from here. */
+    whitePatch: b.whitePatch || b.whiteMode,
+    inkGsm: b.inkGsm || null,
+    solvent: b.solvent || (model.thinner != null ? { thinner: model.thinner } : null),
     model: model.coefficients,
     area: b.area || {}
   });

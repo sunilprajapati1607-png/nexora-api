@@ -1,111 +1,123 @@
 /**
- * Nexora — Ink assumption engine  (4.16.0, BETA)
+ * Nexora — Ink assumption engine  (4.19.0, BETA)  ·  runs on the SERVICE
  * ======================================================================
- * "user will train the machine with first 10 to 100 jpg or png, it will
- *  create one ML module; when user uploads his png/jpg they can know how
- *  much ink per kg / BOPP this item will consume. CMYK base, with solvent
- *  as per the model. All jpg/png stay in the local system but the
- *  algorithm engine is server based. Used in the BOM where flexo printing
- *  or BOPP is required. Also add a background white patch option."
+ * The arithmetic that turns a measured artwork into ink, solvent and
+ * money. It lives here and not in the application: the application can
+ * read a picture; what that picture costs is the product.
  *
- * WHAT THIS FILE IS, AND IS NOT
+ * REDEFINED IN 4.19.0, after reading the trade's own figures
  * ----------------------------------------------------------------------
- * It is the arithmetic: how a picture becomes ink, and how a plant's own
- * measurements correct that arithmetic. It is a pure module — same inputs,
- * same outputs, no storage, no network, no DOM — so the same code can run
- * in the window and on the server, and be tested without either.
+ * The first cut treated both printing processes as one thing with a
+ * different anilox. They are not, and the difference shows up in the
+ * solvent more than anywhere else:
  *
- * It is NOT a claim to know a plant's ink usage. Until a plant has trained
- * it, every figure it produces comes from published trade practice and is
- * labelled an assumption. After training it produces the plant's own
- * numbers and says how well they fit.
+ *   WOVEN PP FABRIC — flexo, water-based
+ *     · layer 2–5 µm wet at full coverage, i.e. 2–5 g/m²
+ *     · anilox 80–100 lpi for sacks (coarse, high volume); an 8 BCM roll
+ *       is the common reference, and 1 BCM/in² = 1.55 cm³/m²
+ *     · transfer ~25–35% of cell volume
+ *     · WATER-BASED inks dominate here: solids 40–50%, so what dries on
+ *       the bag is nearly half of what is drawn from the drum
+ *     · thinner added at the press 20–30%
  *
- * THE PHYSICS  (why the numbers are what they are)
+ *   BOPP FILM — rotogravure, solvent-based, reverse printed
+ *     · the cylinder's engraved cells meter the ink; consumption is
+ *       Σ(cell volume by tone) × impressions × a transfer constant that
+ *       covers incomplete release
+ *     · process colours land at 0.4–0.7 g/m² DRY at working coverage
+ *     · white is an underbase, printed first and solid: 2–3 g/m² for a
+ *       flood, and it is what makes colour read on a clear film
+ *     · SOLVENT inks: solids 25–35%, thinner 20–30% at the press
+ *     · film 15–40 µm, so a kilogram of film is 25–70 m² — which is why
+ *       ink per kilogram of film is several times ink per kilogram of
+ *       fabric for the same design
+ *
+ * THE TWO WHITES  (4.19.0)
  * ----------------------------------------------------------------------
- * An anilox roll (flexo) or an engraved cylinder (gravure) carries a
- * measured volume of ink per unit area. Part of it transfers to the plate
- * and then to the substrate; the rest stays in the cells.
+ * A white patch and white inside the design are different inks on the
+ * same press:
  *
- *     anilox volume        BCM (billion cubic microns per square inch)
- *     1 BCM/in²          = 1.550 cm³/m²   (645.16 mm² per in²)
- *     1 cm³/m² over 1 m² = 1 µm of wet film
+ *   white patch   a deliberate underbase — none, behind the design, or a
+ *                 flood over the whole face. The plant chooses it.
+ *   design white  white shapes ENCLOSED by printing. They are printed
+ *                 whether or not there is a patch, and the artwork is
+ *                 what says how much there is.
  *
- *     wet ink (g/m²) = volume(cm³/m²) × transfer × coverage × density
- *     dry ink (g/m²) = wet × solids
- *     solvent (g/m²) = wet − dry
+ * They are ONE PASS on the press, not two: a patch behind the design
+ * already covers the white shapes inside it, so the white laid is the
+ * larger of the two, never their sum. Both are still reported, because a
+ * plant thinks about them separately and needs to see which one is
+ * driving the figure.
  *
- * Published practice, used here as the untrained defaults:
- *   · an 8 BCM anilox at ~30% transfer lays ≈ 3.7 g/m² wet at 100%
- *     coverage, which dries to ≈ 1.2 g/m² — the figure the trade quotes.
- *   · gravure process colours run 0.4–0.7 g/m² dry at working coverage.
- *   · a flood white on film needs 2–3 g/m², white being opaque and laid
- *     solid rather than screened.
- *   · solvent inks arrive at 25–35% solids and are thinned 2–5% at the
- *     press to hold viscosity.
- *
- * THE MODEL  (what training actually changes)
+ * INK GSM  (4.19.0)
  * ----------------------------------------------------------------------
- * Coverage per channel is measured from the artwork; what is unknown is
- * how many grams of press-ready ink this plant lays per square metre at
- * 100% coverage — its anilox, its transfer, its ink, its press. That is
- * one coefficient per channel:
+ * A BOPP job is often specified as a laydown: "white at 6 g/m², colours
+ * at 3". Where a plant states it, that IS the coefficient for that
+ * channel and no fitting overrides it — a stated figure beats a guessed
+ * one, and beats a fitted one too, because it is the instruction the
+ * press is actually run to.
  *
- *     ink(g/m²) = kC·covC + kM·covM + kY·covY + kK·covK + kW·covW
+ * WHAT TRAINING CHANGES
+ * ----------------------------------------------------------------------
+ *   ink(g/m²) = kC·covC + kM·covM + kY·covY + kK·covK + kW·covW
  *
- * Five numbers, fitted by ridge regression against the plant's own
- * measured jobs, pulled towards the physics defaults by the ridge term so
- * that ten jobs give a usable model and a hundred give a good one. The
- * coefficients are clamped non-negative: no channel can consume less than
- * nothing, however the arithmetic falls out.
- *
- * Ridge, not something cleverer, on purpose: with ten samples and five
- * coefficients anything with more capacity would fit the noise, and a
- * costing figure nobody can explain is worse than one that is slightly
- * wrong. Every coefficient here is a number a print manager can read:
- * "we lay 3.4 grams of cyan per square metre at full coverage."
+ * Five coefficients, fitted by ridge regression against the plant's own
+ * measured jobs and pulled towards the published figures above, so ten
+ * jobs give a usable model and a hundred a good one. The thinner ratio is
+ * learned the same way when a plant records its solvent separately:
+ * measured, not assumed.
  */
+
 const CHANNELS = ['c', 'm', 'y', 'k', 'w'];
 const CHANNEL_LABEL = { c: 'Cyan', m: 'Magenta', y: 'Yellow', k: 'Black', w: 'White' };
 
 /* 1 BCM per square inch, in cm³ per square metre. */
 const BCM_TO_CM3_M2 = 1.5500031;
+const BOPP_DENSITY = 0.91;          /* g/cm³ — BOPP film */
 
 /**
- * What a substrate is, and how it behaves.
+ * A substrate, and how its press behaves.
  *   anilox     cell volume actually in use, cm³/m²
  *   transfer   share of that volume reaching the substrate
  *   density    press-ready ink, g/cm³
  *   solids     share of the wet film left after the solvent has gone
- *   dilution   solvent added at the press, as a share of ink weight
+ *   thinner    solvent added at the press, as a share of ink weight
  *   whiteBoost white is opaque and laid heavier than a process colour
+ *   absorb     a rough surface takes more than a smooth one
  */
 const SUBSTRATES = {
   FABRIC: {
     id: 'FABRIC',
-    label: 'Woven PP fabric — flexo',
-    note: 'Printed directly on the woven sack. A rough, absorbent surface takes more ink than film.',
-    anilox: 8 * BCM_TO_CM3_M2,     /* an 8 BCM anilox */
-    transfer: 0.30,
-    density: 1.02,
-    solids: 0.30,
-    dilution: 0.04,
+    label: 'Woven PP fabric — flexo, water-based',
+    note: 'Printed directly on the sack. A rough, absorbent surface, coarse anilox, and water-based ink at 40–50% solids.',
+    ink: 'Water-based flexo',
+    anilox: 8 * BCM_TO_CM3_M2,      /* an 8 BCM anilox — the sack trade's reference */
+    transfer: 0.27,
+    density: 1.05,
+    solids: 0.45,                   /* water-based: 40–50% */
+    thinner: 0.25,                  /* 20–30% added at the press */
     whiteBoost: 1.9,
-    absorb: 1.10                    /* woven fabric drinks ink film does not */
+    absorb: 1.10
   },
   BOPP: {
     id: 'BOPP',
-    label: 'BOPP film — gravure / flexo',
-    note: 'Reverse-printed film, laminated to the sack afterwards. A smooth surface: less ink, sharper dot.',
+    label: 'BOPP film — rotogravure, solvent-based',
+    note: 'Reverse-printed film, laminated to the sack afterwards. Smooth, engraved cylinder, solvent ink at 25–35% solids, white laid first as an underbase.',
+    ink: 'Solvent gravure',
     anilox: 6,                      /* engraved cylinder for process work, cm³/m² */
     transfer: 0.50,
     density: 1.05,
-    solids: 0.28,
-    dilution: 0.05,
+    solids: 0.30,                   /* solvent: 25–35% */
+    thinner: 0.25,
     whiteBoost: 2.2,
     absorb: 1.0
   }
 };
 const substrate = (id) => SUBSTRATES[String(id || '').toUpperCase()] || SUBSTRATES.FABRIC;
+
+function round4(v) { return Math.round(v * 10000) / 10000; }
+const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
+const num = (v) => (v === undefined || v === null || v === '' || !isFinite(Number(v)) ? null : Number(v));
 
 /** The untrained coefficients: grams of press-ready ink per m² at 100%. */
 function defaultCoefficients(substrateId) {
@@ -122,179 +134,166 @@ function defaultCoefficients(substrateId) {
   };
 }
 
-function round4(v) { return Math.round(v * 10000) / 10000; }
-const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
-
 /* ==================================================================
-   1.  THE ARTWORK
+   1.  THE ARTWORK, AS IT ARRIVES
    ==================================================================
-   A picture becomes five numbers: how much of the sheet each channel
-   covers, on average. Nothing else about the image is kept, and the
-   image itself never leaves the computer — these five numbers are all
-   that is ever sent anywhere.
+   The application measures the picture and sends numbers. Nothing here
+   ever sees an image.
 
-   sRGB is converted to CMYK the way a printer does it for separation
-   without a colour profile: the black is the darkest the three inks
-   have in common, and the three are reduced by it. It is not
-   colorimetric and does not pretend to be; it is the same arithmetic a
-   prepress operator gets from "convert to CMYK, GCR" and it is stable,
-   which matters more here than colorimetric truth because the plant's
-   own training corrects the level.  */
-function rgbToCmyk(r, g, b) {
-  const R = r / 255, G = g / 255, B = b / 255;
-  const k = 1 - Math.max(R, G, B);
-  if (k >= 0.9999) return { c: 0, m: 0, y: 0, k: 1 };
-  const d = 1 - k;
-  return { c: (1 - R - k) / d, m: (1 - G - k) / d, y: (1 - B - k) / d, k: k };
-}
-
-/**
- * Analyse raw RGBA pixels.
- *   data      Uint8ClampedArray | array, 4 bytes per pixel
- *   opts.whiteAt   a pixel this pale counts as unprinted (default 0.95)
- *   opts.alphaAt   a pixel this transparent is ignored (default 0.5)
- *
- * Returns the mean coverage of each channel over the WHOLE artwork,
- * the share that is bare (white) and the total area coverage.
- */
-function analysePixels(data, opts) {
-  const o = opts || {};
-  const whiteAt = o.whiteAt == null ? 0.95 : o.whiteAt;
-  const alphaAt = o.alphaAt == null ? 0.5 : o.alphaAt;
-  let n = 0, white = 0;
-  let sc = 0, sm = 0, sy = 0, sk = 0;
-  for (let i = 0; i + 3 < data.length; i += 4) {
-    const a = data[i + 3] / 255;
-    if (a < alphaAt) continue;            /* transparent: no ink there */
-    const r = data[i], g = data[i + 1], b = data[i + 2];
-    n++;
-    if (r / 255 >= whiteAt && g / 255 >= whiteAt && b / 255 >= whiteAt) { white++; continue; }
-    const p = rgbToCmyk(r, g, b);
-    sc += p.c; sm += p.m; sy += p.y; sk += p.k;
-  }
-  if (!n) return { coverage: { c: 0, m: 0, y: 0, k: 0 }, white: 1, tac: 0, pixels: 0 };
-  const cov = { c: sc / n, m: sm / n, y: sy / n, k: sk / n };
+     coverage        {c,m,y,k} mean coverage over the DESIGN
+     white           the share that is bare substrate — no ink
+     whiteInDesign   white shapes enclosed by printing — white INK      */
+function readAnalysis(a) {
+  const an = a || {};
+  const cov = an.coverage || {};
   return {
-    coverage: { c: round4(cov.c), m: round4(cov.m), y: round4(cov.y), k: round4(cov.k) },
-    white: round4(white / n),
-    tac: round4(cov.c + cov.m + cov.y + cov.k),
-    pixels: n
+    c: clamp01(Number(cov.c) || 0),
+    m: clamp01(Number(cov.m) || 0),
+    y: clamp01(Number(cov.y) || 0),
+    k: clamp01(Number(cov.k) || 0),
+    white: clamp01(an.white == null ? 1 : Number(an.white)),
+    whiteInDesign: clamp01(Number(an.whiteInDesign) || 0)
   };
 }
 
 /* ==================================================================
-   2.  WHITE, AND WHERE IT GOES
-   ==================================================================
-   "also add background white patch option."
-
-   A woven sack is not white and BOPP is clear, so a colour only reads
-   if there is white under it. Three ways a plant does it, and they cost
-   very different amounts:
-
-     NONE    no white is printed at all
-     PATCH   white goes behind the artwork only — the printed area
-     FLOOD   white goes over the whole face, artwork or not             */
+   2.  THE WHITE PATCH — the plant's choice, not the artwork's
+   ================================================================== */
 const WHITE_MODES = [
-  { id: 'NONE', label: 'No white', note: 'Nothing is laid under the colours.' },
-  { id: 'PATCH', label: 'White patch behind the artwork', note: 'White goes only where there is something printed. Cheaper, and the usual choice on fabric.' },
-  { id: 'FLOOD', label: 'Flood white over the whole face', note: 'The whole printed face is laid white first. The most ink, and the most even colour.' }
+  { id: 'NONE', label: 'No white patch', note: 'Nothing is laid under the colours. White inside the design is still printed.' },
+  { id: 'PATCH', label: 'White patch behind the design', note: 'White goes only where there is printing. The usual choice on fabric.' },
+  { id: 'FLOOD', label: 'Flood white over the whole face', note: 'The whole printed face is laid white first. The most ink, the most even colour, and what a clear film usually needs.' }
 ];
-function whiteCoverage(mode, analysis) {
+function whitePatchCoverage(mode, an) {
   const m = String(mode || 'NONE').toUpperCase();
   if (m === 'FLOOD') return 1;
-  if (m === 'PATCH') return round4(clamp01(1 - (analysis && analysis.white != null ? analysis.white : 1)));
+  if (m === 'PATCH') return round4(clamp01(1 - (an && an.white != null ? an.white : 1)));
   return 0;
 }
 
 /* ==================================================================
-   3.  AREA — the only place GSM and micron enter
+   3.  AREA — where GSM, micron and the design's own size come in
    ==================================================================
-   Ink is laid per square metre; the plant buys by the kilogram and
-   sells by the bag. Both conversions are area.
+     fabric:  1 kg at G g/m²      = 1000 / G       m²
+     film:    1 kg at T µm        = 1000 / (T × ρ) m²,  ρ = 0.91
 
-     fabric:  1 kg at G g/m²      = 1000 / G      m²
-     film:    1 kg at T µm        = 1000 / (T × ρ) m², ρ = 0.91 for BOPP
-
-   That is the whole of the "GSM and micron effect": a 60 GSM fabric has
-   a third more area per kilogram than an 80, so the same artwork costs
-   a third more ink per kilogram of fabric.  */
-const BOPP_DENSITY = 0.91;          /* g/cm³ — BOPP film */
+   And the printed area itself. 4.19.0 takes the DESIGN's size where it
+   is known — "design size and design length will be valuable" — because
+   a 300 × 200 mm design repeated twice on a 600 × 900 bag prints 0.12 m²,
+   not the 1.08 m² of the whole bag. Where no design size is given the
+   old face calculation still answers, so nothing that worked stops.     */
 function areaPerKg(spec) {
   const s = spec || {};
   const kind = String(s.substrate || 'FABRIC').toUpperCase();
   if (kind === 'BOPP') {
-    const micron = Number(s.micron);
-    if (!isFinite(micron) || micron <= 0) return null;
-    const gsm = micron * (isFinite(Number(s.density)) && Number(s.density) > 0 ? Number(s.density) : BOPP_DENSITY);
+    const micron = num(s.micron);
+    if (!micron || micron <= 0) return null;
+    const gsm = micron * (num(s.density) > 0 ? num(s.density) : BOPP_DENSITY);
     return round4(1000 / gsm);
   }
-  const gsm = Number(s.gsm);
-  if (!isFinite(gsm) || gsm <= 0) return null;
+  const gsm = num(s.gsm);
+  if (!gsm || gsm <= 0) return null;
   return round4(1000 / gsm);
 }
 
-/**
- * The printed area of one bag, in m².
- *   width, length   mm, the lay-flat bag
- *   faces           how many faces carry print (1 or 2; default 2)
- *   printedShare    the share of a face the design covers (default 1)
- */
+/** The printed area of one bag, in m². Design size wins where it is given. */
 function printedAreaPerBag(spec) {
   const s = spec || {};
-  const w = Number(s.width), l = Number(s.length);
-  if (!isFinite(w) || !isFinite(l) || w <= 0 || l <= 0) return null;
-  const faces = isFinite(Number(s.faces)) && Number(s.faces) > 0 ? Number(s.faces) : 2;
-  const share = isFinite(Number(s.printedShare)) && Number(s.printedShare) > 0 ? Math.min(1, Number(s.printedShare)) : 1;
+  const dw = num(s.designWidth), dl = num(s.designLength);
+  if (dw && dl && dw > 0 && dl > 0) {
+    const repeats = num(s.repeats) > 0 ? num(s.repeats) : 1;
+    return round4((dw / 1000) * (dl / 1000) * repeats);
+  }
+  const w = num(s.width), l = num(s.length);
+  if (!w || !l || w <= 0 || l <= 0) return null;
+  const faces = num(s.faces) > 0 ? num(s.faces) : 2;
+  const share = num(s.printedShare) > 0 ? Math.min(1, num(s.printedShare)) : 1;
   return round4((w / 1000) * (l / 1000) * faces * share);
 }
 
 /* ==================================================================
    4.  THE PREDICTION
-   ==================================================================  */
+   ================================================================== */
 /**
  * What this artwork costs in ink.
- *   analysis     from analysePixels()
- *   model        coefficients (trained or default)
- *   whiteMode    NONE | PATCH | FLOOD
- *   substrate    FABRIC | BOPP
- *   area         optional { gsm | micron, width, length, faces, printedShare }
- *
- * Everything is press-ready ink — what the plant actually draws from the
- * store — with the solids and the solvent split out beneath it.
+ *   analysis     { coverage, white, whiteInDesign } from the application
+ *   model        fitted coefficients, or none
+ *   inkGsm       {c,m,y,k,w} the plant's stated laydown at 100% — wins
+ *   whitePatch   NONE | PATCH | FLOOD
+ *   solvent      { solids, thinner } overriding the substrate's
+ *   area         { gsm | micron, designWidth, designLength, repeats,
+ *                  width, length, faces, printedShare }
  */
 function predict(input) {
   const i = input || {};
   const s = substrate(i.substrate);
-  const model = i.model && i.model.c != null ? i.model : defaultCoefficients(s.id);
-  const analysis = i.analysis || { coverage: { c: 0, m: 0, y: 0, k: 0 }, white: 1 };
-  const cov = Object.assign({ c: 0, m: 0, y: 0, k: 0 }, analysis.coverage || {});
-  cov.w = whiteCoverage(i.whiteMode, analysis);
+  const fitted = i.model && i.model.c != null ? i.model : defaultCoefficients(s.id);
+  const stated = i.inkGsm || {};
+  const an = readAnalysis(i.analysis);
+
+  const patch = whitePatchCoverage(i.whitePatch || i.whiteMode, an);
+  const designWhite = an.whiteInDesign;
+  /* The two whites are one PASS. A patch behind the design already covers
+     the white shapes inside it — the design's white IS the underbase
+     showing through where no colour is laid over it. So the white ink is
+     the larger of the two, not their sum: with no patch it is the design's
+     own white, with a patch it is the patch, and a flood is everything.
+     Both are still reported, because a plant thinks about them separately
+     and needs to see which one is driving the figure. */
+  const whiteCoverage = round4(Math.max(patch, designWhite));
+  const cov = { c: an.c, m: an.m, y: an.y, k: an.k, w: whiteCoverage };
+
+  /* Where each coefficient came from is part of the answer. */
+  const used = {}, source = {};
+  CHANNELS.forEach((ch) => {
+    const st = num(stated[ch]);
+    if (st != null && st >= 0) { used[ch] = st; source[ch] = 'STATED'; }
+    else { used[ch] = Math.max(0, Number(fitted[ch]) || 0); source[ch] = fitted.source === 'TRAINED' ? 'TRAINED' : 'DEFAULT'; }
+  });
 
   const perChannel = {};
   let wet = 0;
   CHANNELS.forEach((ch) => {
-    const k = Number(model[ch]);
-    const g = (isFinite(k) ? Math.max(0, k) : 0) * clamp01(Number(cov[ch]) || 0);
+    const g = used[ch] * clamp01(cov[ch]);
     perChannel[ch] = round4(g);
     wet += g;
   });
   wet = round4(wet);
-  const dry = round4(wet * s.solids);
-  /* The solvent a plant buys is what evaporates out of the ink plus what
-     it adds at the press to hold viscosity. Both are consumed. */
+
+  /* The white, split the way the plant thinks about it. */
+  const whitePatchG = round4(used.w * patch);
+  const whiteDesignG = round4(used.w * designWhite);
+  const whiteCountedAs = patch >= designWhite && patch > 0 ? 'PATCH_COVERS_THE_DESIGN_WHITE'
+    : designWhite > 0 ? 'THE_DESIGN_WHITE_ALONE' : 'NO_WHITE';
+
+  const solids = num(i.solvent && i.solvent.solids) != null ? clamp01(num(i.solvent.solids)) : s.solids;
+  const thinner = num(i.solvent && i.solvent.thinner) != null ? Math.max(0, num(i.solvent.thinner)) : s.thinner;
+  const dry = round4(wet * solids);
   const solventInInk = round4(wet - dry);
-  const solventAdded = round4(wet * s.dilution);
+  const solventAdded = round4(wet * thinner);
 
   const out = {
     substrate: s.id,
-    model: model.source || (i.model ? 'TRAINED' : 'DEFAULT'),
+    substrateLabel: s.label,
+    inkSystem: s.ink,
+    model: fitted.source === 'TRAINED' ? 'TRAINED' : 'DEFAULT',
+    coefficients: used,
+    coefficientSource: source,
     coverage: cov,
+    whitePatchCoverage: patch,
+    whiteInDesignCoverage: designWhite,
     perChannel: perChannel,
-    gsmPerM2: wet,                 /* press-ready ink, g/m² */
+    whitePatchPerM2: whitePatchG,
+    whiteInDesignPerM2: whiteDesignG,
+    whiteCoverage: whiteCoverage,
+    whiteCountedAs: whiteCountedAs,
+    gsmPerM2: wet,                    /* press-ready ink, g/m² */
     dryPerM2: dry,
-    solventPerM2: round4(solventInInk + solventAdded),
+    solids: round4(solids),
+    thinner: round4(thinner),
     solventInInk: solventInInk,
     solventAdded: solventAdded,
+    solventPerM2: round4(solventInInk + solventAdded),
     totalWithSolvent: round4(wet + solventAdded)
   };
 
@@ -302,16 +301,18 @@ function predict(input) {
   const perKgArea = areaPerKg({ substrate: s.id, gsm: a.gsm, micron: a.micron, density: a.density });
   if (perKgArea) {
     out.areaPerKg = perKgArea;
-    out.perKgSubstrate = round4(out.totalWithSolvent * perKgArea / 1000);   /* kg ink per kg substrate */
     out.gramsPerKgSubstrate = round4(out.totalWithSolvent * perKgArea);
+    out.perKgSubstrate = round4(out.totalWithSolvent * perKgArea / 1000);
   }
-  const bagArea = printedAreaPerBag({ width: a.width, length: a.length, faces: a.faces, printedShare: a.printedShare });
+  const bagArea = printedAreaPerBag(a);
   if (bagArea) {
     out.areaPerBag = bagArea;
+    out.areaBasis = (num(a.designWidth) && num(a.designLength)) ? 'DESIGN' : 'FACE';
     out.gramsPerBag = round4(out.totalWithSolvent * bagArea);
-    out.kgPer1000Bags = round4(out.totalWithSolvent * bagArea);             /* g/bag × 1000 ÷ 1000 */
+    out.kgPer1000Bags = round4(out.totalWithSolvent * bagArea);
     out.perChannelPerBag = {};
     CHANNELS.forEach((ch) => { out.perChannelPerBag[ch] = round4(perChannel[ch] * bagArea); });
+    out.solventPerBag = round4(out.solventPerM2 * bagArea);
   }
   return out;
 }
@@ -319,16 +320,17 @@ function predict(input) {
 /* ==================================================================
    5.  TRAINING
    ==================================================================
-   Ridge regression, pulled towards the physics defaults.
+   Ridge regression pulled towards the published figures:
 
        minimise  Σ (kᵀx − y)²  +  λ Σ (k − prior)²
 
-   which is the ordinary normal equations with λ added down the diagonal
-   and λ·prior added to the right-hand side. Solved by Gauss-Jordan on a
-   5×5 — small enough that nothing clever is warranted — then clamped
-   non-negative and re-fitted on the remaining channels, because a
-   negative coefficient is not a cheaper ink, it is a fitting artefact.
-   A channel no sample used keeps its prior rather than drifting.       */
+   λ falls as the evidence grows, so ten jobs lean on the trade's numbers
+   and a hundred barely do. Coefficients are clamped non-negative — a
+   negative ink is a fitting artefact, not a cheaper colour — and a
+   channel no job ever printed keeps its prior rather than drifting.
+
+   4.19.0 also learns the THINNER from the jobs that recorded their
+   solvent separately, instead of assuming the trade's 20–30%.            */
 function fit(samples, opts) {
   const o = opts || {};
   const sub = substrate(o.substrate);
@@ -337,8 +339,6 @@ function fit(samples, opts) {
   const n = rows.length;
   if (!n) return { ok: false, reason: 'No usable samples yet.', coefficients: Object.assign({}, prior, { source: 'DEFAULT' }), n: 0 };
 
-  /* λ falls as the evidence grows: ten samples lean on the physics,
-     a hundred barely do. */
   const lambda = o.lambda != null ? Number(o.lambda) : Math.max(0.25, 12 / n);
 
   const X = rows.map((s) => CHANNELS.map((ch) => clamp01(Number(s.coverage[ch]) || 0)));
@@ -346,7 +346,6 @@ function fit(samples, opts) {
   const used = CHANNELS.map((ch, j) => X.some((r) => r[j] > 0.001));
 
   let coef = solveRidge(X, y, CHANNELS.map((ch) => Number(prior[ch]) || 0), lambda, used);
-  /* Non-negative: drop any channel that came out below zero and refit. */
   let guard = 0;
   while (guard++ < 5) {
     const bad = coef.map((v, j) => v < 0 && used[j]);
@@ -356,7 +355,6 @@ function fit(samples, opts) {
   }
   CHANNELS.forEach((ch, j) => { if (!used[j]) coef[j] = Number(prior[ch]) || 0; });
 
-  /* How well it fits, in the units the user measured in. */
   const pred = X.map((r) => r.reduce((a, v, j) => a + v * coef[j], 0));
   const mean = y.reduce((a, v) => a + v, 0) / n;
   const ssTot = y.reduce((a, v) => a + (v - mean) * (v - mean), 0);
@@ -364,6 +362,14 @@ function fit(samples, opts) {
   const r2 = ssTot > 1e-9 ? 1 - ssRes / ssTot : null;
   const rmse = Math.sqrt(ssRes / n);
   const mape = y.reduce((a, v, i2) => a + Math.abs(v - pred[i2]) / (Math.abs(v) > 1e-9 ? Math.abs(v) : 1), 0) / n;
+
+  /* The thinner, where it was measured. Solvent divided by ink, averaged
+     over the jobs that recorded both — the trade's 20–30% is only the
+     starting point. */
+  const withSolvent = rows.filter((s) => isFinite(Number(s.solventRatio)) && Number(s.solventRatio) >= 0);
+  const thinner = withSolvent.length
+    ? round4(withSolvent.reduce((a, s) => a + Number(s.solventRatio), 0) / withSolvent.length)
+    : null;
 
   const coefficients = { source: 'TRAINED', substrate: sub.id };
   CHANNELS.forEach((ch, j) => { coefficients[ch] = round4(Math.max(0, coef[j])); });
@@ -376,7 +382,8 @@ function fit(samples, opts) {
     r2: r2 == null ? null : round4(r2),
     rmse: round4(rmse),
     mape: round4(mape),
-    /* An honest word about how much to trust it. */
+    thinner: thinner,
+    thinnerFrom: withSolvent.length,
     confidence: n >= 40 && r2 != null && r2 > 0.8 ? 'GOOD' : n >= 10 ? 'FAIR' : 'WEAK',
     residuals: rows.map((s, i2) => ({ id: s.id || null, measured: round4(y[i2]), predicted: round4(pred[i2]), error: round4(pred[i2] - y[i2]) }))
   };
@@ -386,10 +393,7 @@ function fit(samples, opts) {
 function solveRidge(X, y, prior, lambda, used) {
   const p = prior.length;
   const A = [], b = [];
-  for (let i = 0; i < p; i++) {
-    A.push(new Array(p).fill(0));
-    b.push(0);
-  }
+  for (let i = 0; i < p; i++) { A.push(new Array(p).fill(0)); b.push(0); }
   for (let i = 0; i < p; i++) {
     for (let j = 0; j < p; j++) {
       let v = 0;
@@ -401,7 +405,6 @@ function solveRidge(X, y, prior, lambda, used) {
     for (let r = 0; r < X.length; r++) v2 += X[r][i] * y[r];
     b[i] = v2 + lambda * prior[i];
   }
-  /* A channel that is not in play is pinned to its prior. */
   for (let i = 0; i < p; i++) {
     if (used && !used[i]) {
       for (let j = 0; j < p; j++) { A[i][j] = (i === j) ? 1 : 0; A[j][i] = (i === j) ? 1 : A[j][i]; }
@@ -429,30 +432,36 @@ function solveRidge(X, y, prior, lambda, used) {
 
 /**
  * One training sample, from what the plant knows: an artwork's coverage
- * and how much ink the job actually drew.
- *   ink      kg of press-ready ink used
- *   area     m² printed  (or bags × area per bag)
+ * and what the job actually drew.
+ *   inkKg / inkGrams   press-ready ink used
+ *   solventKg          solvent added at the press, where it was measured
+ *   areaM2, or bags × areaPerBag
  */
 function sampleFromJob(job) {
   const j = job || {};
-  const area = Number(j.areaM2) > 0 ? Number(j.areaM2)
-    : (Number(j.bags) > 0 && Number(j.areaPerBag) > 0 ? Number(j.bags) * Number(j.areaPerBag) : null);
-  const inkG = Number(j.inkKg) > 0 ? Number(j.inkKg) * 1000 : Number(j.inkGrams);
-  if (!area || !isFinite(inkG) || inkG <= 0) return null;
-  const cov = Object.assign({ c: 0, m: 0, y: 0, k: 0, w: 0 }, (j.analysis && j.analysis.coverage) || j.coverage || {});
-  if (j.whiteMode && j.analysis) cov.w = whiteCoverage(j.whiteMode, j.analysis);
-  return {
+  const area = num(j.areaM2) > 0 ? num(j.areaM2)
+    : (num(j.bags) > 0 && num(j.areaPerBag) > 0 ? num(j.bags) * num(j.areaPerBag) : null);
+  const inkG = num(j.inkKg) > 0 ? num(j.inkKg) * 1000 : num(j.inkGrams);
+  if (!area || !inkG || inkG <= 0) return null;
+  const an = readAnalysis(j.analysis || { coverage: j.coverage, white: j.white, whiteInDesign: j.whiteInDesign });
+  const cov = { c: an.c, m: an.m, y: an.y, k: an.k, w: 0 };
+  /* The white that was actually laid: the patch the job ran, plus the
+     white inside the design. */
+  cov.w = round4(whitePatchCoverage(j.whitePatch || j.whiteMode, an) + an.whiteInDesign);
+  const out = {
     id: j.id || null,
     coverage: cov,
     gsmPerM2: round4(inkG / area),
     areaM2: round4(area),
     substrate: String(j.substrate || 'FABRIC').toUpperCase()
   };
+  const solventG = num(j.solventKg) > 0 ? num(j.solventKg) * 1000 : num(j.solventGrams);
+  if (solventG != null && solventG >= 0) out.solventRatio = round4(solventG / inkG);
+  return out;
 }
-
 
 export {
   CHANNELS, CHANNEL_LABEL, SUBSTRATES, WHITE_MODES, BCM_TO_CM3_M2, BOPP_DENSITY,
-  substrate, defaultCoefficients, rgbToCmyk, analysePixels, whiteCoverage,
+  substrate, defaultCoefficients, readAnalysis, whitePatchCoverage,
   areaPerKg, printedAreaPerBag, predict, fit, sampleFromJob
 };
