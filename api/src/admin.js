@@ -308,6 +308,20 @@ export async function licenceAction(body) {
     }
     await q(`UPDATE licences SET state = 'TRIAL' WHERE device_id = $1`, [deviceId]);
     await logEvent(deviceId, 'ADMIN_RESTORE', { companyId });
+  } else if (action === 'delete') {
+    /* 4.23.1 — one installation, removed outright. The company-level
+       delete cannot reach a device row with no company: the three test
+       machines from before 4.0.0 are exactly that, and Revoke only marks
+       them. This is the only way to be rid of such a row.
+       It does NOT touch the company: a live machine deleted here frees
+       its seat and can activate again, which is the difference between
+       this and revoking. */
+    const row = (await q(`SELECT device_id, device_name, company, company_id FROM licences WHERE device_id = $1`, [deviceId]))[0];
+    if (!row) return { error: 'No such installation.' };
+    await q(`DELETE FROM licences WHERE device_id = $1`, [deviceId]);
+    await logEvent(deviceId, 'ADMIN_INSTALL_DELETE', { company: row.company, companyId: row.company_id, deviceName: row.device_name });
+    return { ok: true, deleted: deviceId, orphan: !row.company_id };
+
   } else if (action === 'note') {
     await q(`UPDATE licences SET notes = $2 WHERE device_id = $1`, [deviceId, String(body.notes || '')]);
   } else {
@@ -321,6 +335,7 @@ export async function saveSettings(body) {
   if (body.trialDays !== undefined) pairs.push(['trial_days', String(Math.max(1, parseInt(body.trialDays, 10) || 7))]);
   if (body.expiredMode !== undefined) pairs.push(['expired_mode', body.expiredMode === 'HARDSTOP' ? 'HARDSTOP' : 'READONLY']);
   if (body.signupsOpen !== undefined) pairs.push(['signups_open', body.signupsOpen ? 'yes' : 'no']);
+  if (body.demoSignup !== undefined) pairs.push(['demo_signup', body.demoSignup ? 'yes' : 'no']);
   if (body.demoGraceDays !== undefined) pairs.push(['demo_grace_days', String(Math.max(0, Math.min(365, parseInt(body.demoGraceDays, 10) || 0)))]);
   if (body.sessionMinutes !== undefined) pairs.push(['session_minutes', String(Math.min(720, Math.max(5, parseInt(body.sessionMinutes, 10) || 30)))]);
   for (const [k, v] of pairs) {
@@ -425,10 +440,11 @@ th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;le
         <label>Demo may work offline, days<input id="sGrace" type="number" min="0" max="365" style="width:90px"></label>
         <label>Working window, minutes<input id="sSession" type="number" min="5" max="720" style="width:90px"></label>
         <label>When a licence ends<select id="sMode"><option value="READONLY">Read-only — saved work still opens and prints</option><option value="HARDSTOP">Hard stop</option></select></label>
-        <label style="flex-direction:row;align-items:center;gap:8px;color:var(--text)"><input id="sOpen" type="checkbox">Accept new registrations and demos</label>
+        <label style="flex-direction:row;align-items:center;gap:8px;color:var(--text)"><input id="sOpen" type="checkbox">Accept new registrations</label>
+        <label style="flex-direction:row;align-items:center;gap:8px;color:var(--text)" title="A demo with no GSTIN, email or mobile — anyone who types a name gets one. Off unless you are handing a machine to a prospect yourself."><input id="sDemo" type="checkbox">Also allow anonymous demos</label>
         <button class="primary" onclick="saveSettings()">Save settings</button>
       </div>
-      <p class="help">A demo with 0 offline days stops the moment it cannot reach this service. The working window is only how long a good answer is reused before the application asks again. Offline days for a paying customer are set on the company.</p>
+      <p class="help"><b>Accept new registrations</b> is how a plant that downloads Nexora starts: company, GSTIN, email, mobile, a company id and passcode. <b>Anonymous demos</b> is the old way &mdash; a licence key left blank creates a company from whatever name is typed, with nothing to tell a real plant from a made-up one; leave it off unless you are demonstrating on a prospect&rsquo;s machine yourself. A demo with 0 offline days stops the moment it cannot reach this service. The working window is only how long a good answer is reused before the application asks again. Offline days for a paying customer are set on the company.</p>
     </div>
 
     <div class="card">
@@ -499,6 +515,7 @@ async function load(){
     document.getElementById('sSession').value=s.sessionMinutes;
     document.getElementById('sMode').value=s.expiredMode;
     document.getElementById('sOpen').checked=!!s.signupsOpen;
+    document.getElementById('sDemo').checked=!!s.demoSignup;
     renderCompanies();
     render();
   }catch(e){
@@ -724,8 +741,16 @@ function render(){
         (l.state==='REVOKED'
           ?'<button class="small" data-device="'+esc(l.device_id)+'" data-action="restore" onclick="act(this)">Restore</button>'
           :'<button class="small danger" data-device="'+esc(l.device_id)+'" data-action="revoke" onclick="act(this)" title="Stops this machine and frees its seat">Revoke</button>')+
+        '<button class="small danger" data-device="'+esc(l.device_id)+'" data-name="'+esc(l.co_name||l.company||l.device_name||l.device_id)+'" onclick="delInstall(this)" title="Remove this installation row altogether">Delete</button>'+
       '</div></td></tr>';
   }).join('')||'<tr><td colspan="10" class="help">Nothing here yet.</td></tr>';
+}
+async function delInstall(btn){
+  if(!confirm('Delete the installation "'+btn.dataset.name+'"?\\n\\nThe row is removed altogether. If the machine is still in use it frees its seat and can activate again — use Revoke to stop a machine, and this to tidy away one that is finished with.'))return;
+  const r=await api('/admin/api/licence',{method:'POST',body:JSON.stringify({deviceId:btn.dataset.device,action:'delete'})});
+  if(r.error){say('<div class="msg err">'+esc(r.error)+'</div>');return;}
+  say('<div class="msg ok">Installation deleted'+(r.orphan?' — it belonged to no company.':'.')+'</div>');
+  await load();
 }
 async function act(btn){
   const deviceId=btn.dataset.device,action=btn.dataset.action;
@@ -742,7 +767,8 @@ async function saveSettings(){
     demoGraceDays:+document.getElementById('sGrace').value,
     sessionMinutes:+document.getElementById('sSession').value,
     expiredMode:document.getElementById('sMode').value,
-    signupsOpen:document.getElementById('sOpen').checked})});
+    signupsOpen:document.getElementById('sOpen').checked,
+    demoSignup:document.getElementById('sDemo').checked})});
   say('<div class="msg ok">Settings saved.</div>');
   await load();
 }

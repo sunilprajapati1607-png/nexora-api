@@ -280,7 +280,18 @@ function describeState(row, company, settings) {
   /* The company's clock wins where there is one. */
   const expiresAt = co ? co.expires_at : row.expires_at;
   const msLeft = new Date(expiresAt).getTime() - now;
-  const daysLeft = Math.max(0, Math.ceil(msLeft / 86400000));
+  /* 4.23.1 — TO THE NEAREST SECOND FIRST.
+     expires_at is computed by the DATABASE's clock; `now` is this
+     process's. On the live service those are two different machines, so
+     the difference between them is a whole number of days give or take a
+     little skew — and a bare ceil() turns "seven days and one
+     millisecond" into EIGHT. A customer activating a 7-day demo was told
+     8 while the licence console said 7, because the console does its
+     arithmetic entirely in SQL, one clock throughout.
+     Rounding to the nearest second absorbs the skew and leaves the
+     meaning alone: part of a day still counts as a day, which is why
+     this is ceil and not round. */
+  const daysLeft = Math.max(0, Math.ceil(Math.round(msLeft / 1000) / 86400));
 
   const graceDays = co ? Math.max(0, Number(co.grace_days) || 0) : settings.demoGraceDays;
   const offlineMinutes = graceDays > 0 ? graceDays * 1440 : settings.sessionMinutes;
@@ -448,8 +459,22 @@ export async function activate({ deviceId, deviceName, company, email, appVersio
     }
     seat = await nextSeat(co.id);
   } else {
-    /* No key — the website demo. signups_open only ever gates THIS path,
-       so closing it never locks out a paying customer adding a machine. */
+    /* 4.23.1 — NO KEY AND NO COMPANY ID.
+       Until 4.23.0 this created a company out of whatever name was typed:
+       the website demo. Registration replaced it, and leaving both doors
+       open meant a stranger refused at Register — duplicate GSTIN, email
+       or device — could take the other one and be in with nothing checked
+       at all. So the anonymous demo is now a switch the owner holds, and
+       it is off unless they open it.
+       This gates ONLY this path. A customer with a key, a machine joining
+       with the company id and passcode, and every installation that
+       already exists are all untouched. */
+    if (!settings.demoSignup) {
+      return { httpStatus: 403, body: { error: 'NOT_REGISTERED',
+        message: 'This computer is not registered yet. Use "Register your company" to start your 7-day demo — ' +
+                 'it takes your company name, GSTIN, email and mobile. If your company already uses Nexora, ' +
+                 'enter its licence key, or its company id and passcode.' } };
+    }
     if (!settings.signupsOpen) {
       return { httpStatus: 403, body: { error: 'SIGNUPS_CLOSED',
         message: 'New demos are not being issued at the moment. Please contact Nexora.' } };

@@ -197,6 +197,12 @@ export function ensureSchema() {
                ('expired_mode', 'READONLY'),
                ('signups_open', 'yes'),
                ('demo_grace_days', '0'),
+               /* 4.23.1 — an anonymous demo is a company with no GSTIN,
+                  no email and no way to tell a real plant from a made-up
+                  one. Since 4.23.0 a plant registers itself, so this is
+                  OFF unless the owner deliberately opens it (a trade
+                  show, a machine handed to a prospect). */
+               ('demo_signup', 'no'),
                ('session_minutes', '30')
              ON CONFLICT (key) DO NOTHING`);
     return true;
@@ -212,6 +218,10 @@ export async function getSettings() {
     trialDays: Math.max(1, parseInt(s.trial_days, 10) || 7),
     expiredMode: s.expired_mode === 'HARDSTOP' ? 'HARDSTOP' : 'READONLY',
     signupsOpen: s.signups_open !== 'no',
+    /* Absent reads as NO: a database that has never seen this key is a
+       database from before registration existed, and the safe reading of
+       silence is "do not hand out anonymous demos". */
+    demoSignup: s.demo_signup === 'yes',
     /* 4.0.0 — how long a DEMO may run with no contact. Zero by design:
        a demo taken offline stops working. */
     demoGraceDays: Math.max(0, parseInt(s.demo_grace_days, 10) || 0),
