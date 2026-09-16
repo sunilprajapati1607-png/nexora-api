@@ -13,7 +13,7 @@
  */
 import { q, getSettings, logEvent } from './db.js';
 import { newLicenceKey } from './licence.js';
-import { ensureAdmin, usersSummary } from './sync.js';
+import { ensureAdmin, usersSummary, userCap } from './sync.js';
 
 const ADMIN_KEY = process.env.NEXORA_ADMIN_KEY || '';
 
@@ -55,7 +55,7 @@ export async function listLicences() {
 
 export async function listCompanies() {
   const rows = await q(`
-    SELECT c.id, c.name, c.licence_key, c.email, c.phone, c.state, c.seats, c.gstin,
+    SELECT c.id, c.name, c.licence_key, c.email, c.phone, c.state, c.seats, c.max_users, c.gstin,
            c.grace_days, c.is_demo, c.expires_at, c.created_at, c.notes, c.txn_limit,
            /* 4.23.0 — self-registration: who registered, from where, and
               what the GST check said. The passcode hash is never listed. */
@@ -79,6 +79,9 @@ export async function listCompanies() {
     const u = await usersSummary(c.id);
     c.users_count = u.count;
     c.admin_names = u.admins;
+    /* 4.29.0 — every name counts against the allowance, switched off or
+       not; users_count stays the ACTIVE number the page always showed. */
+    c.users_total = (await userCap(c.id)).count;
   }
   return rows;
 }
@@ -144,6 +147,18 @@ export async function companyAction(body) {
     if (Number(used.n) > seats) {
       return { ok: true, warning: 'Saved. ' + used.n + ' machines are still active, which is more than the ' +
         seats + ' seats now allowed. None were stopped — revoke the ones you do not want in the Installations list.' };
+    }
+
+  } else if (action === 'maxusers') {
+    const max = Math.max(1, Math.min(500, parseInt(body.maxUsers, 10) || 1));
+    /* Like seats: going below what exists stops nobody. The next create
+       is refused, and the console says so instead of pretending. */
+    const have = (await q(`SELECT COUNT(*)::int AS n FROM company_users WHERE company_id = $1`, [id]))[0];
+    await q(`UPDATE companies SET max_users = $2 WHERE id = $1`, [id, max]);
+    await logEvent(null, 'ADMIN_COMPANY_MAXUSERS', { id, maxUsers: max, have: Number(have.n) });
+    if (Number(have.n) > max) {
+      return { ok: true, warning: 'Saved. ' + have.n + ' people are already on this company, which is more than the ' +
+        max + ' now allowed. Nobody was removed — the application will refuse the next one until the number is raised.' };
     }
 
   } else if (action === 'grace') {
@@ -532,8 +547,10 @@ function gstPill(c){
 }
 function usersCell(c){
   const n=+c.users_count||0;
-  if(!n)return '<b style="color:var(--warn)">none yet</b><small> — set an administrator under People</small>';
-  return '<b>'+n+'</b>'+(c.admin_names?'<small> · admin '+esc(c.admin_names)+'</small>':'<small style="color:var(--bad)"> · no administrator</small>');
+  const max=+c.max_users||10;
+  const total=+c.users_total||n;
+  if(!n&&!total)return '<b style="color:var(--warn)">none yet</b><small> — set an administrator under People · '+max+' allowed</small>';
+  return '<b>'+total+' of '+max+'</b>'+(total>n?'<small> ('+n+' active)</small>':'')+(total>=max?'<small style="color:var(--warn)"> · full</small>':'')+(c.admin_names?'<small> · admin '+esc(c.admin_names)+'</small>':'<small style="color:var(--bad)"> · no administrator</small>');
 }
 function txnCell(used,limit){
   used=+used||0;limit=+limit||0;
@@ -590,6 +607,7 @@ function renderCompanies(){
         '</div></div>'+
         '<div class="group"><h4>People</h4><div class="acts">'+
           '<button data-id="'+c.id+'" data-name="'+esc(c.name)+'" onclick="coAdmin(this)">Set administrator…</button><span class="why">the person who adds everyone else from inside the application</span>'+
+          '<button data-id="'+c.id+'" data-now="'+(+c.max_users||10)+'" onclick="coMaxUsers(this)">People allowed…</button><span class="why">how many names may sign in on this company; the application refuses the next one past it</span>'+
         '</div></div>'+
         (c.gstin?'<div class="group"><h4>GST</h4><div class="acts">'+
           '<button data-id="'+c.id+'" onclick="gstVerify(this)">Verify online</button><span class="why">asks the verification service, if one is configured</span>'+
@@ -630,6 +648,14 @@ async function coSeats(btn){
   const v=prompt('How many machines may run on this licence?',btn.dataset.now);
   if(v===null)return;
   const r=await api('/admin/api/company',{method:'POST',body:JSON.stringify({id:+btn.dataset.id,action:'seats',seats:+v})});
+  if(r.error){say('<div class="msg err">'+esc(r.error)+'</div>');return;}
+  if(r.warning)say('<div class="msg warn">'+esc(r.warning)+'</div>');
+  await load();
+}
+async function coMaxUsers(btn){
+  const v=prompt('How many people may this company have? Names that can sign in, on any seat.',btn.dataset.now);
+  if(v===null)return;
+  const r=await api('/admin/api/company',{method:'POST',body:JSON.stringify({id:+btn.dataset.id,action:'maxusers',maxUsers:+v})});
   if(r.error){say('<div class="msg err">'+esc(r.error)+'</div>');return;}
   if(r.warning)say('<div class="msg warn">'+esc(r.warning)+'</div>');
   await load();

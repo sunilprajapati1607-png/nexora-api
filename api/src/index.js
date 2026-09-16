@@ -16,7 +16,7 @@ import { ensureSchema } from './db.js';
 import { activate, authorise, touch, issueToken, reportUsage, companyUsage, describe } from './licence.js';
 import { runBom } from './engine.js';
 import { adminAuthorised, listLicences, licenceAction, companyAction, saveSettings, recentEvents, ADMIN_HTML } from './admin.js';
-import { login, listUsers, userAction, pull, push, describeUser } from './sync.js';
+import { login, listUsers, userAction, pull, push, describeUser, userCap } from './sync.js';
 import { ensureInkSchema, getModel, listModels, train as inkTrain, estimate as inkEstimate, reset as inkReset } from './inkstore.js';
 import { register, gstAction } from './register.js';
 
@@ -118,7 +118,12 @@ export default {
         const a = await authorise(request);
         if (!a.ok) return json(a.error, a.httpStatus);
         if (!a.user) return json({ error: 'SIGN_IN', message: 'Sign in to see the company\'s users.' }, 401);
-        if (method === 'GET') return json({ users: await listUsers(a.companyId), me: describeUser(a.user) });
+        if (method === 'GET') {
+          /* 4.29.0 — the allowance travels with the list, so the window can
+             say '3 of 10' and grey Add before the service has to refuse. */
+          const cap = await userCap(a.companyId);
+          return json({ users: await listUsers(a.companyId), me: describeUser(a.user), maxUsers: cap.max, count: cap.count });
+        }
         const out = await userAction(a.companyId, a.user, await readJson(request));
         return json(out.body, out.httpStatus);
       }
