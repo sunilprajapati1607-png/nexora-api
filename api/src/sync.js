@@ -195,6 +195,20 @@ export async function userAction(companyId, actor, body) {
 
   if (!isAdmin) return { httpStatus: 403, body: { error: 'ADMIN_ONLY', message: 'Only a Nexora administrator can change users.' } };
 
+  if (action === 'remove') {
+    /* 4.30.0 - frees the seat. Switching off keeps it (a name that can be
+       switched back on); removing deletes the name. Never oneself, never
+       the last administrator. Their records stay with the company. */
+    if (self) return { httpStatus: 409, body: { error: 'SELF', message: 'You cannot remove yourself. Ask another administrator.' } };
+    if (target.role === 'ADMIN') {
+      const admins = await q(`SELECT COUNT(*)::int AS n FROM company_users WHERE company_id = $1 AND role = 'ADMIN' AND active = true AND id <> $2`, [companyId, id]);
+      if (!Number(admins[0].n)) return { httpStatus: 409, body: { error: 'LAST_ADMIN', message: 'This is the only administrator and cannot be removed.' } };
+    }
+    await q(`DELETE FROM company_users WHERE id = $1 AND company_id = $2`, [id, companyId]);
+    await logEvent(null, 'USER_REMOVE', { companyId, by: actor.id, userId: id, name: target.name });
+    const cap = await userCap(companyId);
+    return { httpStatus: 200, body: { ok: true, removed: { id: Number(id), name: target.name }, maxUsers: cap.max, count: cap.count } };
+  }
   if (action === 'scope') {
     await q(`UPDATE company_users SET scope = $2 WHERE id = $1`, [id, body.scope === 'ALL' ? 'ALL' : 'OWN']);
   } else if (action === 'role') {
