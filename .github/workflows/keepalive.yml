@@ -6,12 +6,20 @@
 #   Supabase  PAUSES a free project after about a week of no activity,
 #             and a paused database takes every customer read-only
 #
-# pg_cron inside Supabase keeps the database itself busy, but Supabase
-# measures inactivity by requests arriving AT THE PROJECT, so the ping
-# that really counts has to come from outside. That is this workflow.
+# Two pg_cron jobs inside the database do the actual keeping-awake:
 #
-# It checks three things every day and fails loudly if any of them is
-# wrong, so a silent outage becomes an email instead of a discovery.
+#   nexora-keepalive     every 6 hours, so the project is never paused
+#   nexora-wake-render   every 10 min, 02:00-14:59 UTC (07:30-20:29 IST),
+#                        so Render never sleeps while anyone is working
+#
+# This workflow does the part they CANNOT do. Supabase measures
+# inactivity by requests arriving AT THE PROJECT, so a ping from inside
+# it does not necessarily count — and a cron job cannot report that it
+# has stopped running. So this asks from OUTSIDE, once a day, and fails
+# loudly, which turns a silent outage into an email.
+#
+# It is not the heartbeat. Scheduled workflows queue and routinely run
+# late, which is fine for a daily check and useless for a heartbeat.
 
 name: keepalive
 

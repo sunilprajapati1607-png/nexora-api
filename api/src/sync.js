@@ -29,9 +29,6 @@
  * the body — exactly as the costing route has always been scoped.
  */
 import { scryptSync, randomBytes, timingSafeEqual } from 'node:crypto';
-/* Deno does not put Buffer in the global scope; Node does. One import
-   and the same source runs on both. */
-import { Buffer } from 'node:buffer';
 import { q, logEvent } from './db.js';
 
 /* ---- PINs ------------------------------------------------------------

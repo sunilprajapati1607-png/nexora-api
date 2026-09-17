@@ -503,22 +503,13 @@ th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;le
 </div>
 <script>
 let KEY='', DATA={licences:[],companies:[],settings:{}}, OPEN=null, COFILTER=null;
-/* Where /admin/api/* lives. Empty when this page is served BY the service,
-   which is how Render serves it — relative paths, same origin, no CORS.
-   Set to the service's address when the page is hosted somewhere else,
-   because a Supabase Edge Function cannot serve it: the platform rewrites
-   text/html to text/plain, so the console would arrive as source. The page
-   holds no secret either way; the admin key is typed in and kept only in
-   this browser tab. */
-let API_BASE=window.NEXORA_API_BASE||'';
-if(API_BASE.charAt(API_BASE.length-1)==='/')API_BASE=API_BASE.slice(0,-1);
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function fmt(d){return d?new Date(d).toLocaleDateString(undefined,{day:'2-digit',month:'short',year:'2-digit'}):'—'}
 function toggle(btn){const id=typeof btn==='string'?btn:btn.dataset.target;const n=document.getElementById(id);n.style.display=n.style.display==='none'?'':'none';}
 function say(html){document.getElementById('coMsg').innerHTML=html;if(html)setTimeout(()=>{if(document.getElementById('coMsg').innerHTML===html)say('')},6000);}
 function signOut(){try{sessionStorage.removeItem('nexora_admin_key')}catch(e){}location.reload();}
 async function api(path,opts){
-  const r=await fetch(API_BASE+path,Object.assign({headers:{'x-admin-key':KEY,'content-type':'application/json'}},opts||{}));
+  const r=await fetch(path,Object.assign({headers:{'x-admin-key':KEY,'content-type':'application/json'}},opts||{}));
   if(r.status===401)throw new Error('That admin key was not accepted.');
   let b={};try{b=await r.json()}catch(e){}
   if(!r.ok&&!b.error)throw new Error('Request failed ('+r.status+')');

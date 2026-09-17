@@ -204,17 +204,6 @@ export default {
 
       /* ---- the owner ----------------------------------------------- */
       if (path === '/admin') {
-        /* Supabase's Edge runtime REWRITES text/html to text/plain — its
-           own documentation says so, and the live function proves it — so
-           the console served from there arrives as source code rather than
-           as a page. Where that is the case the page is hosted elsewhere
-           (Supabase Storage, which serves real content types) and
-           NEXORA_CONSOLE_URL points at it. Render sets nothing and keeps
-           serving the page itself, from the same ADMIN_HTML. */
-        const elsewhere = (process.env.NEXORA_CONSOLE_URL || '').trim();
-        if (elsewhere) {
-          return new Response(null, { status: 302, headers: Object.assign({ location: elsewhere }, CORS) });
-        }
         return new Response(ADMIN_HTML, { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } });
       }
       if (path.startsWith('/admin/api/')) {

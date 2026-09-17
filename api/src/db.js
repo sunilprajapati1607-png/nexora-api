@@ -14,20 +14,7 @@
  */
 import { createClient } from './pgmini.js';
 
-/* Where the connection string lives depends on the host, and the choice has
-   to be made by READING, never by writing.
-     DATABASE_URL      what Render is given
-     SUPABASE_DB_URL   what Supabase injects into an Edge Function
-     NEXORA_DB_URL     an override, so the pooler can be changed by adding a
-                       secret rather than by editing code
-   4.34.0 — the Edge entry used to copy SUPABASE_DB_URL into DATABASE_URL so
-   that this line would not have to change. The Edge runtime REFUSES writes
-   to process.env: "NotSupported", thrown from inside the node:process shim,
-   AFTER the function has booted. Every route then answers 500 with nothing
-   in the body to explain it. Reading is fine, so the fallback belongs here. */
-export const pool = createClient(
-  process.env.NEXORA_DB_URL || process.env.DATABASE_URL || process.env.SUPABASE_DB_URL
-);
+export const pool = createClient(process.env.DATABASE_URL);
 
 export async function q(text, params) {
   return pool.query(text, params);
