@@ -109,26 +109,30 @@ jobs:
                exit 1 ;;
           esac
 
-          # ---- 2. does the token work, and does it reach THIS project? ----
+          # ---- 2. what can the token actually do? ----
           # Asked before deploying, because "the deploy failed" is not a
-          # diagnosis: a bad token, a token scoped to another project, and a
-          # mistyped ref all look identical in the CLI's output.
-          code=$(curl -sS -o projects.json -w '%{http_code}' --max-time 30 \
-                   -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
-                   https://api.supabase.com/v1/projects || echo 000)
-          case "$code" in
-            200) ;;
-            401|403)
-              echo "::error::Supabase refused the token (HTTP $code). It is wrong, revoked, or expired. Make a new one at https://supabase.com/dashboard/account/tokens and replace the repository secret. Nothing in production is affected — this token is only used to deploy."
+          # diagnosis. But it is ONLY a diagnosis: nothing below this line
+          # stops the deploy except a token the server outright rejects.
+          # An earlier version asked GET /v1/projects, which lists the whole
+          # ACCOUNT, and then failed the build on 403 — so a token correctly
+          # scoped to one project was refused by the check rather than by
+          # Supabase. A test that is stricter than the thing it is testing
+          # is worse than no test.
+          probe=$(curl -sS -o probe.json -w '%{http_code}' --max-time 30 \
+                    -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
+                    "https://api.supabase.com/v1/projects/$ref/functions" || echo 000)
+          case "$probe" in
+            200) echo "the token reaches Edge Functions on $ref" ;;
+            401)
+              echo "::error::Supabase rejected the token (401). It is wrong, revoked, or expired. Make a new one at https://supabase.com/dashboard/account/tokens and replace the repository secret. Nothing in production is affected — this token is only used to deploy."
               exit 1 ;;
-            *) echo "::error::could not reach the Supabase Management API (HTTP $code)"; head -c 300 projects.json; exit 1 ;;
+            403)
+              echo "::warning::the token is valid but not permitted to read Edge Functions on $ref (403). If it is a SCOPED token, it needs this project with WRITE access to Edge Functions; a classic token always has it. Trying the deploy anyway — Supabase, not this check, decides." ;;
+            404)
+              echo "::warning::project $ref is not visible to this token (404) — either the ref is wrong or the token is scoped elsewhere. Trying the deploy anyway." ;;
+            *)
+              echo "::warning::could not check the token first (HTTP $probe). Trying the deploy anyway."; head -c 200 probe.json || true ;;
           esac
-          if ! grep -q "\"$ref\"" projects.json; then
-            echo "::error::the token works, but it cannot see project $ref. Either the ref is wrong, or the token is SCOPED to a different project. Projects this token can see:"
-            node -e 'JSON.parse(require("fs").readFileSync("projects.json","utf8")).forEach(p=>console.log("  "+p.ref+"  "+p.name))' || true
-            exit 1
-          fi
-          echo "the token reaches $ref"
 
           # ---- 3. deploy ----
           # --no-verify-jwt is what older CLI versions want and newer ones
@@ -140,7 +144,10 @@ jobs:
             flags="--no-verify-jwt"
           fi
           echo "supabase functions deploy nexora --project-ref $ref $flags"
-          supabase functions deploy nexora --project-ref "$ref" $flags --debug
+          if ! supabase functions deploy nexora --project-ref "$ref" $flags --debug; then
+            echo "::error::the deploy was refused by Supabase (the CLI's own reason is above; the token check returned HTTP $probe). If that reason is about permissions, the token needs WRITE access to Edge Functions on $ref — a scoped token grants that per project, a classic token has it everywhere. Nothing in production is affected: this token is only used to deploy."
+            exit 1
+          fi
 
       - name: Check it answers
         run: |
