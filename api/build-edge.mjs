@@ -76,8 +76,24 @@ const result = await esbuild.build({
   minify: true,
   legalComments: 'none',
   write: false,
+  metafile: true,
   logLevel: 'warning'
 });
+
+/* No file in this bundle may WRITE to process.env.
+   The Edge runtime refuses it — "NotSupported: The operation is not
+   supported", from inside the node:process shim, thrown on the event loop
+   AFTER the function has booted. So the function starts in 22 ms and then
+   dies, and every route answers 500 with an empty body. Node allows the
+   write, so no suite can catch it; this is checked here instead, against
+   the files esbuild actually pulled in rather than a guessed list. */
+const assigns = /process\s*\.\s*env\s*(?:\.\s*[A-Za-z_$][\w$]*|\[[^\]]*\])\s*=(?!=)/;
+const offenders = Object.keys(result.metafile.inputs)
+  .filter((f) => !f.includes('node_modules'))
+  .filter((f) => { try { return assigns.test(readFileSync(resolve(HERE, f), 'utf8')); } catch (e) { return false; } });
+if (offenders.length) {
+  throw new Error('these files assign to process.env, which the Edge runtime refuses: ' + offenders.join(', '));
+}
 
 let code = result.outputFiles[0].text;
 

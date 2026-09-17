@@ -8,12 +8,15 @@
  *
  * Four things differ here, and each one is a real difference, not taste:
  *
- *  1. THE DATABASE URL ARRIVES UNDER ANOTHER NAME. Supabase injects
- *     SUPABASE_DB_URL; `db.js` reads DATABASE_URL, at MODULE SCOPE. So
- *     the environment is settled BEFORE the service is imported — which
- *     is why the import below is dynamic and awaited. A static import
- *     would be hoisted above this file's first statement and `db.js`
- *     would read an empty value.
+ *  1. THE ENVIRONMENT IS READ-ONLY. Supabase injects the connection
+ *     string as SUPABASE_DB_URL, not DATABASE_URL. This file used to copy
+ *     one to the other so that `db.js` would not have to change — and the
+ *     Edge runtime REFUSES writes to process.env. The function booted in
+ *     22 ms and then died on that single assignment with
+ *     "NotSupported: The operation is not supported", leaving every route
+ *     answering 500 with nothing in the body to say why. Node allows the
+ *     write, so no test here could have caught it; edge-test.mjs now
+ *     forbids it explicitly. `db.js` reads all three names instead.
  *
  *  2. THE PATH CARRIES THE FUNCTION'S NAME. A function is published at
  *     /functions/v1/<name>/…; the runtime removes /functions/v1 and
@@ -36,13 +39,9 @@
  */
 import process from 'node:process';
 
-/* Order matters: this runs before the service is loaded. A secret named
-   DATABASE_URL or NEXORA_DB_URL wins, so the pooler can be chosen later
-   without touching this file; otherwise the platform's own value. */
-const dbUrl = (process.env.NEXORA_DB_URL || process.env.DATABASE_URL || process.env.SUPABASE_DB_URL || '').trim();
-if (dbUrl) process.env.DATABASE_URL = dbUrl;
-
-const app = (await import('../src/index.js')).default;
+/* Nothing in this file writes to process.env — see (1) above. `db.js`
+   picks the connection string by reading, so a plain import is enough. */
+import app from '../src/index.js';
 
 /* The runtime's own name for this function. Both shapes are handled:
    /<slug>/… is what the handler actually receives in production, and
