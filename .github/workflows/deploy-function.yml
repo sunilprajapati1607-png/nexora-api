@@ -168,6 +168,75 @@ jobs:
             exit 1
           fi
 
+      # The licence console is ONE page, and it lives in ADMIN_HTML in
+      # src/admin.js. It cannot be served by the function: Supabase rewrites
+      # text/html to text/plain, so /admin arrives as source code. Supabase
+      # Storage serves real content types, so the page goes there — and it
+      # is REGENERATED AND RE-UPLOADED on every deploy, because a second
+      # copy of a 32 KB page that nobody regenerates is a copy that drifts.
+      #
+      # Uploading needs the project's secret key, which the Management API
+      # will hand over to this token. It is masked the moment it arrives so
+      # that nothing can print it, and it is never written to a file.
+      - name: Publish the console page to Storage
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+        run: |
+          ref="${{ github.event.inputs.project_ref }}"
+          base="https://$ref.supabase.co/functions/v1/nexora"
+
+          node build-console.mjs "$base"
+
+          keys=$(curl -sS --max-time 30 -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
+                   "https://api.supabase.com/v1/projects/$ref/api-keys?reveal=true" || echo '[]')
+          key=$(node -e '
+            const rows = JSON.parse(process.argv[1] || "[]");
+            const pick = (t) => (rows.find((r) => r.type === t && r.api_key) || {}).api_key;
+            process.stdout.write(pick("secret") || pick("service_role") || "");
+          ' "$keys" || true)
+          unset keys
+          if [ -z "$key" ]; then
+            echo "::warning::could not read the project's secret key, so the console page was not uploaded. The API is deployed and fine; the console page is simply not refreshed. Give the token permission to read API keys, or upload api/build/console/index.html by hand under Storage."
+            exit 0
+          fi
+          echo "::add-mask::$key"
+
+          # The bucket, if it is not there yet. Public: the page is a UI with
+          # no secret in it — the admin key is typed by the owner and stays
+          # in their browser tab — and /admin/api/* is what actually guards
+          # the data. Already-exists comes back 400/409 and is fine.
+          curl -sS --max-time 30 -o bucket.json -w 'bucket: HTTP %{http_code}\n' \
+            -X POST "https://$ref.supabase.co/storage/v1/bucket" \
+            -H "authorization: Bearer $key" -H 'content-type: application/json' \
+            -d '{"id":"console","name":"console","public":true}' || true
+
+          up=$(curl -sS --max-time 60 -o upload.json -w '%{http_code}' \
+                 -X POST "https://$ref.supabase.co/storage/v1/object/console/index.html" \
+                 -H "authorization: Bearer $key" \
+                 -H 'content-type: text/html; charset=utf-8' \
+                 -H 'cache-control: no-cache' \
+                 -H 'x-upsert: true' \
+                 --data-binary @build/console/index.html || echo 000)
+          echo "upload: HTTP $up  $(head -c 200 upload.json)"
+          if [ "$up" != "200" ] && [ "$up" != "201" ]; then
+            echo "::error::the console page could not be uploaded to Storage (HTTP $up). The API is deployed and working; only the console page is stale."
+            exit 1
+          fi
+
+          page="https://$ref.supabase.co/storage/v1/object/public/console/index.html"
+          type=$(curl -sS --max-time 30 -o /dev/null -w '%{content_type}' "$page" || echo '?')
+          echo "the console is at $page  (served as $type)"
+          case "$type" in
+            text/html*) ;;
+            *) echo "::error::Storage served the console as '$type', not text/html — a browser will show it as source, which is the whole problem this step exists to avoid"; exit 1 ;;
+          esac
+          {
+            echo ""
+            echo "Console: [$page]($page)"
+            echo ""
+            echo "Set \`NEXORA_CONSOLE_URL\` to that address under Edge Functions -> Secrets and \`/admin\` will redirect to it."
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Check it answers
         run: |
           base="https://${{ github.event.inputs.project_ref }}.supabase.co/functions/v1/nexora"
