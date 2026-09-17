@@ -301,7 +301,7 @@ function describeState(row, company, settings) {
     gstin: co.gstin || '',
     key: maskKey(co.licence_key),
     seats: Number(co.seats) || 1,
-    maxUsers: Number(co.max_users) || 10,
+    maxUsers: Number(co.seats) || 1,   /* one seat = one person */
     seatNo: Number(row.seat_no) || null,
     isDemo: co.is_demo === true,
     graceDays

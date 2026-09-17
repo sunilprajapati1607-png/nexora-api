@@ -103,11 +103,14 @@ export async function login(companyId, { name, pin }) {
 }
 
 /* ---- users ------------------------------------------------------------- */
-/** How many people the console allows this company, and how many it has. */
+/** How many people this company may have, and how many it has.
+    ONE SEAT = ONE PERSON (the owner's rule, 2026-09-17): a company with
+    three seats may have three names, the administrator included. Every
+    name counts, switched off or not. */
 export async function userCap(companyId) {
-  const co = await q(`SELECT max_users FROM companies WHERE id = $1`, [companyId]);
+  const co = await q(`SELECT seats FROM companies WHERE id = $1`, [companyId]);
   const n = await q(`SELECT COUNT(*)::int AS n FROM company_users WHERE company_id = $1`, [companyId]);
-  return { max: Number(co[0] && co[0].max_users) || 10, count: Number(n[0] && n[0].n) || 0 };
+  return { max: Number(co[0] && co[0].seats) || 1, count: Number(n[0] && n[0].n) || 0 };
 }
 export async function listUsers(companyId) {
   const rows = await q(
@@ -151,15 +154,15 @@ export async function userAction(companyId, actor, body) {
     if (!validPin(body.pin)) return { httpStatus: 400, body: { error: 'BAD_PIN', message: 'A PIN of at least 4 characters is required.' } };
     const dup = await q(`SELECT id FROM company_users WHERE company_id = $1 AND name_key = $2`, [companyId, key]);
     if (dup.length) return { httpStatus: 409, body: { error: 'NAME_TAKEN', message: 'There is already a user called ' + name + '.' } };
-    /* The console decides how many people a company may have. Enforced
-       here and not only in the window, because a limit the client
-       enforces alone is a suggestion. People switched off still count:
-       they are names that can be switched back on. */
+    /* One seat, one person. Enforced here and not only in the window,
+       because a limit the client enforces alone is a suggestion. People
+       switched off still count: they are names that can be switched
+       back on. */
     const cap = await userCap(companyId);
     if (cap.count >= cap.max) {
       return { httpStatus: 409, body: { error: 'USER_LIMIT',
-        message: 'Your licence allows ' + cap.max + ' ' + (cap.max === 1 ? 'person' : 'people') + ' and ' + cap.count +
-          ' are already on it. Ask Nexora to raise the number, or remove someone who has left.',
+        message: 'Your licence has ' + cap.max + ' ' + (cap.max === 1 ? 'seat' : 'seats') + ' and one person per seat — ' + cap.count +
+          (cap.count === 1 ? ' is' : ' are') + ' already on it. Ask Nexora for more seats, or remove someone who has left.',
         maxUsers: cap.max, count: cap.count } };
     }
     const rows = await q(

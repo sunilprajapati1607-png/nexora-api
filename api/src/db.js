@@ -148,9 +148,9 @@ export function ensureSchema() {
     await q(`ALTER TABLE licences ADD COLUMN IF NOT EXISTS txn_base INTEGER NOT NULL DEFAULT 0`);
     await q(`ALTER TABLE licences ADD COLUMN IF NOT EXISTS usage_base INTEGER NOT NULL DEFAULT 0`);
     await q(`ALTER TABLE licences ADD COLUMN IF NOT EXISTS usage_reset_at TIMESTAMPTZ`);
-    /* 4.29.0 — how many PEOPLE a company may have, set from the console.
-       Seats count machines; this counts names that can sign in. */
-    await q(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS max_users INTEGER NOT NULL DEFAULT 10`);
+    /* 4.29.0 added companies.max_users and withdrew it the same day: one
+       seat = one person, so seats is the number. The column may exist on a
+       database that booted the first 4.29.0; nothing reads it. */
 
     /* ---- 4.8.0 — COMPANY USERS AND COMPANY-WIDE SYNC -----------------
        A person signs in on any seat of their company with name + PIN. The
