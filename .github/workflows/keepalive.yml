@@ -1,0 +1,123 @@
+# Nexora — keep the licence service and its database awake
+# ======================================================================
+# Two free tiers sit under this service and both go to sleep:
+#
+#   Render    spins the web service down after ~15 minutes idle
+#   Supabase  PAUSES a free project after about a week of no activity,
+#             and a paused database takes every customer read-only
+#
+# pg_cron inside Supabase keeps the database itself busy, but Supabase
+# measures inactivity by requests arriving AT THE PROJECT, so the ping
+# that really counts has to come from outside. That is this workflow.
+#
+# It checks three things every day and fails loudly if any of them is
+# wrong, so a silent outage becomes an email instead of a discovery.
+
+name: keepalive
+
+on:
+  schedule:
+    # 02:30 UTC = 08:00 IST, before the plant starts work
+    - cron: '30 2 * * *'
+  workflow_dispatch:      # and a "Run workflow" button for when you want one now
+
+concurrency:
+  group: keepalive
+  cancel-in-progress: false
+
+permissions:
+  contents: write         # only to push the schedule-keepalive branch, never main
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      SERVICE: https://nexora-api-55jv.onrender.com
+      SUPABASE: https://dzbzcwmxyenztowzcukc.supabase.co
+      # The anon key is publishable by design, and this project grants it
+      # nothing: RLS is on for every table with no policies and the
+      # anon/authenticated grants are revoked. It is here so the ping is a
+      # proper authenticated API request, which is what Supabase counts.
+      SUPABASE_ANON: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImR6Ynpjd214eWVuenRvd3pjdWtjIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODk2NDIxODcsImV4cCI6MjEwNTIxODE4N30.s8G5dlDkoZpYrZwHgJh_ihvNROTOsnvbUjtDNgLYcmI
+    steps:
+      - name: Wake the service and check it is healthy
+        id: health
+        run: |
+          # --retry rides out the cold start: Render can take ~50s to wake.
+          code=$(curl -sS -o body.txt -w '%{http_code}' --max-time 90 \
+                   --retry 5 --retry-delay 15 --retry-all-errors "$SERVICE/health" || echo 000)
+          echo "health: HTTP $code"
+          head -c 200 body.txt; echo
+          if [ "$code" != "200" ]; then echo "::error::the licence service did not answer /health (HTTP $code)"; exit 1; fi
+          grep -q '"ok":true' body.txt || { echo "::error::/health answered but did not say ok"; exit 1; }
+
+      - name: Check the service can still reach its database
+        run: |
+          # /v1/ink/* runs the schema steps BEFORE authorising, so 401 proves
+          # the database answered. A 500 means it did not.
+          code=$(curl -sS -o body.txt -w '%{http_code}' --max-time 60 \
+                   --retry 3 --retry-delay 10 --retry-all-errors "$SERVICE/v1/ink/model" || echo 000)
+          echo "database reachable through the service: HTTP $code"
+          if [ "$code" = "500" ]; then echo "::error::the service cannot reach its database"; head -c 300 body.txt; exit 1; fi
+          if [ "$code" != "401" ] && [ "$code" != "200" ]; then
+            echo "::error::unexpected answer from /v1/ink/model (HTTP $code)"; head -c 300 body.txt; exit 1; fi
+
+      - name: Ping Supabase itself, so the project counts as active
+        run: |
+          code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 60 \
+                   --retry 3 --retry-delay 10 --retry-all-errors \
+                   -H "apikey: $SUPABASE_ANON" -H "Authorization: Bearer $SUPABASE_ANON" \
+                   "$SUPABASE/rest/v1/" || echo 000)
+          echo "supabase rest: HTTP $code"
+          # 200 is the normal answer. 401/404 still reached the project, which
+          # is what matters here; only a connection failure is a problem.
+          if [ "$code" = "000" ]; then echo "::error::could not reach the Supabase project at all"; exit 1; fi
+
+      - name: Say what happened
+        if: always()
+        run: |
+          {
+            echo "### Nexora keepalive — $(date -u '+%Y-%m-%d %H:%M UTC')"
+            echo ""
+            echo "| check | result |"
+            echo "| --- | --- |"
+            echo "| licence service /health | ${{ steps.health.outcome }} |"
+            echo "| database through the service | see log |"
+            echo "| Supabase project pinged | see log |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # GitHub switches scheduled workflows off after 60 days with no activity
+  # in the repository — which would quietly disable the very thing meant to
+  # be foolproof. A weekly commit counts as activity. It goes to its own
+  # orphan branch, NOT main: Render auto-deploys on a push to main, and a
+  # keepalive commit has no business restarting the service.
+  keep-the-schedule-alive:
+    runs-on: ubuntu-latest
+    needs: ping
+    if: github.event_name == 'schedule'
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Touch the keepalive branch once a week
+        run: |
+          if [ "$(date -u '+%u')" != "1" ]; then echo "not Monday — nothing to do"; exit 0; fi
+          git config user.name  "nexora-keepalive"
+          git config user.email "noreply@users.noreply.github.com"
+          git checkout --orphan keepalive
+          git rm -rf --cached . >/dev/null 2>&1 || true
+          rm -rf api README.md 2>/dev/null || true
+          {
+            echo "This branch exists for one reason."
+            echo ""
+            echo "GitHub disables scheduled workflows after 60 days without"
+            echo "repository activity. The keepalive workflow writes here once a"
+            echo "week so its own schedule is never switched off. Nothing reads"
+            echo "this file, and it is deliberately NOT on main, because a push"
+            echo "to main redeploys the licence service."
+            echo ""
+            echo "last ping: $(date -u '+%Y-%m-%d %H:%M UTC')"
+          } > README.md
+          git add README.md
+          git commit -m "keepalive $(date -u '+%Y-%m-%d')"
+          git push -f origin keepalive
