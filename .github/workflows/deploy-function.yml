@@ -169,103 +169,42 @@ jobs:
           fi
 
       # The licence console is ONE page, and it lives in ADMIN_HTML in
-      # src/admin.js. It cannot be served by the function: Supabase rewrites
-      # text/html to text/plain, so /admin arrives as source code. Supabase
-      # Storage serves real content types, so the page goes there — and it
-      # is REGENERATED AND RE-UPLOADED on every deploy, because a second
-      # copy of a 32 KB page that nobody regenerates is a copy that drifts.
+      # src/admin.js. Two platforms refuse to serve it as a page, both
+      # deliberately and both documented:
       #
-      # Uploading needs the project's secret key, which the Management API
-      # will hand over to this token. It is masked the moment it arrives so
-      # that nothing can print it, and it is never written to a file.
-      - name: Publish the console page to Storage
-        env:
-          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+      #   Edge Functions  "HTML content is not supported. GET requests that
+      #                    return text/html will be rewritten to text/plain."
+      #   Storage         "For security, HTML files are returned as plain
+      #                    text."  — verified: the object uploads fine and
+      #                    comes back text/plain with nosniff.
+      #
+      # So the page is BUILT here, on every deploy, and attached to the run.
+      # It is generated from ADMIN_HTML and never hand-maintained, because a
+      # second copy of a 32 KB page is a copy that drifts. WHERE it is served
+      # from is a hosting decision rather than a code one: the same file works
+      # from any web host, or opened straight off a disk, because all it needs
+      # is CORS and the service already allows it.
+      - name: Build the console page
         run: |
           ref="${{ github.event.inputs.project_ref }}"
-          base="https://$ref.supabase.co/functions/v1/nexora"
-
-          node build-console.mjs "$base"
-
-          keys=$(curl -sS --max-time 30 -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
-                   "https://api.supabase.com/v1/projects/$ref/api-keys?reveal=true" || echo '[]')
-          # Report which KIND of key was chosen, and which kinds the project
-          # offered. Never the value. Storage 400s and 401s look identical
-          # from outside, and the difference is usually the key.
-          echo "key types this project offers: $(node -e '
-            try { process.stdout.write(JSON.parse(process.argv[1]).map((r) => r.type + (r.name ? "/" + r.name : "")).join(", ")); }
-            catch (e) { process.stdout.write("(could not read the list)"); }
-          ' "$keys")"
-          key=$(node -e '
-            const rows = JSON.parse(process.argv[1] || "[]");
-            const pick = (t) => (rows.find((r) => r.type === t && r.api_key) || {}).api_key;
-            process.stdout.write(pick("secret") || pick("service_role") || "");
-          ' "$keys" || true)
-          kind=$(node -e '
-            const rows = JSON.parse(process.argv[1] || "[]");
-            const has = (t) => rows.some((r) => r.type === t && r.api_key);
-            process.stdout.write(has("secret") ? "secret" : has("service_role") ? "service_role" : "none");
-          ' "$keys" || true)
-          keys=''
-          if [ -z "$key" ]; then
-            echo "::warning::no secret or service_role key came back, so the console page was not uploaded. The API is deployed and fine; the console page is simply not refreshed. Give the token permission to read API keys, or upload api/build/console/index.html by hand under Storage."
-            exit 0
-          fi
-          echo "::add-mask::$key"
-          echo "using the '$kind' key"
-
-          # The bucket, if it is not there yet. Public: the page is a UI with
-          # no secret in it — the admin key is typed by the owner and stays
-          # in their browser tab — and /admin/api/* is what actually guards
-          # the data. "Already exists" is a fine answer here.
-          bkt=$(curl -sS --max-time 30 -o bucket.json -w '%{http_code}' \
-                  -X POST "https://$ref.supabase.co/storage/v1/bucket" \
-                  -H "authorization: Bearer $key" \
-                  -H "apikey: $key" \
-                  -H 'content-type: application/json' \
-                  -d '{"name":"console","public":true}' || echo 000)
-          echo "bucket: HTTP $bkt  $(head -c 300 bucket.json)"
-
-          # POST creates; PUT replaces. x-upsert should make POST do both,
-          # but only one of the two is right on every version of the Storage
-          # API, so try the other rather than fail on a coin toss.
-          send() {
-            curl -sS --max-time 60 -o upload.json -w '%{http_code}' \
-              -X "$1" "https://$ref.supabase.co/storage/v1/object/console/index.html" \
-              -H "authorization: Bearer $key" \
-              -H "apikey: $key" \
-              -H 'content-type: text/html; charset=utf-8' \
-              -H 'cache-control: no-cache' \
-              -H 'x-upsert: true' \
-              --data-binary @build/console/index.html || echo 000
-          }
-          up=$(send POST)
-          echo "upload POST: HTTP $up  $(head -c 300 upload.json)"
-          if [ "$up" != "200" ] && [ "$up" != "201" ]; then
-            first=$(head -c 200 upload.json | tr -d '\n')
-            up=$(send PUT)
-            echo "upload PUT:  HTTP $up  $(head -c 300 upload.json)"
-          fi
-          if [ "$up" != "200" ] && [ "$up" != "201" ]; then
-            # The body, in the ERROR, because that is the only place anyone
-            # reading this later will actually look.
-            echo "::error::the console page could not be uploaded to Storage. bucket HTTP $bkt ($(head -c 150 bucket.json | tr -d '\n')) · upload HTTP $up · POST said: $first · PUT said: $(head -c 200 upload.json | tr -d '\n') · key kind: $kind. The API is deployed and working; only the console page is stale."
-            exit 1
-          fi
-
-          page="https://$ref.supabase.co/storage/v1/object/public/console/index.html"
-          type=$(curl -sS --max-time 30 -o /dev/null -w '%{content_type}' "$page" || echo '?')
-          echo "the console is at $page  (served as $type)"
-          case "$type" in
-            text/html*) ;;
-            *) echo "::error::Storage served the console as '$type', not text/html — a browser will show it as source, which is the whole problem this step exists to avoid"; exit 1 ;;
-          esac
+          api="https://$ref.supabase.co/functions/v1/nexora"
+          node build-console.mjs "$api"
+          f=build/console/index.html
           {
             echo ""
-            echo "Console: [$page]($page)"
+            echo "**Console page** - $(wc -c < "$f") bytes, generated from ADMIN_HTML."
             echo ""
-            echo "Set \`NEXORA_CONSOLE_URL\` to that address under Edge Functions -> Secrets and \`/admin\` will redirect to it."
+            echo "Download it from *Artifacts* below. It talks to $api and can be"
+            echo "served from any web host, or opened from a local disk. Neither Edge"
+            echo "Functions nor Storage will serve it as a page - both return"
+            echo "text/plain on purpose, so /admin on the function is not a page there."
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nexora-console
+          path: api/build/console/index.html
+          if-no-files-found: error
 
       - name: Check it answers
         run: |
