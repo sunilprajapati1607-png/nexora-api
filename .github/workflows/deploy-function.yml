@@ -38,7 +38,7 @@ on:
       project_ref:
         description: 'Supabase project ref (dzbzcwmxyenztowzcukc = production, xanbgeuwbykfmgulzxuk = the throwaway spike)'
         required: true
-        default: xanbgeuwbykfmgulzxuk
+        default: dzbzcwmxyenztowzcukc
 
 concurrency:
   group: deploy-function-${{ github.event.inputs.project_ref }}
@@ -134,7 +134,26 @@ jobs:
               echo "::warning::could not check the token first (HTTP $probe). Trying the deploy anyway."; head -c 200 probe.json || true ;;
           esac
 
-          # ---- 3. deploy ----
+          # ---- 3. are the function's own secrets there? ----
+          # NEXORA_TOKEN_SECRET signs every licence token and NEXORA_ADMIN_KEY
+          # opens the console. Both default to the empty string, so a function
+          # deployed without them ANSWERS — /health is fine, activation is
+          # fine — while signing tokens with no secret at all. Worth looking
+          # for, and only ever a warning: the names come back, never the
+          # values, and a scoped token may not be allowed to ask.
+          secrets_code=$(curl -sS -o secrets.json -w '%{http_code}' --max-time 30 \
+                           -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
+                           "https://api.supabase.com/v1/projects/$ref/secrets" || echo 000)
+          if [ "$secrets_code" = "200" ]; then
+            for name in NEXORA_TOKEN_SECRET NEXORA_ADMIN_KEY; do
+              if grep -q "\"$name\"" secrets.json; then echo "  $name is set"
+              else echo "::warning::$name is NOT set on $ref. Set it under Edge Functions -> Secrets, to the same value Render uses, or the function will run with an empty one."; fi
+            done
+          else
+            echo "could not list the function's secrets (HTTP $secrets_code) — carrying on"
+          fi
+
+          # ---- 4. deploy ----
           # --no-verify-jwt is what older CLI versions want and newer ones
           # have replaced with config.toml (which build-edge.mjs writes
           # either way). Pass it only if this CLI still has it, rather than
