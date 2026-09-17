@@ -65,14 +65,20 @@ jobs:
 
       - name: Ping Supabase itself, so the project counts as active
         run: |
-          code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 60 \
+          # /auth/v1/health answers a clean 200 with the publishable key.
+          # (/rest/v1/ returns 401 here BY DESIGN — the anon role has had its
+          # grants revoked — so it is a poor thing to assert on.)
+          code=$(curl -sS -o body.txt -w '%{http_code}' --max-time 60 \
                    --retry 3 --retry-delay 10 --retry-all-errors \
-                   -H "apikey: $SUPABASE_ANON" -H "Authorization: Bearer $SUPABASE_ANON" \
-                   "$SUPABASE/rest/v1/" || echo 000)
-          echo "supabase rest: HTTP $code"
-          # 200 is the normal answer. 401/404 still reached the project, which
-          # is what matters here; only a connection failure is a problem.
-          if [ "$code" = "000" ]; then echo "::error::could not reach the Supabase project at all"; exit 1; fi
+                   -H "apikey: $SUPABASE_ANON" "$SUPABASE/auth/v1/health" || echo 000)
+          echo "supabase: HTTP $code  $(head -c 60 body.txt)"
+          if [ "$code" != "200" ]; then echo "::error::the Supabase project did not answer (HTTP $code) — check whether it has been paused"; exit 1; fi
+          # A second request, straight at the database layer, so the ping is
+          # not only against the auth service.
+          rest=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 60 --retry 2 --retry-delay 10 --retry-all-errors \
+                   -H "apikey: $SUPABASE_ANON" "$SUPABASE/rest/v1/" || echo 000)
+          echo "supabase rest reached: HTTP $rest (401 is expected and correct — the tables are locked down)"
+          if [ "$rest" = "000" ]; then echo "::error::could not reach the Supabase REST endpoint at all"; exit 1; fi
 
       - name: Say what happened
         if: always()
