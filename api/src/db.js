@@ -24,6 +24,13 @@ let ready = null;
 
 /** Idempotent. Every statement is IF NOT EXISTS, so it is safe on every
  *  cold start and safe to run concurrently. */
+/** 4.31.0 - rows written before expiry landed at end of day are moved to
+ *  23:59:59 Asia/Kolkata of their day. Idempotent; run on every boot. */
+export async function moveExpiriesToEndOfDay() {
+  await q(`UPDATE companies SET expires_at = nexora_eod(expires_at) WHERE expires_at <> nexora_eod(expires_at)`);
+  await q(`UPDATE licences  SET expires_at = nexora_eod(expires_at) WHERE expires_at <> nexora_eod(expires_at)`);
+}
+
 export function ensureSchema() {
   if (ready) return ready;
   ready = (async () => {
@@ -148,6 +155,18 @@ export function ensureSchema() {
     await q(`ALTER TABLE licences ADD COLUMN IF NOT EXISTS txn_base INTEGER NOT NULL DEFAULT 0`);
     await q(`ALTER TABLE licences ADD COLUMN IF NOT EXISTS usage_base INTEGER NOT NULL DEFAULT 0`);
     await q(`ALTER TABLE licences ADD COLUMN IF NOT EXISTS usage_reset_at TIMESTAMPTZ`);
+    /* 4.31.0 — a licence ends at the END of its last day, Indian time.
+       "if a licence shows Expires Sep 23, the customer can use it for the
+       entire working day without it stopping mid-shift." nexora_eod()
+       moves any instant to 23:59:59 IST (+05:30, no daylight saving, so a
+       fixed offset is exact and needs no zone table) of that calendar day;
+       every write of expires_at goes through it, and rows written before
+       4.31.0 are moved once here (idempotent: eod(eod(x)) = eod(x)). */
+    await q(`CREATE OR REPLACE FUNCTION nexora_eod(ts TIMESTAMPTZ) RETURNS TIMESTAMPTZ
+             LANGUAGE sql IMMUTABLE AS $f$
+               SELECT (((ts AT TIME ZONE INTERVAL '+05:30')::date + INTERVAL '1 day' - INTERVAL '1 second') AT TIME ZONE INTERVAL '+05:30')
+             $f$`);
+    await moveExpiriesToEndOfDay();
     /* 4.29.0 added companies.max_users and withdrew it the same day: one
        seat = one person, so seats is the number. The column may exist on a
        database that booted the first 4.29.0; nothing reads it. */

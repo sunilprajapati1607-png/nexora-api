@@ -183,7 +183,7 @@ async function createDemoCompany({ name, email, trialDays, graceDays, expiresAt 
       const rows = await q(
         `INSERT INTO companies (name, licence_key, email, state, seats, grace_days, is_demo, expires_at)
          VALUES ($1, $2, $3, 'DEMO', 1, $4, true,
-                 COALESCE($6::timestamptz, now() + make_interval(days => $5::int)))
+                 nexora_eod(COALESCE($6::timestamptz, now() + make_interval(days => $5::int))))
          RETURNING *`,
         [name || 'Demo', key, email || null, graceDays, trialDays, expiresAt || null]);
       if (rows.length) return rows[0];
@@ -291,7 +291,13 @@ function describeState(row, company, settings) {
      Rounding to the nearest second absorbs the skew and leaves the
      meaning alone: part of a day still counts as a day, which is why
      this is ceil and not round. */
-  const daysLeft = Math.max(0, Math.ceil(Math.round(msLeft / 1000) / 86400));
+  /* 4.31.0 — CALENDAR DAYS, Indian time. Expiry now lands at 23:59:59 IST,
+     so "days left" is the expiry day minus today (IST): a 7-day demo made
+     at 11:50 says 7, not 8; the last day says 0 and is still usable until
+     midnight ("ends tonight"). Whether it HAS expired is msLeft, never
+     the count. IST is +05:30 with no daylight saving. */
+  const istDay = (ms) => Math.floor((ms + 19800000) / 86400000);
+  const daysLeft = Math.max(0, istDay(new Date(expiresAt).getTime()) - istDay(now));
 
   const graceDays = co ? Math.max(0, Number(co.grace_days) || 0) : settings.demoGraceDays;
   const offlineMinutes = graceDays > 0 ? graceDays * 1440 : settings.sessionMinutes;
@@ -329,8 +335,8 @@ function describeState(row, company, settings) {
         message: 'Your licence period has ended. Renew to continue calculating.' };
     }
     return { ...base, state: 'LICENSED', canCalculate: true, daysLeft, mode: 'FULL',
-      message: daysLeft <= 14
-        ? 'Your licence renews in ' + daysLeft + ' day' + (daysLeft === 1 ? '' : 's') + '.'
+      message: daysLeft === 0 ? 'Your licence ends tonight. Renew to keep calculating tomorrow.'
+        : daysLeft <= 14 ? 'Your licence renews in ' + daysLeft + ' day' + (daysLeft === 1 ? '' : 's') + '.'
         : null };
   }
 
@@ -342,8 +348,8 @@ function describeState(row, company, settings) {
         : 'Your ' + settings.trialDays + '-day demo has ended. Contact Nexora for a licence to continue.' };
   }
   return { ...base, state: 'TRIAL', canCalculate: true, daysLeft, mode: 'FULL',
-    message: daysLeft <= 2
-      ? 'Your demo ends in ' + daysLeft + ' day' + (daysLeft === 1 ? '' : 's') + '.'
+    message: daysLeft === 0 ? 'Your demo ends tonight.'
+      : daysLeft <= 2 ? 'Your demo ends in ' + daysLeft + ' day' + (daysLeft === 1 ? '' : 's') + '.'
       : null };
 }
 

@@ -39,7 +39,9 @@ export async function listLicences() {
            c.name AS co_name, c.licence_key AS co_key, c.state AS co_state,
            c.seats AS co_seats, c.is_demo AS co_is_demo,
            COALESCE(c.expires_at, l.expires_at) AS expires_at,
-           GREATEST(0, CEIL(EXTRACT(EPOCH FROM (COALESCE(c.expires_at, l.expires_at) - now())) / 86400.0))::int AS days_left
+           GREATEST(0, ((COALESCE(c.expires_at, l.expires_at) AT TIME ZONE INTERVAL '+05:30')::date
+                        - (now() AT TIME ZONE INTERVAL '+05:30')::date))::int AS days_left,
+           (COALESCE(c.expires_at, l.expires_at) < now()) AS expired
       FROM licences l
       LEFT JOIN companies c ON c.id = l.company_id
      ORDER BY l.created_at DESC
@@ -61,7 +63,10 @@ export async function listCompanies() {
               what the GST check said. The passcode hash is never listed. */
            c.login_id, c.self_registered, c.registered_ip, c.registered_device, c.registered_at,
            c.gst_status, c.gst_checked_at, c.gst_note,
-           GREATEST(0, CEIL(EXTRACT(EPOCH FROM (c.expires_at - now())) / 86400.0))::int AS days_left,
+           /* 4.31.0 — calendar days in IST; expired is the instant, not the count */
+           GREATEST(0, ((c.expires_at AT TIME ZONE INTERVAL '+05:30')::date
+                        - (now() AT TIME ZONE INTERVAL '+05:30')::date))::int AS days_left,
+           (c.expires_at < now()) AS expired,
            (SELECT COUNT(*)::int FROM licences l
              WHERE l.company_id = c.id AND l.state <> 'REVOKED') AS seats_used,
            /* 4.3.0 — what this licence has used, summed across its seats.
@@ -102,7 +107,7 @@ export async function companyAction(body) {
         const rows = await q(
           `INSERT INTO companies (name, licence_key, email, phone, state, seats, grace_days,
                                   is_demo, expires_at, notes, gstin)
-           VALUES ($1,$2,$3,$4,'LICENSED',$5,$6,false, now() + make_interval(days => $7::int), $8, $9)
+           VALUES ($1,$2,$3,$4,'LICENSED',$5,$6,false, nexora_eod(now() + make_interval(days => $7::int)), $8, $9)
            RETURNING *`,
           [name, key, body.email || null, body.phone || null, seats, grace, days, body.notes || null,
            (String(body.gstin || '').trim().toUpperCase() || null)]);
@@ -124,14 +129,14 @@ export async function companyAction(body) {
     /* From whichever is later, so extending a live licence adds time
        rather than shortening it. */
     await q(`UPDATE companies
-                SET expires_at = GREATEST(now(), expires_at) + make_interval(days => $2::int)
+                SET expires_at = nexora_eod(GREATEST(now(), expires_at) + make_interval(days => $2::int))
               WHERE id = $1`, [id, days]);
     await logEvent(null, 'ADMIN_COMPANY_EXTEND', { id, days });
 
   } else if (action === 'licence') {
     await q(`UPDATE companies
                 SET state = 'LICENSED', is_demo = false,
-                    expires_at = GREATEST(now(), expires_at) + make_interval(days => $2::int)
+                    expires_at = nexora_eod(GREATEST(now(), expires_at) + make_interval(days => $2::int))
               WHERE id = $1`, [id, days]);
     await logEvent(null, 'ADMIN_COMPANY_LICENCE', { id, days });
 
@@ -273,7 +278,7 @@ export async function licenceAction(body) {
     if (!companyId) {
       /* Not adopted yet — write the device row, exactly as before. */
       await q(`UPDATE licences
-                  SET expires_at = GREATEST(now(), expires_at) + make_interval(days => $2::int),
+                  SET expires_at = nexora_eod(GREATEST(now(), expires_at) + make_interval(days => $2::int)),
                       state = CASE WHEN $3::bool THEN 'LICENSED'
                                    WHEN state = 'EXPIRED' THEN 'TRIAL' ELSE state END
                 WHERE device_id = $1`, [deviceId, days, action === 'licence']);
@@ -281,7 +286,7 @@ export async function licenceAction(body) {
       return { ok: true, scope: 'device' };
     }
     await q(`UPDATE companies
-                SET expires_at = GREATEST(now(), expires_at) + make_interval(days => $2::int)
+                SET expires_at = nexora_eod(GREATEST(now(), expires_at) + make_interval(days => $2::int))
                   ${action === 'licence' ? ", state = 'LICENSED', is_demo = false" : ''}
               WHERE id = $1`, [companyId, days]);
     await logEvent(deviceId, action === 'licence' ? 'ADMIN_LICENCE' : 'ADMIN_EXTEND',
@@ -558,7 +563,7 @@ function renderCompanies(){
   const term=(document.getElementById('cq').value||'').toLowerCase();
   const cos=(DATA.companies||[]).filter(c=>!term||[c.name,c.licence_key,c.email,c.gstin,c.login_id,c.phone].some(v=>String(v||'').toLowerCase().includes(term)));
   document.getElementById('colist').innerHTML=cos.map(c=>{
-    const state=(c.days_left<=0&&c.state!=='SUSPENDED')?'EXPIRED':c.state;
+    const state=(c.expired&&c.state!=='SUSPENDED')?'EXPIRED':c.state;
     const used=c.seats_used, seats=c.seats, pct=Math.min(100,Math.round(used/Math.max(1,seats)*100));
     const open=OPEN===c.id;
     return '<div class="co'+(c.state==='SUSPENDED'?' suspended':'')+'" id="co-'+c.id+'">'+
@@ -581,7 +586,7 @@ function renderCompanies(){
       '</div>'+
       '<div class="co-facts">'+
         '<div class="fact"><span>Seats</span><b>'+used+' of '+seats+'</b><span class="bar'+(used>=seats?' full':'')+'"><i style="width:'+pct+'%"></i></span></div>'+
-        '<div class="fact"><span>'+(state==='EXPIRED'?'Ended':state==='SUSPENDED'?'Suspended · ends':'Days left')+'</span><b>'+(state==='EXPIRED'||state==='SUSPENDED'?fmt(c.expires_at):c.days_left)+'</b>'+(state==='EXPIRED'||state==='SUSPENDED'?'':'<small>'+fmt(c.expires_at)+'</small>')+'</div>'+
+        '<div class="fact"><span>'+(state==='EXPIRED'?'Ended':state==='SUSPENDED'?'Suspended · ends':'Days left')+'</span><b>'+(state==='EXPIRED'||state==='SUSPENDED'?fmt(c.expires_at):(c.days_left===0?'today':c.days_left))+'</b>'+(state==='EXPIRED'||state==='SUSPENDED'?'':'<small>'+fmt(c.expires_at)+'</small>')+'</div>'+
         '<div class="fact"><span>Offline allowed</span><b>'+(c.grace_days>0?c.grace_days+' days':'none')+'</b>'+(c.grace_days>0?'':'<small>stops when it cannot reach the service</small>')+'</div>'+
         '<div class="fact"><span>Transactions</span>'+txnCell(c.txn_used,c.txn_limit)+'</div>'+
         '<div class="fact"><span>Hours in use</span><b>'+hoursText(c.usage_minutes)+'</b></div>'+
@@ -722,7 +727,7 @@ function render(){
   const term=(document.getElementById('q').value||'').toLowerCase();
   const all=DATA.licences, cos=DATA.companies||[];
   const rows=all.filter(l=>(!COFILTER||l.company_id===COFILTER)&&(!term||[l.company,l.co_name,l.co_key,l.email,l.device_id,l.device_name].some(v=>String(v||'').toLowerCase().includes(term))));
-  const live=all.filter(l=>l.days_left>0&&l.state!=='REVOKED').length;
+  const live=all.filter(l=>!l.expired&&l.state!=='REVOKED').length;
   document.getElementById('kpi').innerHTML=
     '<div class="kpi"><b>'+cos.filter(c=>!c.is_demo).length+'</b><span>Customers</span></div>'+
     '<div class="kpi"><b>'+cos.filter(c=>c.is_demo).length+'</b><span>Demos</span></div>'+
@@ -733,14 +738,14 @@ function render(){
   document.getElementById('instsub').textContent=fc?'— '+fc.name+' only':'— '+rows.length+' of '+all.length;
   document.getElementById('clearFilter').style.display=COFILTER?'':'none';
   document.querySelector('#tbl tbody').innerHTML=rows.map(l=>{
-    let state=(l.state==='TRIAL'&&l.days_left<=0)?'EXPIRED':l.state;
+    let state=(l.state==='TRIAL'&&l.expired)?'EXPIRED':l.state;
     if(l.co_state==='SUSPENDED'&&state!=='REVOKED')state='SUSPENDED';
     return '<tr>'+
       '<td><b>'+esc(l.co_name||l.company||'—')+'</b>'+(l.seat_no?' <code>seat '+l.seat_no+' of '+(l.co_seats||1)+'</code>':'')+
         '<br><code>'+esc(String(l.device_id).slice(0,12))+'…</code>'+(l.device_name?' <code>'+esc(l.device_name)+'</code>':'')+'</td>'+
       '<td><span class="pill s-'+state+'">'+state.toLowerCase()+'</span></td>'+
       '<td>'+esc(l.email||'—')+'</td>'+
-      '<td>'+(state==='EXPIRED'||state==='REVOKED'?'—':l.days_left)+'</td>'+
+      '<td>'+(state==='EXPIRED'||state==='REVOKED'?'—':(l.days_left===0?'today':l.days_left))+'</td>'+
       '<td>'+fmt(l.trial_started_at)+'</td>'+
       '<td>'+fmt(l.last_seen_at)+'</td>'+
       '<td>'+esc(l.app_version||'—')+'</td>'+

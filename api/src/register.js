@@ -146,7 +146,7 @@ export async function register(body, request) {
         `INSERT INTO companies (name, licence_key, email, phone, gstin, state, seats, grace_days, is_demo, expires_at,
                                 login_id, passcode_hash, self_registered, registered_ip, registered_device, registered_at,
                                 gst_status, gst_checked_at, gst_note)
-         VALUES ($1, $2, $3, $4, $5, 'DEMO', 1, $6, true, now() + make_interval(days => $7::int),
+         VALUES ($1, $2, $3, $4, $5, 'DEMO', 1, $6, true, nexora_eod(now() + make_interval(days => $7::int)),
                  $8, $9, true, $10, $11, now(), $12, $13::timestamptz, $14)
          RETURNING *`,
         [company, key, email, mobile, gstin, settings.demoGraceDays, settings.trialDays,
