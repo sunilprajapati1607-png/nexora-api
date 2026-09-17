@@ -22,6 +22,9 @@
  * matters re-reads the licence row anyway.
  */
 import { createHmac, timingSafeEqual, randomInt } from 'node:crypto';
+/* Deno does not put Buffer in the global scope; Node does. One import
+   and the same source runs on both. */
+import { Buffer } from 'node:buffer';
 import { q, getSettings, logEvent } from './db.js';
 
 const SECRET = process.env.NEXORA_TOKEN_SECRET || '';

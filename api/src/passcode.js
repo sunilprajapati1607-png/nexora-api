@@ -8,6 +8,9 @@
  * not four.
  */
 import { scryptSync, randomBytes, timingSafeEqual } from 'node:crypto';
+/* Deno does not put Buffer in the global scope; Node does. One import
+   and the same source runs on both. */
+import { Buffer } from 'node:buffer';
 
 export const PASSCODE_MIN = 6;
 
