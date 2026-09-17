@@ -97,9 +97,15 @@ jobs:
         run: |
           if [ -z "$SUPABASE_ACCESS_TOKEN" ]; then
             echo "::error::SUPABASE_ACCESS_TOKEN is not set on this repository — see the comment at the top of this file"; exit 1; fi
-          supabase functions deploy "nexora" \
-            --project-ref "${{ github.event.inputs.project_ref }}" \
-            --no-verify-jwt
+          # A token that was given an expiry when it was created will fail
+          # here, months later, with an authentication error and no hint as
+          # to why. Say so now, so nobody has to work it out then.
+          if ! supabase functions deploy "nexora" \
+                 --project-ref "${{ github.event.inputs.project_ref }}" \
+                 --no-verify-jwt; then
+            echo "::error::the deploy was refused. If this used to work, the most likely cause is that SUPABASE_ACCESS_TOKEN has expired or been revoked — make a new one at https://supabase.com/dashboard/account/tokens and replace the repository secret. Nothing in production is affected: this token is only used to deploy."
+            exit 1
+          fi
 
       - name: Check it answers
         run: |
