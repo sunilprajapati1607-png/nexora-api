@@ -29,6 +29,7 @@
 import { connect as tlsConnect } from 'node:tls';
 import { connect as netConnect } from 'node:net';
 import { createHash, createHmac, pbkdf2Sync, randomBytes } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 
 /* ---- wire helpers ---------------------------------------------------- */
 class Writer {
@@ -187,13 +188,33 @@ function parseUrl(url) {
     e.code = 'DATABASE_URL_INVALID';
     throw e;
   }
+  /* 4.34.0 — sslmode, read the way libpq reads it, because a managed
+     Postgres is not always fronted by a publicly trusted certificate.
+     Supabase's pooler presents its OWN root ("Supabase Root 2021 CA"),
+     which no CA bundle knows, so a blanket "always verify" cannot reach
+     it at all — and psql, pgAdmin and every Supabase client connect to it
+     every day with sslmode=require, which encrypts WITHOUT verifying.
+
+       disable                 no TLS at all
+       require / prefer/allow  TLS, certificate not verified  (libpq's rule)
+       verify-ca / verify-full TLS, certificate verified against the CA in
+                               sslrootcert= or PGSSLROOTCERT, or the system
+                               bundle when neither is given
+
+     Verification is the better setting where the CA is known: put the
+     provider's root in PGSSLROOTCERT and ask for verify-full. */
+  const mode = (u.searchParams.get('sslmode') || 'require').toLowerCase();
+  const rootcert = u.searchParams.get('sslrootcert') || process.env.PGSSLROOTCERT || '';
   return {
     host: u.hostname,
     port: u.port ? Number(u.port) : 5432,
     user: decodeURIComponent(u.username),
     password: decodeURIComponent(u.password),
     database: decodeURIComponent(u.pathname.replace(/^\//, '')),
-    ssl: !/sslmode=disable/.test(u.search)
+    ssl: mode !== 'disable',
+    sslmode: mode,
+    verify: mode === 'verify-ca' || mode === 'verify-full',
+    rootcert: rootcert
   };
 }
 
@@ -221,8 +242,25 @@ async function openConnection(url) {
     plain.once('error', reject);
     plain.once('data', (d) => {
       if (d[0] !== 0x53) return reject(new Error('The database refused a TLS connection.'));
-      const secure = tlsConnect({ socket: plain, servername: cfg.host }, () => resolve());
+      const opts = { socket: plain, servername: cfg.host, rejectUnauthorized: cfg.verify };
+      if (cfg.verify && cfg.rootcert) {
+        try { opts.ca = readFileSync(cfg.rootcert); }
+        catch (e) { return reject(new Error('Could not read the CA certificate at ' + cfg.rootcert + ': ' + e.message)); }
+      }
+      const secure = tlsConnect(opts, () => resolve());
       conn.socket = secure;
+      /* 4.34.0 — a TLS failure used to be filed under conn.dead and the
+         promise above was simply never settled: the caller waited for
+         ever instead of being told. Every handshake error now REJECTS
+         while the connection is being opened, and only afterwards is it
+         a fault on a live socket. */
+      secure.once('error', (e) => {
+        const why = e && e.code === 'SELF_SIGNED_CERT_IN_CHAIN'
+          ? 'the database presents its own certificate authority, which nothing here trusts. Use sslmode=require, or sslmode=verify-full with sslrootcert= pointing at that authority.'
+          : (e && e.message) || String(e);
+        conn.dead = e;
+        reject(new Error('TLS to ' + cfg.host + ' failed: ' + why));
+      });
       secure.on('error', (e) => { conn.dead = e; });
       secure.on('data', (c) => conn.feed(c));
     });
