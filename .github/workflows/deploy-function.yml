@@ -15,6 +15,16 @@
 #   SUPABASE_ACCESS_TOKEN   Supabase dashboard -> account -> Access Tokens
 #                           Settings -> Secrets and variables -> Actions
 #
+# Make it a SCOPED token if the option is offered (those begin sbp_fc),
+# scoped to this one project. A classic token carries the whole account:
+# every permission, on every organization and project, including ones
+# created after the token was made. That is far more than a deploy needs,
+# and a secret kept in CI is a secret that can leak.
+#
+# This is NOT the same as connecting GitHub to Supabase in the dashboard.
+# That integration is database BRANCHING — preview branches and
+# migrations — and it issues no token to Actions.
+#
 # The function's own secrets (NEXORA_TOKEN_SECRET, NEXORA_ADMIN_KEY) are
 # set once in the Supabase dashboard under Edge Functions -> Secrets.
 # SUPABASE_DB_URL is injected by the platform, so the database URL is not
