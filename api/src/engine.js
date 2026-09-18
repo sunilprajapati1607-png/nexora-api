@@ -38,7 +38,8 @@ function tableOr(obj, fallback) {
 /**
  * @param payload {
  *   bags, bagWeightG, basis, orderBags, steps, sections, qtyRounding,
- *   masters: { rates, names, uoms, procRates, procNames, procResources, groups },
+ *   masters: { rates, names, uoms, procRates, procNames, procResources, groups,
+ *              procProduces },
  *   view:      { mode:'EACH'|'FINAL', value }        optional
  *   components: [{name, qtyPerBagKg, lenPerBagM}]    optional, for reconcile
  * }
@@ -53,6 +54,11 @@ export function runBom(payload) {
   const procRate = tableOr(m.procRates, () => 0);
   const procName = tableOr(m.procNames, (c) => c);
   const groupOf = tableOr(m.groups, () => '');
+  /* 4.36.0 — what each process turns out. The reconciliation needs it to
+     report the running metres of web the plant MAKES; without it there is
+     simply no web line, which is what an older client that does not send
+     this will get. */
+  const producesOf = tableOr(m.procProduces, () => '');
   const procResources = (m.procResources && typeof m.procResources === 'object')
     ? (code) => (Object.prototype.hasOwnProperty.call(m.procResources, code) ? m.procResources[code] : null)
     : undefined;
@@ -75,7 +81,7 @@ export function runBom(payload) {
   let reconcile = null;
   if (result && result.ok) {
     reconcile = BomReconcile.build({
-      result, groupOf, nameOf,
+      result, groupOf, nameOf, producesOf,
       components: Array.isArray(p.components) ? p.components : [],
       /* The bag count the reconciliation reports against is the one the
          ROLL-UP actually costed — result.totals.bags — not the order
