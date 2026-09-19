@@ -277,7 +277,21 @@ export default {
 
       /* ---- the owner ----------------------------------------------- */
       if (path === '/admin') {
-        return new Response(ADMIN_HTML, { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } });
+        /* 4.44.0 — ALWAYS THE PAGE THAT WAS JUST DEPLOYED.
+
+           The console is one HTML string that changes with every release,
+           and a browser told nothing will happily keep the copy it got a
+           week ago — so a card added on Tuesday is simply missing on
+           Wednesday and nobody can see why. no-store settles it: the page
+           is re-fetched every time, which for a page one person opens a
+           few times a day costs nothing worth counting. */
+        return new Response(ADMIN_HTML, {
+          status: 200,
+          headers: {
+            'content-type': 'text/html; charset=utf-8',
+            'cache-control': 'no-store, must-revalidate'
+          }
+        });
       }
       if (path.startsWith('/admin/api/')) {
         await ensureSchema();
