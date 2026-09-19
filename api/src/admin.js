@@ -514,50 +514,107 @@ export const ADMIN_HTML = `<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Nexora — Licence console</title>
 <style>
-:root{--bg:#f4f6fb;--surface:#fff;--border:#e1e5ee;--text:#1a2233;--muted:#667085;--accent:#4f7cff;--accentbg:#eaf1fe;
-      --ok:#16a34a;--warn:#d97706;--bad:#dc2626;--okbg:#e8f7ee;--warnbg:#fef3e2;--badbg:#fdeaea;}
-@media(prefers-color-scheme:dark){:root{--bg:#12141c;--surface:#1b1e29;--border:#2a2e3e;--text:#e8ebf2;--muted:#98a2b3;
-      --accentbg:#1c2740;--okbg:#123222;--warnbg:#3a2a10;--badbg:#3a1717;}}
+/* 4.39.0 — THE CONSOLE WEARS THE APPLICATION'S THEME.
+
+     "make it reach same like app theme"
+
+   It had the application's colours and none of its manners: no brand,
+   no mode switch of its own, flat cards, flat buttons. Somebody who
+   spends their day in Nexora and then opens this to answer a customer
+   should not feel they have left the product.
+
+   These are the application's OWN tokens, values and all \u2014 including the
+   4.39.0 dark mode, where the quiet writing was lifted from 3.13:1 to
+   4.82:1 against a card. The console is themed BY HAND rather than by
+   the OS now, exactly as the app is: data-theme on the root, remembered
+   between visits, starting from whatever the machine prefers. */
+:root{
+  --bg:#f4f6fb;--bg-elevated:#ffffff;--bg-sunken:#eceff5;--surface:#fff;--surface-hover:#f1f4fa;
+  --border:#e1e5ee;--border-strong:#cbd2e1;
+  --text:#1a2233;--muted:#667085;--faint:#98a2b3;
+  --accent:#4f7cff;--accent-rgb:79,124,255;--accentbg:#eaf1fe;
+  --ok:#16a34a;--warn:#d97706;--bad:#dc2626;--okbg:#e8f7ee;--warnbg:#fef3e2;--badbg:#fdeaea;
+  --shadow-sm:0 1px 2px rgba(20,24,38,.06);
+  --shadow:0 4px 16px rgba(20,24,38,.08);
+  --shadow-lg:0 12px 32px rgba(20,24,38,.14);
+  --radius:12px;--radius-sm:8px;
+  --font:-apple-system,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;
+}
+:root[data-theme=dark]{
+  --bg:#12141c;--bg-elevated:#1b1e29;--bg-sunken:#0c0e14;--surface:#1b1e29;--surface-hover:#232735;
+  --border:#333a4f;--border-strong:#464f6a;
+  --text:#eef0f6;--muted:#a8b2ca;--faint:#7f8aa6;
+  --accentbg:#1c2740;
+  --ok:#34d399;--warn:#fbbf24;--bad:#f87171;--okbg:#12291f;--warnbg:#2c2410;--badbg:#2c1616;
+  /* Depth in a dark room comes from the edge: a black shadow on a
+     near-black page is invisible, so every raised surface carries a
+     hairline of light along its top instead. */
+  --shadow-sm:0 1px 2px rgba(0,0,0,.35),inset 0 1px 0 rgba(255,255,255,.035);
+  --shadow:0 4px 20px rgba(0,0,0,.42),inset 0 1px 0 rgba(255,255,255,.045);
+  --shadow-lg:0 16px 40px rgba(0,0,0,.55),inset 0 1px 0 rgba(255,255,255,.06);
+}
 *{box-sizing:border-box}
-body{margin:0;font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--text)}
+body{margin:0;font:14px/1.5 var(--font);background:var(--bg);color:var(--text);
+     -webkit-font-smoothing:antialiased}
 .wrap{max-width:1180px;margin:0 auto;padding:20px 16px 60px}
 h1{font-size:20px;margin:0}h2{font-size:15px;margin:0}
 .sub{color:var(--muted);margin:0}
-.card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:16px;margin-bottom:14px}
+/* A card carries the accent down its left edge, painted INSIDE the
+   border so the card is exactly the size it was \u2014 the application's
+   own signature, and the thing that makes a page of them read as one
+   product rather than as a table of boxes. */
+.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:16px;margin-bottom:14px;
+      box-shadow:var(--shadow-sm),inset 3px 0 0 rgba(var(--accent-rgb),.45);
+      transition:box-shadow .16s ease,border-color .16s ease}
+.card:hover{box-shadow:var(--shadow),inset 3px 0 0 rgba(var(--accent-rgb),.9)}
 .top{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:14px}
 .top .grow{flex:1}
 .kpis{display:flex;gap:8px;flex-wrap:wrap}
-.kpi{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:8px 14px;min-width:96px}
-.kpi b{display:block;font-size:20px;line-height:1.1}.kpi span{color:var(--muted);font-size:12px}
-.pill{display:inline-block;padding:2px 9px;border-radius:99px;font-size:12px;font-weight:600;white-space:nowrap}
+.kpi{background:var(--bg-sunken);border:1px solid var(--border);border-radius:var(--radius-sm);padding:9px 15px;min-width:100px;
+     position:relative;overflow:hidden}
+/* the state bar every figure tile in the application wears */
+.kpi::before{content:'';position:absolute;left:0;right:0;top:0;height:3px;background:rgba(var(--accent-rgb),.55)}
+.kpi b{display:block;font-size:21px;line-height:1.1;font-weight:800;letter-spacing:-.01em}
+.kpi span{color:var(--muted);font-size:11.5px;font-weight:700;text-transform:uppercase;letter-spacing:.04em}
+.pill{display:inline-block;padding:3px 10px;border-radius:999px;font-size:11.5px;font-weight:700;white-space:nowrap;border:1px solid transparent}
 .s-TRIAL,.s-DEMO{background:var(--okbg);color:var(--ok)}.s-LICENSED{background:var(--accentbg);color:var(--accent)}
 .s-EXPIRED{background:var(--warnbg);color:var(--warn)}.s-REVOKED,.s-SUSPENDED,.s-FAILED{background:var(--badbg);color:var(--bad)}
 .s-SELF{background:var(--accentbg);color:var(--accent)}.s-UNVERIFIED{background:var(--warnbg);color:var(--warn)}
 .key{font:13px ui-monospace,Menlo,Consolas,monospace;letter-spacing:.03em}
 code{font:12px ui-monospace,Menlo,Consolas,monospace;color:var(--muted)}
-button{font:inherit;padding:6px 11px;border:1px solid var(--border);border-radius:7px;background:var(--surface);color:var(--text);cursor:pointer}
-button:hover{border-color:var(--accent);color:var(--accent)}
-button.primary{background:var(--accent);border-color:var(--accent);color:#fff}button.primary:hover{color:#fff;opacity:.92}
-button.danger{border-color:var(--bad);color:var(--bad)}button.danger:hover{background:var(--badbg)}
-button.small{padding:3px 8px;font-size:12px}
-input,select{font:inherit;padding:7px 9px;border:1px solid var(--border);border-radius:7px;background:var(--surface);color:var(--text)}
+button{font:inherit;font-weight:700;padding:7px 13px;border:1px solid var(--border);border-radius:var(--radius-sm);
+       background:var(--surface);color:var(--text);cursor:pointer;
+       transition:transform .12s cubic-bezier(.2,.8,.3,1),box-shadow .12s ease,border-color .12s ease,color .12s ease,background .12s ease}
+button:hover{border-color:var(--accent);color:var(--accent);background:var(--surface-hover);transform:translateY(-1px);box-shadow:var(--shadow-sm)}
+button:active{transform:translateY(0)}
+button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff;box-shadow:0 2px 6px rgba(var(--accent-rgb),.35)}
+button.primary:hover{color:#fff;background:var(--accent);box-shadow:0 4px 12px rgba(var(--accent-rgb),.5)}
+button.danger{border-color:var(--bad);color:var(--bad)}button.danger:hover{background:var(--badbg);color:var(--bad)}
+button.small{padding:4px 9px;font-size:12px;border-radius:7px}
+input,select{font:inherit;padding:8px 10px;border:1px solid var(--border-strong);border-radius:var(--radius-sm);
+             background:var(--bg-sunken);color:var(--text);transition:border-color .12s ease,box-shadow .12s ease}
+input:focus,select:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(var(--accent-rgb),.18)}
 label{display:inline-flex;flex-direction:column;gap:3px;font-size:12px;color:var(--muted)}
 label input,label select{font-size:14px;color:var(--text)}
 .row{display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap}
-.msg{padding:10px 12px;border-radius:8px;margin:8px 0}
+.msg{padding:10px 13px;border-radius:var(--radius-sm);margin:8px 0;font-weight:600;border:1px solid transparent}
 .msg.err{background:var(--badbg);color:var(--bad)}.msg.warn{background:var(--warnbg);color:var(--warn)}.msg.ok{background:var(--okbg);color:var(--ok)}
 .help{color:var(--muted);font-size:12.5px;margin:6px 0 0}
 #gate{max-width:400px;margin:12vh auto}
 /* companies */
-.co{border:1px solid var(--border);border-radius:12px;padding:14px 16px;margin-bottom:10px;background:var(--surface)}
+.co{border:1px solid var(--border);border-radius:var(--radius);padding:15px 17px;margin-bottom:10px;background:var(--surface);
+    box-shadow:var(--shadow-sm),inset 3px 0 0 rgba(var(--accent-rgb),.45);
+    transition:box-shadow .16s ease,border-color .16s ease}
+.co:hover{box-shadow:var(--shadow),inset 3px 0 0 rgba(var(--accent-rgb),.9)}
 .co.suspended{border-color:var(--bad)}
 .co-head{display:flex;gap:12px;align-items:flex-start;flex-wrap:wrap}
 .co-name{font-size:16px;font-weight:700;margin-right:4px}
 .co-meta{color:var(--muted);font-size:12.5px;display:flex;gap:14px;flex-wrap:wrap;margin-top:6px}
 .co-facts{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-top:12px}
-.fact{border:1px solid var(--border);border-radius:9px;padding:8px 10px}
+.fact{border:1px solid var(--border);border-radius:var(--radius-sm);padding:9px 11px;background:var(--bg-sunken)}
 .fact span{display:block;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em}
-.fact b{font-size:15px}
+.fact b{font-size:15.5px;font-weight:800}
 .fact small{color:var(--muted)}
 .bar{display:block;height:5px;border-radius:3px;background:var(--border);margin-top:5px;overflow:hidden}
 .bar i{display:block;height:100%;background:var(--accent)}.bar.full i{background:var(--bad)}
@@ -573,15 +630,46 @@ th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;le
 .legend{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:10px;margin-top:10px}
 .legend div{background:var(--bg);border-radius:9px;padding:9px 11px;font-size:12.5px}
 .legend b{display:block}
-.users-panel{margin:8px 0 4px;padding:10px 12px;border:1px solid #2a2e3e;border-radius:8px;background:rgba(255,255,255,.02)}
+/* ---- the brand, as the application wears it ---- */
+.brand{display:flex;align-items:center;gap:11px}
+.brand-mark{width:38px;height:38px;border-radius:11px;display:flex;align-items:center;justify-content:center;
+  background:linear-gradient(160deg,#6d93ff 0%,#4f7cff 55%,#3862d8 100%);color:#fff;font-weight:800;font-size:19px;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.5),0 1px 2px rgba(0,0,0,.25),0 0 12px rgba(var(--accent-rgb),.45)}
+.brand h1{font-size:18px;letter-spacing:-.01em}
+.brand .sub{font-size:11.5px}
+/* ---- light and dark, the same switch the application has ---- */
+.mode-switch{appearance:none;cursor:pointer;position:relative;width:50px;height:26px;padding:0;flex:0 0 auto;
+  border:1px solid var(--border-strong);border-radius:999px;background:var(--bg-sunken);display:inline-flex;align-items:center;
+  transition:background .2s ease,border-color .2s ease}
+.mode-switch:hover{border-color:rgba(var(--accent-rgb),.75);transform:none;box-shadow:none}
+.mode-switch .mode-mark{position:absolute;top:50%;transform:translateY(-50%);width:14px;height:14px;
+  display:flex;align-items:center;justify-content:center;color:var(--faint);font-size:11px;transition:opacity .2s ease}
+.mode-switch .mode-sun{left:6px}.mode-switch .mode-moon{right:6px}
+.mode-switch[aria-checked=false] .mode-sun{opacity:0}
+.mode-switch[aria-checked=true] .mode-moon{opacity:0}
+.mode-switch .mode-knob{position:absolute;top:2px;left:2px;width:20px;height:20px;border-radius:50%;
+  display:flex;align-items:center;justify-content:center;font-size:11px;
+  background:linear-gradient(180deg,#fff 0%,#e6e9f2 100%);color:#d38b0c;
+  box-shadow:0 1px 3px rgba(10,14,28,.45),inset 0 1px 0 rgba(255,255,255,.9);
+  transition:transform .22s cubic-bezier(.2,.8,.3,1),background .2s ease,color .2s ease}
+.mode-switch[aria-checked=true] .mode-knob{transform:translateX(24px);
+  background:linear-gradient(180deg,#39415c 0%,#232a3d 100%);color:#cfe0ff}
+@media(prefers-reduced-motion:reduce){.mode-switch .mode-knob{transition:none}button{transition:none}}
+/* The people panel is a sunken surface, the way the application makes
+   a panel that belongs INSIDE a card \u2014 and it takes its colours from
+   the tokens rather than from a hard-coded grey, so it follows the
+   theme instead of fighting it. */
+.users-panel{margin:8px 0 4px;padding:12px 14px;border:1px solid var(--border);border-radius:var(--radius-sm);
+             background:var(--bg-sunken);width:100%}
 .users-panel table.users{width:100%;border-collapse:collapse;margin:6px 0}
 .users-panel table.users th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.04em;opacity:.7;padding:4px 8px 4px 0}
-.users-panel table.users td{padding:5px 8px 5px 0;border-top:1px solid #23273a;font-size:13px}
+.users-panel table.users td{padding:7px 10px 7px 0;border-top:1px solid var(--border);font-size:13px}
 .users-panel tr.off{opacity:.55}
 </style></head><body>
 <div class="wrap">
   <div id="gate" class="card">
-    <h1>Nexora — Licence console</h1>
+    <div class="brand" style="margin-bottom:10px"><span class="brand-mark">N</span>
+      <div><h1 style="margin:0">NEXORA</h1><p class="sub" style="margin:0">Licence console</p></div></div>
     <p class="sub" style="margin:4px 0 12px">Enter the admin key (NEXORA_ADMIN_KEY on the service).</p>
     <div id="gateErr"></div>
     <div class="row"><input id="key" type="password" placeholder="Admin key" style="flex:1" onkeydown="if(event.key==='Enter')load()"><button class="primary" onclick="load()">Open</button></div>
@@ -589,8 +677,13 @@ th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;le
 
   <div id="app" style="display:none">
     <div class="top">
-      <div class="grow"><h1>Nexora — Licence console</h1><p class="sub" id="sub"></p></div>
+      <div class="grow brand"><span class="brand-mark">N</span>
+        <div><h1 style="margin:0">NEXORA <span class="sub" style="font-weight:600">Licence console</span></h1>
+        <p class="sub" id="sub"></p></div></div>
       <div class="kpis" id="kpi"></div>
+      <button class="mode-switch" id="mode-switch" role="switch" aria-checked="false" onclick="flipMode()" title="Light \u2014 click for dark">
+        <span class="mode-mark mode-sun">\u2600</span><span class="mode-mark mode-moon">\u263e</span>
+        <span class="mode-knob">\u2600</span></button>
       <button onclick="load()">Refresh</button>
       <button data-target="settings" onclick="toggle(this)">Service settings</button>
       <button onclick="signOut()" title="Forget the key in this browser tab">Sign out</button>
@@ -653,6 +746,28 @@ th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;le
 </div>
 <script>
 let KEY='', DATA={licences:[],companies:[],settings:{}}, OPEN=null, COFILTER=null;
+/* Themed by hand and remembered, exactly as the application is: the
+   machine's preference decides only where you START. */
+function setMode(m){
+  document.documentElement.setAttribute('data-theme',m);
+  const s=document.getElementById('mode-switch');
+  if(s){
+    s.setAttribute('aria-checked',m==='dark'?'true':'false');
+    s.title=m==='dark'?'Dark \u2014 click for light':'Light \u2014 click for dark';
+    s.querySelector('.mode-knob').textContent=m==='dark'?'\u263e':'\u2600';
+  }
+  try{localStorage.setItem('nexora.console.mode',m)}catch(e){}
+}
+function flipMode(){setMode(document.documentElement.getAttribute('data-theme')==='dark'?'light':'dark');}
+(function(){
+  let m=null;
+  try{m=localStorage.getItem('nexora.console.mode')}catch(e){}
+  if(m!=='dark'&&m!=='light'){
+    m=(window.matchMedia&&window.matchMedia('(prefers-color-scheme:dark)').matches)?'dark':'light';
+  }
+  document.addEventListener('DOMContentLoaded',()=>setMode(m));
+  document.documentElement.setAttribute('data-theme',m);
+})();
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function fmt(d){return d?new Date(d).toLocaleDateString(undefined,{day:'2-digit',month:'short',year:'2-digit'}):'—'}
 function toggle(btn){const id=typeof btn==='string'?btn:btn.dataset.target;const n=document.getElementById(id);n.style.display=n.style.display==='none'?'':'none';}
