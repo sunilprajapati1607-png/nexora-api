@@ -47,7 +47,7 @@ export function pinMatches(pin, stored) {
   const b = Buffer.from(stored);
   return a.length === b.length && timingSafeEqual(a, b);
 }
-function validPin(pin) {
+export function validPin(pin) {
   const p = String(pin == null ? '' : pin);
   return p.length >= 4 && p.length <= 64;
 }

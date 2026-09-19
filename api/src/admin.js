@@ -12,8 +12,9 @@
  * real accounts the day there is more than one operator.
  */
 import { q, getSettings, logEvent } from './db.js';
+import { hashPasscode, validPasscode, PASSCODE_MIN } from './passcode.js';
 import { newLicenceKey } from './licence.js';
-import { ensureAdmin, usersSummary, userCap } from './sync.js';
+import { ensureAdmin, usersSummary, userCap, listUsers, hashPin, validPin, nameKey } from './sync.js';
 
 const ADMIN_KEY = process.env.NEXORA_ADMIN_KEY || '';
 
@@ -214,6 +215,150 @@ export async function companyAction(body) {
                 SET txn_base = txn_count, usage_base = usage_minutes, usage_reset_at = now()
               WHERE company_id = $1`, [id]);
     await logEvent(null, 'ADMIN_COMPANY_RESETUSAGE', { id });
+
+  } else if (action === 'users') {
+    /* 4.39.0 — THE PEOPLE ON A COMPANY, FROM THE OWNER'S SIDE.
+
+         "company console ma thi user delete ane create kri sakay ane
+          tamam user ane passcode joi sakay"
+
+       A company runs its own people from inside the application, and
+       that stays true. But when a plant telephones — the administrator
+       has left, nobody can sign in, a leaver is still holding the only
+       seat — the owner had no way to see who is on a company, let alone
+       do anything about it. This is that way.
+
+       WHAT IS NOT HERE, AND WILL NOT BE: the PINs. They are scrypt
+       hashes, exactly like the company passcode, so there is nothing to
+       show — not to the plant, not to the owner, not to anyone who ever
+       gets hold of the database. That is the whole point of storing them
+       that way, and it is worth far more than the convenience of reading
+       one back. When somebody has forgotten theirs, SET a new one and
+       tell them: 'userpin' below, and 'passcode' for the company's own.
+       Every bank in the world answers a forgotten password the same
+       way, for the same reason. */
+    const list = await listUsers(id);
+    const cap = await userCap(id);
+    return { ok: true, users: list, cap: cap };
+
+  } else if (action === 'useradd') {
+    const name = String(body.name || '').trim();
+    if (!name) return { error: 'A name is required.' };
+    if (!validPin(body.pin)) return { error: 'A PIN of at least 4 characters is required.' };
+    const key = nameKey(name);
+    const dup = await q(`SELECT id FROM company_users WHERE company_id = $1 AND name_key = $2`, [id, key]);
+    if (dup.length) return { error: 'There is already a user called ' + name + ' on this company.' };
+    /* The seat limit is the licence, and the owner is not exempt from it:
+       a seat given here is a seat the company is not paying for. Raise
+       the seats first if that is what is meant. */
+    const cap = await userCap(id);
+    if (cap.count >= cap.max) {
+      return { error: 'This company has ' + cap.max + ' seat(s) and ' + cap.count +
+        ' person(s) on them. Give it more seats first, or remove someone who has left.' };
+    }
+    const rows = await q(
+      `INSERT INTO company_users (company_id, name, name_key, pin_hash, role, scope, active)
+       VALUES ($1, $2, $3, $4, $5, $6, true) RETURNING *`,
+      [id, name, key, hashPin(body.pin), body.role === 'ADMIN' ? 'ADMIN' : 'USER',
+       body.scope === 'ALL' ? 'ALL' : 'OWN']);
+    await logEvent(null, 'ADMIN_USER_CREATE', { companyId: id, userId: rows[0].id, name });
+    return { ok: true, warning: name + ' can now sign in. Tell them the PIN directly \u2014 it is not shown again.' };
+
+  } else if (action === 'userrole') {
+    /* 4.39.0 — what a person IS on their company. An administrator adds
+       and removes people and sees everyone's work; an ordinary user does
+       neither. The plant changes this itself from inside the
+       application; this is for the call where the only administrator has
+       left and nobody inside can promote anyone. */
+    const want = body.role === 'ADMIN' ? 'ADMIN' : 'USER';
+    const u = (await q(`SELECT id, name, role FROM company_users WHERE company_id = $1 AND id = $2`, [id, +body.userId]))[0];
+    if (!u) return { error: 'No such user on this company.' };
+    if (u.role === want) return { ok: true, warning: u.name + ' is already ' + (want === 'ADMIN' ? 'an administrator' : 'an ordinary user') + '.' };
+    if (u.role === 'ADMIN' && want === 'USER') {
+      const admins = await q(
+        `SELECT COUNT(*)::int AS n FROM company_users WHERE company_id = $1 AND role = 'ADMIN' AND active = true`, [id]);
+      if ((Number(admins[0].n) || 0) <= 1) {
+        return { error: u.name + ' is the only administrator. Make somebody else one first \u2014 a company with none cannot add anybody.' };
+      }
+    }
+    /* An administrator sees the company's work, which is what the role is
+       for; stepping down puts that back to their own unless somebody has
+       deliberately widened it. */
+    await q(`UPDATE company_users SET role = $3, scope = CASE WHEN $3 = 'ADMIN' THEN 'ALL' ELSE scope END
+              WHERE company_id = $1 AND id = $2`, [id, u.id, want]);
+    await logEvent(null, 'ADMIN_USER_ROLE', { companyId: id, userId: u.id, name: u.name, role: want });
+    return { ok: true, warning: u.name + ' is now ' + (want === 'ADMIN' ? 'an administrator.' : 'an ordinary user.') };
+
+  } else if (action === 'userpin') {
+    if (!validPin(body.pin)) return { error: 'A PIN of at least 4 characters is required.' };
+    const u = (await q(`SELECT id, name FROM company_users WHERE company_id = $1 AND id = $2`, [id, +body.userId]))[0];
+    if (!u) return { error: 'No such user on this company.' };
+    await q(`UPDATE company_users SET pin_hash = $3 WHERE company_id = $1 AND id = $2`,
+      [id, u.id, hashPin(body.pin)]);
+    await logEvent(null, 'ADMIN_USER_PIN', { companyId: id, userId: u.id, name: u.name });
+    return { ok: true, warning: 'The PIN for ' + u.name + ' has been set. Tell them directly \u2014 it is not shown again.' };
+
+  } else if (action === 'userdel') {
+    const u = (await q(`SELECT id, name, role FROM company_users WHERE company_id = $1 AND id = $2`, [id, +body.userId]))[0];
+    if (!u) return { error: 'No such user on this company.' };
+    /* A company with nobody who can add anyone is a company nobody can
+       get back into, so the last administrator does not go this way.
+       Make somebody else an administrator first. */
+    if (u.role === 'ADMIN') {
+      const admins = await q(
+        `SELECT COUNT(*)::int AS n FROM company_users WHERE company_id = $1 AND role = 'ADMIN' AND active = true`, [id]);
+      if ((Number(admins[0].n) || 0) <= 1) {
+        return { error: u.name + ' is the only administrator. Set another one first \u2014 a company with none cannot add anybody.' };
+      }
+    }
+    /* What they saved stays with the company: it is the company's work,
+       and a leaver must not take the plant's costings with them. */
+    await q(`DELETE FROM company_users WHERE company_id = $1 AND id = $2`, [id, u.id]);
+    await logEvent(null, 'ADMIN_USER_DELETE', { companyId: id, userId: u.id, name: u.name });
+    return { ok: true, warning: u.name + ' has been removed and their seat is free. Everything they saved stays with the company.' };
+
+  } else if (action === 'passcode') {
+    /* 4.39.0 — SET A NEW COMPANY PASSCODE.
+
+       The passcode is scrypt-hashed (passcode.js), so it cannot be read
+       back by anyone, including whoever is reading this. That is right —
+       and it left a plant that forgot theirs with no way onto another
+       computer at all, because the id and passcode are how a
+       self-registered company joins its next seat.
+
+       So the owner can set a new one, and tell the customer. It is
+       deliberately SET, never shown: there is nothing to show. The login
+       id can be corrected at the same time, because a company that
+       cannot remember the passcode often cannot remember the id either,
+       and a login needs both halves to be right.
+
+       Only a company that registered itself has either; a company Nexora
+       issued a licence key to joins with the key and is told so rather
+       than being given a passcode it will never use. */
+    const co = (await q(`SELECT id, name, login_id, self_registered FROM companies WHERE id = $1`, [id]))[0];
+    if (!co) return { error: 'No such company.' };
+    if (!co.self_registered) {
+      return { error: co.name + ' did not register itself — it joins with its licence key, not with a passcode.' };
+    }
+    const passcode = body.passcode == null ? '' : String(body.passcode);
+    if (!validPasscode(passcode)) {
+      return { error: 'A company passcode needs at least ' + PASSCODE_MIN + ' characters.' };
+    }
+    let loginId = body.loginId == null ? '' : String(body.loginId).trim().toLowerCase();
+    if (loginId && loginId !== co.login_id) {
+      const taken = await q(`SELECT id FROM companies WHERE login_id = $1 AND id <> $2 LIMIT 1`, [loginId, id]);
+      if (taken.length) return { error: 'Another company already uses the login id "' + loginId + '".' };
+    } else {
+      loginId = co.login_id;
+    }
+    await q(`UPDATE companies SET login_id = $2, passcode_hash = $3 WHERE id = $1`,
+      [id, loginId, hashPasscode(passcode)]);
+    /* Recorded, because changing the way into a company is exactly the
+       kind of thing that should be answerable for afterwards. The
+       passcode itself is never written down. */
+    await logEvent(null, 'ADMIN_COMPANY_PASSCODE', { id, name: co.name, loginId });
+    return { ok: true, warning: 'The login for ' + co.name + ' is now id "' + loginId +
+      '" with the new passcode. Tell them directly \u2014 it is not shown again.' };
 
   } else if (action === 'adminuser') {
     /* 4.8.0 — the owner creates (or resets the PIN of) the company's
@@ -428,6 +573,11 @@ th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;le
 .legend{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:10px;margin-top:10px}
 .legend div{background:var(--bg);border-radius:9px;padding:9px 11px;font-size:12.5px}
 .legend b{display:block}
+.users-panel{margin:8px 0 4px;padding:10px 12px;border:1px solid #2a2e3e;border-radius:8px;background:rgba(255,255,255,.02)}
+.users-panel table.users{width:100%;border-collapse:collapse;margin:6px 0}
+.users-panel table.users th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.04em;opacity:.7;padding:4px 8px 4px 0}
+.users-panel table.users td{padding:5px 8px 5px 0;border-top:1px solid #23273a;font-size:13px}
+.users-panel tr.off{opacity:.55}
 </style></head><body>
 <div class="wrap">
   <div id="gate" class="card">
@@ -605,6 +755,12 @@ function renderCompanies(){
         '</div></div>'+
         '<div class="group"><h4>People</h4><div class="acts">'+
           '<button data-id="'+c.id+'" data-name="'+esc(c.name)+'" onclick="coAdmin(this)">Set administrator…</button><span class="why">the person who adds everyone else from inside the application</span>'+
+          '<button data-id="'+c.id+'" data-name="'+esc(c.name)+'" data-login="'+esc(c.login_id||'')+'" onclick="coPasscode(this)">New company passcode…</button><span class="why">for a plant that has forgotten the one it chose; it cannot be read back</span>'+
+          '<button data-id="'+c.id+'" data-name="'+esc(c.name)+'" onclick="coUsers(this)">Refresh the list</button><span class="why">the plant adds and removes people too, from inside the application</span>'+
+          /* 4.39.0 — the people are shown WITH the company, not behind
+             another click. Opening a company to see who is on it is the
+             commonest reason for opening one at all. */
+          '<div id="users-'+c.id+'" class="users-panel"><p class="help">Reading…</p></div>'+
         '</div></div>'+
         (c.gstin?'<div class="group"><h4>GST</h4><div class="acts">'+
           '<button data-id="'+c.id+'" onclick="gstVerify(this)">Verify online</button><span class="why">asks the verification service, if one is configured</span>'+
@@ -624,7 +780,16 @@ function renderCompanies(){
     '</div>';
   }).join('')||'<p class="help">No companies yet. A plant that registers itself from the application appears here as a demo; a customer you set up yourself is created with New company.</p>';
 }
-function manage(btn){const id=+btn.dataset.id;OPEN=OPEN===id?null:id;renderCompanies();if(OPEN)document.getElementById('co-'+OPEN).scrollIntoView({block:'nearest'});}
+function manage(btn){
+  const id=+btn.dataset.id;
+  OPEN=OPEN===id?null:id;
+  renderCompanies();
+  if(OPEN){
+    document.getElementById('co-'+OPEN).scrollIntoView({block:'nearest'});
+    /* The people come with the company. */
+    coUsers({dataset:{id:OPEN}});
+  }
+}
 function copyKey(btn){const k=btn.dataset.key;try{navigator.clipboard.writeText(k);say('<div class="msg ok">Copied '+esc(k)+'</div>');}catch(e){prompt('Licence key',k);}}
 async function coAct(btn){
   const id=+btn.dataset.id,action=btn.dataset.action,days=+btn.dataset.days||0;
@@ -668,6 +833,97 @@ async function coReset(btn){
   const r=await api('/admin/api/company',{method:'POST',body:JSON.stringify({id:+btn.dataset.id,action:'resetusage'})});
   if(r.error){say('<div class="msg err">'+esc(r.error)+'</div>');return;}
   say('<div class="msg ok">Usage reset for <b>'+esc(btn.dataset.name)+'</b>.</div>');
+  await load();
+}
+/* 4.39.0 — the people on a company. What is shown is everything there
+   IS to show: a PIN is a scrypt hash, so there is no PIN to print here
+   or anywhere else. A forgotten one is SET again, not read. */
+function userRow(cid,u){
+  const when=u.lastLoginAt?('last signed in '+fmt(u.lastLoginAt)):'never signed in';
+  return '<tr'+(u.active?'':' class="off"')+'>'+
+    '<td><b>'+esc(u.name)+'</b>'+(u.active?'':' <span class="why">switched off</span>')+'</td>'+
+    '<td>'+(u.role==='ADMIN'?'<b>administrator</b>':'user')+'</td>'+
+    '<td>'+(u.scope==='ALL'?'sees everyone&rsquo;s work':'sees own work')+'</td>'+
+    '<td class="why">'+esc(when)+'</td>'+
+    '<td>'+
+      '<button class="small" data-cid="'+cid+'" data-uid="'+u.id+'" data-name="'+esc(u.name)+'" data-role="'+(u.role==='ADMIN'?'USER':'ADMIN')+'" onclick="uRole(this)">'+
+        (u.role==='ADMIN'?'Make ordinary user':'Make administrator')+'</button> '+
+      '<button class="small" data-cid="'+cid+'" data-uid="'+u.id+'" data-name="'+esc(u.name)+'" onclick="uPin(this)">Set PIN…</button> '+
+      '<button class="small" data-cid="'+cid+'" data-uid="'+u.id+'" data-name="'+esc(u.name)+'" onclick="uDel(this)">Remove…</button>'+
+    '</td></tr>';
+}
+async function coUsers(btn){
+  const cid=+btn.dataset.id, host=document.getElementById('users-'+cid);
+  if(!host)return;
+  host.style.display='';
+  host.innerHTML='<p class="help">Reading…</p>';
+  const r=await api('/admin/api/company',{method:'POST',body:JSON.stringify({id:cid,action:'users'})});
+  if(r.error){host.innerHTML='<div class="msg err">'+esc(r.error)+'</div>';return;}
+  const cap=r.cap||{max:0,count:0};
+  host.innerHTML=
+    '<p class="help"><b>'+cap.count+' of '+cap.max+' seat(s) taken.</b> '+
+      'A PIN cannot be shown here or anywhere else \u2014 it is stored scrambled, which is what stops anyone who gets the database from signing in as your customers. '+
+      'When somebody forgets theirs, set a new one and tell them.</p>'+
+    (r.users&&r.users.length
+      ? '<table class="users"><thead><tr><th>Name</th><th>Role</th><th>Sees</th><th>Last signed in</th><th></th></tr></thead><tbody>'+
+        r.users.map(u=>userRow(cid,u)).join('')+'</tbody></table>'
+      : '<p class="help">Nobody has been added to this company yet.</p>')+
+    '<button data-id="'+cid+'" onclick="uAdd(this)">Add a person…</button>';
+}
+async function uAdd(btn){
+  const cid=+btn.dataset.id;
+  const name=prompt('Name of the person to add.\\n\\nThey sign in with this name and a PIN.');
+  if(name===null||!name.trim())return;
+  const pin=prompt('PIN for '+name.trim()+' (at least 4 characters). Tell it to them directly; it is not shown again.');
+  if(pin===null)return;
+  const admin=confirm('Make '+name.trim()+' an ADMINISTRATOR?\\n\\nOK = administrator (can add and remove people from inside the application).\\nCancel = ordinary user.');
+  const r=await api('/admin/api/company',{method:'POST',body:JSON.stringify({id:cid,action:'useradd',name:name.trim(),pin,role:admin?'ADMIN':'USER'})});
+  if(r.error){say('<div class="msg err">'+esc(r.error)+'</div>');return;}
+  say('<div class="msg ok">'+esc(r.warning||'Added.')+'</div>');
+  document.getElementById('users-'+cid).innerHTML='';
+  await coUsers({dataset:{id:cid}});
+  await load();
+}
+async function uRole(btn){
+  const to=btn.dataset.role;
+  const word=to==='ADMIN'?'an ADMINISTRATOR':'an ordinary user';
+  if(!confirm('Make '+btn.dataset.name+' '+word+'?\\n\\n'+(to==='ADMIN'
+    ?'They will be able to add and remove people from inside the application, and see everyone\u2019s work.'
+    :'They will no longer be able to add or remove anybody.')))return;
+  const cid=+btn.dataset.cid;
+  const r=await api('/admin/api/company',{method:'POST',body:JSON.stringify({id:cid,action:'userrole',userId:+btn.dataset.uid,role:to})});
+  if(r.error){say('<div class="msg err">'+esc(r.error)+'</div>');return;}
+  say('<div class="msg ok">'+esc(r.warning||'Done.')+'</div>');
+  document.getElementById('users-'+cid).innerHTML='';
+  await coUsers({dataset:{id:cid}});
+}
+async function uPin(btn){
+  const cid=+btn.dataset.cid;
+  const pin=prompt('New PIN for '+btn.dataset.name+' (at least 4 characters).\\n\\nThe old one cannot be read back. Tell them this one directly.');
+  if(pin===null)return;
+  const r=await api('/admin/api/company',{method:'POST',body:JSON.stringify({id:cid,action:'userpin',userId:+btn.dataset.uid,pin})});
+  if(r.error){say('<div class="msg err">'+esc(r.error)+'</div>');return;}
+  say('<div class="msg ok">'+esc(r.warning||'Done.')+'</div>');
+}
+async function uDel(btn){
+  const cid=+btn.dataset.cid;
+  if(!confirm('Remove '+btn.dataset.name+' from this company?\\n\\nTheir seat is freed. Everything they saved stays with the company.'))return;
+  const r=await api('/admin/api/company',{method:'POST',body:JSON.stringify({id:cid,action:'userdel',userId:+btn.dataset.uid})});
+  if(r.error){say('<div class="msg err">'+esc(r.error)+'</div>');return;}
+  say('<div class="msg ok">'+esc(r.warning||'Removed.')+'</div>');
+  document.getElementById('users-'+cid).innerHTML='';
+  await coUsers({dataset:{id:cid}});
+  await load();
+}
+async function coPasscode(btn){
+  const name=btn.dataset.name;
+  const id=prompt('Company login id for '+name+'\\n\\nThis is the first half of their login. Leave it as it is unless they want it changed.',btn.dataset.login||'');
+  if(id===null)return;
+  const pass=prompt('New company passcode for '+name+' (at least 6 characters).\\n\\nNobody can read the old one \u2014 it is stored scrambled. Tell them this new one directly; it is not shown again.');
+  if(pass===null)return;
+  const r=await api('/admin/api/company',{method:'POST',body:JSON.stringify({id:+btn.dataset.id,action:'passcode',loginId:id.trim(),passcode:pass})});
+  if(r.error){say('<div class="msg err">'+esc(r.error)+'</div>');return;}
+  say('<div class="msg ok">'+esc(r.warning||'Done.')+'</div>');
   await load();
 }
 async function coAdmin(btn){
