@@ -253,6 +253,31 @@ export function ensureSchema() {
     await q(`CREATE INDEX IF NOT EXISTS inquiries_created_idx ON inquiries (created_at DESC)`);
     await q(`CREATE INDEX IF NOT EXISTS inquiries_state_idx ON inquiries (state)`);
 
+    /* 4.44.0 — WHAT THE PHONE CONSOLE SHOULD BE RUNNING.
+
+       The Android console is not on Play, so nothing tells it a new build
+       exists. The owner publishes one here and every phone offers it at
+       its next check.
+
+       The APK itself is NOT stored here — `url` points at wherever it
+       lives (a GitHub release asset, a file on the site, anywhere over
+       https). A binary in the database is a binary in every backup, and
+       this service has no business serving sixteen megabytes.
+
+       version_code is the primary key because that is the number Android
+       itself compares; it only ever goes up. */
+    await q(`
+      CREATE TABLE IF NOT EXISTS app_releases (
+        version_code BIGINT PRIMARY KEY,
+        version_name TEXT NOT NULL,
+        url          TEXT NOT NULL,
+        notes        TEXT,
+        sha256       TEXT,
+        size_bytes   BIGINT,
+        mandatory    BOOLEAN NOT NULL DEFAULT false,
+        published_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      )`);
+
     /* 4.42.0 — a person's own address.
 
        Until now the only email the service held was the company's, so a
@@ -282,6 +307,36 @@ export function ensureSchema() {
        step, and nothing to leak. `session_at` is kept so the console can
        say WHERE somebody is, which is the first question asked when
        somebody rings to say they were signed out. */
+    /* 4.44.0 — THE COMPANY'S OWN CONVERSATION.
+
+         "add best ui base company internal chat window with tagging of
+          documents and item code, only for inter company"
+
+       One room per company. `tags` are REFERENCES — a calculation
+       number, a BOM number, an item code — and never the record
+       itself: what travels is the name of the thing, and each reader's
+       own installation opens its own copy. No costing and no price is
+       ever in a message unless somebody types one.
+
+       `name` is stored beside user_id on purpose. A message should
+       still read correctly a year after the person who wrote it has
+       left and their row has been removed.
+
+       Indexed on (company_id, id) because every read is 'this
+       company, since this id' and nothing else. */
+    await q(`
+      CREATE TABLE IF NOT EXISTS chat_messages (
+        id          BIGSERIAL PRIMARY KEY,
+        company_id  BIGINT NOT NULL,
+        user_id     BIGINT,
+        name        TEXT NOT NULL,
+        body        TEXT NOT NULL DEFAULT '',
+        tags        JSONB NOT NULL DEFAULT '[]'::jsonb,
+        deleted     BOOLEAN NOT NULL DEFAULT false,
+        at          TIMESTAMPTZ NOT NULL DEFAULT now()
+      )`);
+    await q(`CREATE INDEX IF NOT EXISTS chat_company_id_idx ON chat_messages (company_id, id)`);
+
     await q(`ALTER TABLE company_users ADD COLUMN IF NOT EXISTS session_device TEXT`);
     await q(`ALTER TABLE company_users ADD COLUMN IF NOT EXISTS session_at TIMESTAMPTZ`);
 

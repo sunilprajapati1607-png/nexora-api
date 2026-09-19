@@ -17,9 +17,12 @@ import { activate, authorise, touch, issueToken, reportUsage, companyUsage, desc
 import { runBom } from './engine.js';
 import { adminAuthorised, listLicences, licenceAction, companyAction, saveSettings, recentEvents, ADMIN_HTML } from './admin.js';
 import { login, listUsers, userAction, pull, push, describeUser, userCap, setCompanyPasscode, releaseSession } from './sync.js';
+import { send as chatSend, since as chatSince, remove as chatRemove } from './chat.js';
 import { ensureInkSchema, getModel, listModels, train as inkTrain, estimate as inkEstimate, reset as inkReset } from './inkstore.js';
 import { register, gstAction, remoteIp } from './register.js';
 import { listInquiries, inquiryAction, publicInquiry } from './inquiry.js';
+import { latestRelease, listReleases, releaseAction } from './appupdate.js';
+import { logoResponse } from './brand.js';
 
 const CORS = {
   'access-control-allow-origin': '*',
@@ -124,6 +127,35 @@ export default {
         return json({ token: issueToken(a.row, out.body.user.id), user: out.body.user, licence: a.licence,
           company: a.company ? { id: a.company.id, name: a.company.name } : null });
       }
+      /* 4.44.0 — the company's own conversation. Scoped by the device
+         row's company like every other read here, and refused outright
+         to a machine with nobody signed in: a message has to have a
+         name against it or it is not a conversation. */
+      if (path === '/v1/chat' && method === 'GET') {
+        await ensureSchema();
+        const a = await authorise(request);
+        if (!a.ok) return json(a.error, a.httpStatus);
+        if (!a.user) return json({ error: 'SIGN_IN', message: 'Sign in to read the company conversation.' }, 401);
+        const u = new URL(request.url);
+        const out = await chatSince(a.companyId, u.searchParams.get('since'), u.searchParams.get('limit'));
+        return json(out.body, out.httpStatus);
+      }
+      if (path === '/v1/chat/send' && method === 'POST') {
+        await ensureSchema();
+        const a = await authorise(request);
+        if (!a.ok) return json(a.error, a.httpStatus);
+        const out = await chatSend(a.companyId, a.user, await readJson(request));
+        return json(out.body, out.httpStatus);
+      }
+      if (path === '/v1/chat/delete' && method === 'POST') {
+        await ensureSchema();
+        const a = await authorise(request);
+        if (!a.ok) return json(a.error, a.httpStatus);
+        const b2 = await readJson(request);
+        const out = await chatRemove(a.companyId, a.user, b2 && b2.id);
+        return json(out.body, out.httpStatus);
+      }
+
       if (path === '/v1/logout' && method === 'POST') {
         await ensureSchema();
         const a = await authorise(request);
@@ -237,6 +269,12 @@ export default {
         return json({ licence: a.licence, ...out });
       }
 
+      /* 4.44.0 — the mark, so the console carries its own logo rather than
+         borrowing one from a website that may not be reachable. */
+      if (path === '/logo.png' && (method === 'GET' || method === 'HEAD')) {
+        return logoResponse();
+      }
+
       /* ---- the owner ----------------------------------------------- */
       if (path === '/admin') {
         return new Response(ADMIN_HTML, { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } });
@@ -254,6 +292,13 @@ export default {
         /* 4.42.0 — enquiries: the leads, before they are customers. */
         if (path === '/admin/api/inquiries' && method === 'GET') return json(await listInquiries());
         if (path === '/admin/api/inquiry' && method === 'POST') return json(await inquiryAction(await readJson(request)));
+        /* 4.44.0 — the phone console's own releases. */
+        if (path === '/admin/api/app' && method === 'GET') return json(await listReleases());
+        if (path === '/admin/api/app' && method === 'POST') return json(await releaseAction(await readJson(request)));
+        /* What a phone asks on every check. Behind the admin key like
+           everything else here: only the owner runs this application, and
+           an unlisted build is not an advertisement. */
+        if (path === '/admin/api/app/latest' && method === 'GET') return json(await latestRelease());
         return json({ error: 'NOT_FOUND' }, 404);
       }
 

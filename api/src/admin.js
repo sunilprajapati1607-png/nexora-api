@@ -562,6 +562,8 @@ export async function recentEvents(deviceId) {
 export const ADMIN_HTML = `<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Nexora — Licence console</title>
+<link rel="icon" type="image/png" href="/logo.png">
+<link rel="apple-touch-icon" href="/logo.png">
 <style>
 /* 4.39.0 — THE CONSOLE WEARS THE APPLICATION'S THEME.
 
@@ -681,9 +683,17 @@ th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;le
 .legend b{display:block}
 /* ---- the brand, as the application wears it ---- */
 .brand{display:flex;align-items:center;gap:11px}
-.brand-mark{width:38px;height:38px;border-radius:11px;display:flex;align-items:center;justify-content:center;
-  background:linear-gradient(160deg,#6d93ff 0%,#4f7cff 55%,#3862d8 100%);color:#fff;font-weight:800;font-size:19px;
-  box-shadow:inset 0 1px 0 rgba(255,255,255,.5),0 1px 2px rgba(0,0,0,.25),0 0 12px rgba(var(--accent-rgb),.45)}
+/* 4.44.0 — THE REAL MARK, not a letter in a blue box. The same logo the
+   calculation software and the website wear, served by this service itself
+   from /logo.png so the console does not depend on anything else being up.
+   The dark mode gets a soft halo behind it, because a mark drawn for white
+   paper needs a little light under it on a near-black page. */
+.brand-mark{width:38px;height:38px;flex:0 0 auto;object-fit:contain;display:block;
+  filter:drop-shadow(0 1px 2px rgba(10,14,28,.18))}
+:root[data-theme=dark] .brand-mark{
+  background:radial-gradient(circle at 50% 50%, rgba(255,255,255,.10) 0%, rgba(255,255,255,0) 70%);
+  border-radius:11px;
+  filter:drop-shadow(0 0 10px rgba(var(--accent-rgb),.45))}
 .brand h1{font-size:18px;letter-spacing:-.01em}
 .brand .sub{font-size:11.5px}
 /* ---- light and dark, the same switch the application has ---- */
@@ -717,7 +727,7 @@ th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;le
 </style></head><body>
 <div class="wrap">
   <div id="gate" class="card">
-    <div class="brand" style="margin-bottom:10px"><span class="brand-mark">N</span>
+    <div class="brand" style="margin-bottom:10px"><img class="brand-mark" src="/logo.png" alt="Nexora" width="38" height="38">
       <div><h1 style="margin:0">NEXORA</h1><p class="sub" style="margin:0">Licence console</p></div></div>
     <p class="sub" style="margin:4px 0 12px">Enter the admin key (NEXORA_ADMIN_KEY on the service).</p>
     <div id="gateErr"></div>
@@ -726,7 +736,7 @@ th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;le
 
   <div id="app" style="display:none">
     <div class="top">
-      <div class="grow brand"><span class="brand-mark">N</span>
+      <div class="grow brand"><img class="brand-mark" src="/logo.png" alt="Nexora" width="38" height="38">
         <div><h1 style="margin:0">NEXORA <span class="sub" style="font-weight:600">Licence console</span></h1>
         <p class="sub" id="sub"></p></div></div>
       <div class="kpis" id="kpi"></div>
@@ -775,10 +785,50 @@ th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;le
       <div id="colist"></div>
       <div class="legend">
         <div><b>Suspend</b>stops every machine of the company at its next check. Nothing is deleted; Restore puts it all back. Use it when a customer has not paid.</div>
-        <div><b>Revoke</b>(on one installation) stops that one machine and frees its seat for another. The company keeps running.</div>
-        <div><b>Delete</b>removes the company, its machines, its people and everything its seats synced. It cannot be undone from here — the name must be typed to confirm.</div>
+        <div><b>Revoke</b>(on one installation) stops that one machine. It frees no seat — seats are people, and a machine never held one. The company keeps running.</div>
+        <div><b>Delete</b>removes the company, its machines, its people and everything they synced. It cannot be undone from here — the name must be typed to confirm.</div>
         <div><b>Transactions and hours</b>are what the company has used — saved records, and time in the application — summed over its machines. A limit of 0 means none.</div>
       </div>
+    </div>
+
+    <!-- 4.44.0 — THE PHONE CONSOLE'S RELEASES.
+
+         The Android console is not on Play, so this is what tells it a new
+         build exists. The APK is not stored here: the address points at
+         wherever the file actually lives. -->
+    <div class="card" id="appcard">
+      <div class="top" style="margin-bottom:6px">
+        <h2 class="grow">Phone app <span class="sub" style="font-weight:400" id="appsub"></span></h2>
+        <button class="primary" data-target="newrel" onclick="toggle(this)">Publish a build</button>
+      </div>
+      <div id="newrel" style="display:none;border:1px solid var(--border);border-radius:10px;padding:12px;margin:8px 0 12px">
+        <div class="row">
+          <label>Version code<input id="rCode" type="number" min="1" step="1" style="width:120px" placeholder="4"></label>
+          <label>Version name<input id="rName" style="width:140px" placeholder="1.3.0"></label>
+          <label style="flex:1;min-width:280px">Download address (https)<input id="rUrl" placeholder="https://github.com/…/nexora-console-1.3.0.apk" style="width:100%"></label>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <label style="flex:1">What changed<input id="rNotes" placeholder="Shown on the phone before it installs" style="width:100%"></label>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <label>SHA-256 <span class="hint">optional</span><input id="rSha" placeholder="checked before installing" style="min-width:260px"></label>
+          <label style="flex-direction:row;align-items:center;gap:8px;color:var(--text)"><input id="rMust" type="checkbox">Must install</label>
+          <button class="primary" onclick="publishRelease()">Publish</button>
+        </div>
+        <p class="help">The version code is the number Android compares, and it only ever goes up &mdash; it is <code>versionCode</code> in the app&rsquo;s build file. The address can point anywhere the phone can reach over https: a GitHub release asset, a file on the site, anywhere. Publishing the same code again replaces it.</p>
+      </div>
+      <!-- 4.44.0 — the repository publishes itself: one small JSON beside
+           the APK, and pushing a build is all a new version needs. -->
+      <div class="row" style="margin:6px 0 10px">
+        <label style="flex:1;min-width:300px">Build repository <span class="hint">a version file the service reads; a push is then all it takes</span>
+          <input id="rSource" placeholder="https://raw.githubusercontent.com/…/main/releases/latest.json" style="width:100%"></label>
+        <button onclick="saveSource()">Save</button>
+      </div>
+      <div id="repoLine"></div>
+      <div id="appMsg"></div>
+      <div style="overflow-x:auto"><table id="apptbl">
+        <thead><tr><th>Version</th><th>Code</th><th>Published</th><th>What changed</th><th>Address</th><th></th></tr></thead><tbody></tbody></table></div>
+      <p class="help">Every phone running the console checks this and offers the newest build it finds &mdash; whichever is higher, the repository&rsquo;s file or a version published here. Withdrawing one makes the phones offer the version below it instead.</p>
     </div>
 
     <!-- 4.42.0 — THE ENQUIRIES.
@@ -833,7 +883,7 @@ th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;le
       </div>
       <div style="overflow-x:auto"><table id="tbl">
         <thead><tr><th>Company · machine</th><th>State</th><th>Email</th><th>Days left</th><th>Started</th><th>Last seen</th><th>Version</th><th>Transactions</th><th>Hours</th><th></th></tr></thead><tbody></tbody></table></div>
-      <p class="help">The clock belongs to the company, not the machine. Revoke one machine to free its seat; suspend the company to stop all of them.</p>
+      <p class="help">The clock belongs to the company, not the machine. Machines take no seat — revoke one to stop that computer, suspend the company to stop all of them. Seats are the people, under Manage &rarr; People.</p>
     </div>
   </div>
 </div>
@@ -892,6 +942,7 @@ async function load(){
     /* 4.42.0 — the leads come with everything else, and never hold up the
        rest of the page if the service has not been deployed with them. */
     loadInquiries();
+    loadReleases();
   }catch(e){
     KEY='';
     document.getElementById('gateErr').innerHTML='<div class="msg err">'+esc(e.message)+'</div>';
@@ -1235,7 +1286,7 @@ async function coAdmin(btn){
 }
 async function coDelete(btn){
   const name=btn.dataset.name;
-  const typed=prompt('Delete '+name+'?\\n\\nThis removes the company, its machines, its people and everything its seats synced. It cannot be undone from here.\\n\\nType the company name exactly to confirm:');
+  const typed=prompt('Delete '+name+'?\\n\\nThis removes the company, its machines, its people and everything they synced. It cannot be undone from here.\\n\\nType the company name exactly to confirm:');
   if(typed===null)return;
   const r=await api('/admin/api/company',{method:'POST',body:JSON.stringify({id:+btn.dataset.id,action:'delete',confirmName:typed})});
   if(r.error){say('<div class="msg err">'+esc(r.error)+'</div>');return;}
@@ -1272,6 +1323,100 @@ async function createCo(){
   await load();
   say('<div class="msg ok"><b>'+esc(r.company.name)+'</b> created. Licence key <span class="key">'+esc(r.company.licence_key)+'</span> — give this to the customer; every machine types it at activation.</div>');
 }
+/* ---------- the phone app's releases (4.44.0) -------------------------- */
+let RELEASES=[];
+function appsay(html){
+  const n=document.getElementById('appMsg');
+  if(!n)return;
+  n.innerHTML=html;
+  if(html)setTimeout(()=>{if(n.innerHTML===html)appsay('')},6000);
+}
+let REPO_RELEASE=null;
+async function loadReleases(){
+  try{
+    const r=await api('/admin/api/app');
+    RELEASES=r.releases||[];
+    REPO_RELEASE=r.fromRepository||null;
+    const s=document.getElementById('rSource');
+    if(s&&document.activeElement!==s)s.value=r.manifestUrl||'';
+  }catch(e){
+    RELEASES=[];
+    document.querySelector('#apptbl tbody').innerHTML=
+      '<tr><td colspan="6" class="help">This service does not carry phone builds yet — deploy the API to switch them on.</td></tr>';
+    return;
+  }
+  renderReleases();
+}
+async function saveSource(){
+  const url=document.getElementById('rSource').value.trim();
+  const r=await api('/admin/api/app',{method:'POST',body:JSON.stringify({action:'source',manifestUrl:url})});
+  if(r.error){appsay('<div class="msg err">'+esc(r.error)+'</div>');return;}
+  appsay('<div class="msg ok">'+esc(r.warning||'Saved.')+'</div>');
+  await loadReleases();
+}
+function renderReleases(){
+  const latest=RELEASES[0];
+  /* Whichever is newer is what the phones will actually be offered. */
+  const offered=(REPO_RELEASE&&(!latest||REPO_RELEASE.versionCode>latest.versionCode))?REPO_RELEASE:latest;
+  document.getElementById('appsub').textContent=
+    offered?('— phones are offered '+offered.versionName+' (code '+offered.versionCode+')')
+           :'— nothing published yet';
+  document.getElementById('repoLine').innerHTML=REPO_RELEASE
+    ? '<div class="msg ok">The repository is offering <b>'+esc(REPO_RELEASE.versionName)+
+      '</b> (code '+REPO_RELEASE.versionCode+')'+
+      (REPO_RELEASE.notes?' &mdash; '+esc(REPO_RELEASE.notes):'')+
+      '. Pushing a new build there is all a new version needs.</div>'
+    : '';
+  document.querySelector('#apptbl tbody').innerHTML=RELEASES.map((r,i)=>
+    '<tr>'+
+      '<td><b>'+esc(r.versionName)+'</b>'+(i===0?' <span class="pill s-LICENSED">newest</span>':'')+
+        (r.mandatory?' <span class="pill s-EXPIRED">must install</span>':'')+'</td>'+
+      '<td><code>'+r.versionCode+'</code></td>'+
+      '<td class="why">'+fmt(r.publishedAt)+'</td>'+
+      '<td class="why" style="max-width:280px">'+esc(r.notes||'')+'</td>'+
+      '<td><a href="'+esc(r.url)+'" target="_blank" rel="noopener"><code>'+esc(String(r.url).slice(0,48))+'…</code></a></td>'+
+      '<td><div class="acts">'+
+        '<button class="small" data-code="'+r.versionCode+'" onclick="editRelease(this)">Edit</button>'+
+        '<button class="small danger" data-code="'+r.versionCode+'" data-name="'+esc(r.versionName)+'" onclick="withdrawRelease(this)">Withdraw</button>'+
+      '</div></td></tr>'
+  ).join('')||'<tr><td colspan="6" class="help">Nothing published yet. Build the APK, put it somewhere the phones can reach over https, and publish its version code and address here.</td></tr>';
+}
+function editRelease(btn){
+  const r=RELEASES.find(x=>x.versionCode===+btn.dataset.code);
+  if(!r)return;
+  document.getElementById('newrel').style.display='';
+  document.getElementById('rCode').value=r.versionCode;
+  document.getElementById('rName').value=r.versionName||'';
+  document.getElementById('rUrl').value=r.url||'';
+  document.getElementById('rNotes').value=r.notes||'';
+  document.getElementById('rSha').value=r.sha256||'';
+  document.getElementById('rMust').checked=!!r.mandatory;
+  document.getElementById('newrel').scrollIntoView({behavior:'smooth',block:'nearest'});
+}
+async function publishRelease(){
+  const body={
+    action:'publish',
+    versionCode:+document.getElementById('rCode').value,
+    versionName:document.getElementById('rName').value.trim(),
+    url:document.getElementById('rUrl').value.trim(),
+    notes:document.getElementById('rNotes').value.trim(),
+    sha256:document.getElementById('rSha').value.trim(),
+    mandatory:document.getElementById('rMust').checked
+  };
+  const r=await api('/admin/api/app',{method:'POST',body:JSON.stringify(body)});
+  if(r.error){appsay('<div class="msg err">'+esc(r.error)+'</div>');return;}
+  document.getElementById('newrel').style.display='none';
+  appsay('<div class="msg ok">'+esc(r.warning||'Published.')+'</div>');
+  await loadReleases();
+}
+async function withdrawRelease(btn){
+  if(!confirm('Withdraw version '+btn.dataset.name+'?\\n\\nPhones will offer the version below it instead. Nothing already installed is touched.'))return;
+  const r=await api('/admin/api/app',{method:'POST',body:JSON.stringify({action:'delete',versionCode:+btn.dataset.code})});
+  if(r.error){appsay('<div class="msg err">'+esc(r.error)+'</div>');return;}
+  appsay('<div class="msg ok">'+esc(r.warning||'Withdrawn.')+'</div>');
+  await loadReleases();
+}
+
 /* ---------- enquiries (4.42.0) ----------------------------------------
    The same rows the phone console shows, from the same service. Nothing
    is cached here and nothing is merged: both read /admin/api/inquiries,
@@ -1450,7 +1595,7 @@ function render(){
         '<button class="small" data-device="'+esc(l.device_id)+'" data-action="resetusage" onclick="act(this)">Reset usage</button>'+
         (l.state==='REVOKED'
           ?'<button class="small" data-device="'+esc(l.device_id)+'" data-action="restore" onclick="act(this)">Restore</button>'
-          :'<button class="small danger" data-device="'+esc(l.device_id)+'" data-action="revoke" onclick="act(this)" title="Stops this machine and frees its seat">Revoke</button>')+
+          :'<button class="small danger" data-device="'+esc(l.device_id)+'" data-action="revoke" onclick="act(this)" title="Stops this machine. It frees no seat: seats are people">Revoke</button>')+
         '<button class="small danger" data-device="'+esc(l.device_id)+'" data-name="'+esc(l.co_name||l.company||l.device_name||l.device_id)+'" onclick="delInstall(this)" title="Remove this installation row altogether">Delete</button>'+
       '</div></td></tr>';
   }).join('')||'<tr><td colspan="10" class="help">Nothing here yet.</td></tr>';
