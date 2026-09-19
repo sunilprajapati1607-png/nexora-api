@@ -16,9 +16,10 @@ import { ensureSchema } from './db.js';
 import { activate, authorise, touch, issueToken, reportUsage, companyUsage, describe } from './licence.js';
 import { runBom } from './engine.js';
 import { adminAuthorised, listLicences, licenceAction, companyAction, saveSettings, recentEvents, ADMIN_HTML } from './admin.js';
-import { login, listUsers, userAction, pull, push, describeUser, userCap } from './sync.js';
+import { login, listUsers, userAction, pull, push, describeUser, userCap, setCompanyPasscode } from './sync.js';
 import { ensureInkSchema, getModel, listModels, train as inkTrain, estimate as inkEstimate, reset as inkReset } from './inkstore.js';
-import { register, gstAction } from './register.js';
+import { register, gstAction, remoteIp } from './register.js';
+import { listInquiries, inquiryAction, publicInquiry } from './inquiry.js';
 
 const CORS = {
   'access-control-allow-origin': '*',
@@ -49,6 +50,17 @@ export default {
       if (path === '/health' || path === '/') {
         await ensureSchema();
         return json({ ok: true, service: 'nexora-api', version: '1.0.0', time: new Date().toISOString() });
+      }
+
+      /* 4.42.0 — the website's contact and demo forms. Open by necessity:
+         a visitor has no key and is not going to be given one. It can only
+         ever INSERT one lead, it carries a honeypot and a per-address
+         throttle, and it answers 200 whatever it decides, so a robot
+         learns nothing from the reply. */
+      if (path === '/enquiry' && method === 'POST') {
+        await ensureSchema();
+        const body = await readJson(request);
+        return json(await publicInquiry(body, remoteIp(request)));
       }
 
       /* ---- the app ------------------------------------------------- */
@@ -125,6 +137,17 @@ export default {
           return json({ users: await listUsers(a.companyId), me: describeUser(a.user), maxUsers: cap.max, count: cap.count });
         }
         const out = await userAction(a.companyId, a.user, await readJson(request));
+        return json(out.body, out.httpStatus);
+      }
+      /* 4.42.0 — an administrator sets a new company passcode from inside
+         the plant. The role is checked in setCompanyPasscode, not here:
+         one rule, one place. */
+      if (path === '/v1/company/passcode' && method === 'POST') {
+        await ensureSchema();
+        const a = await authorise(request);
+        if (!a.ok) return json(a.error, a.httpStatus);
+        if (!a.user) return json({ error: 'SIGN_IN', message: 'Sign in to change the company passcode.' }, 401);
+        const out = await setCompanyPasscode(a.companyId, a.user, await readJson(request));
         return json(out.body, out.httpStatus);
       }
       if (path === '/v1/sync/pull' && method === 'GET') {
@@ -216,6 +239,9 @@ export default {
         if (path === '/admin/api/company' && method === 'POST') return json(await companyAction(await readJson(request)));
         if (path === '/admin/api/settings' && method === 'POST') return json(await saveSettings(await readJson(request)));
         if (path === '/admin/api/events' && method === 'GET') return json({ events: await recentEvents(url.searchParams.get('deviceId')) });
+        /* 4.42.0 — enquiries: the leads, before they are customers. */
+        if (path === '/admin/api/inquiries' && method === 'GET') return json(await listInquiries());
+        if (path === '/admin/api/inquiry' && method === 'POST') return json(await inquiryAction(await readJson(request)));
         return json({ error: 'NOT_FOUND' }, 404);
       }
 

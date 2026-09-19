@@ -14,7 +14,7 @@
 import { q, getSettings, logEvent } from './db.js';
 import { hashPasscode, validPasscode, PASSCODE_MIN } from './passcode.js';
 import { newLicenceKey } from './licence.js';
-import { ensureAdmin, usersSummary, userCap, listUsers, hashPin, validPin, nameKey } from './sync.js';
+import { ensureAdmin, usersSummary, userCap, listUsers, hashPin, validPin, nameKey, cleanEmail } from './sync.js';
 
 const ADMIN_KEY = process.env.NEXORA_ADMIN_KEY || '';
 
@@ -68,8 +68,14 @@ export async function listCompanies() {
            GREATEST(0, ((c.expires_at AT TIME ZONE INTERVAL '+05:30')::date
                         - (now() AT TIME ZONE INTERVAL '+05:30')::date))::int AS days_left,
            (c.expires_at < now()) AS expired,
+           /* 4.42.0 — a seat is a PERSON, so this is the people count.
+              The machines are counted beside it under its own name, because
+              the owner still wants to know how many are out there — they
+              simply are not what the company is paying for. */
+           (SELECT COUNT(*)::int FROM company_users u
+             WHERE u.company_id = c.id) AS seats_used,
            (SELECT COUNT(*)::int FROM licences l
-             WHERE l.company_id = c.id AND l.state <> 'REVOKED') AS seats_used,
+             WHERE l.company_id = c.id AND l.state <> 'REVOKED') AS machines_used,
            /* 4.3.0 — what this licence has used, summed across its seats.
               Computed here rather than stored, so it cannot disagree with
               the device rows it is made of. */
@@ -85,6 +91,8 @@ export async function listCompanies() {
     const u = await usersSummary(c.id);
     c.users_count = u.count;
     c.admin_names = u.admins;
+    /* 4.42.0 — whom a circular would actually reach at this company. */
+    c.user_emails = u.emails;
     /* One seat = one person. Every name counts, switched off or not;
        users_count stays the ACTIVE number the page always showed. */
     c.users_total = (await userCap(c.id)).count;
@@ -151,11 +159,12 @@ export async function companyAction(body) {
     await q(`UPDATE companies SET seats = $2 WHERE id = $1`, [id, seats]);
     const people = (await q(`SELECT COUNT(*)::int AS n FROM company_users WHERE company_id = $1`, [id]))[0];
     await logEvent(null, 'ADMIN_COMPANY_SEATS', { id, seats, inUse: Number(used.n), people: Number(people.n) });
-    /* One seat = one person as well as one machine. Going below either
-       stops nobody; the application refuses the NEXT person. */
+    /* 4.42.0 — a seat is a person and nothing else. Machines are not
+       rationed any more, so their number is no longer a warning: a plant
+       may put Nexora on every terminal it owns and still pay for the
+       three people who actually use it. Going below the people already
+       created stops nobody; the application refuses the NEXT person. */
     const warn = [];
-    if (Number(used.n) > seats) warn.push(used.n + ' machines are still active, which is more than the ' + seats +
-      ' seats now allowed. None were stopped — revoke the ones you do not want in the Installations list.');
     if (Number(people.n) > seats) warn.push(people.n + ' people are on this company, which is more than the ' + seats +
       ' seats now allowed. Nobody was removed — the application refuses the next person until seats are raised.');
     if (warn.length) return { ok: true, warning: 'Saved. ' + warn.join(' ') };
@@ -257,12 +266,27 @@ export async function companyAction(body) {
         ' person(s) on them. Give it more seats first, or remove someone who has left.' };
     }
     const rows = await q(
-      `INSERT INTO company_users (company_id, name, name_key, pin_hash, role, scope, active)
-       VALUES ($1, $2, $3, $4, $5, $6, true) RETURNING *`,
+      `INSERT INTO company_users (company_id, name, name_key, pin_hash, role, scope, active, email)
+       VALUES ($1, $2, $3, $4, $5, $6, true, $7) RETURNING *`,
       [id, name, key, hashPin(body.pin), body.role === 'ADMIN' ? 'ADMIN' : 'USER',
-       body.scope === 'ALL' ? 'ALL' : 'OWN']);
+       body.scope === 'ALL' ? 'ALL' : 'OWN', cleanEmail(body.email)]);
     await logEvent(null, 'ADMIN_USER_CREATE', { companyId: id, userId: rows[0].id, name });
     return { ok: true, warning: name + ' can now sign in. Tell them the PIN directly \u2014 it is not shown again.' };
+
+  } else if (action === 'useremail') {
+    /* 4.42.0 \u2014 a person's own address, set or cleared. Blank clears it,
+       which is the only way to take somebody off the distribution list who
+       still runs the software. */
+    const u = (await q(`SELECT id, name FROM company_users WHERE company_id = $1 AND id = $2`, [id, +body.userId]))[0];
+    if (!u) return { error: 'No such user on this company.' };
+    const raw = String(body.email == null ? '' : body.email).trim();
+    const mail = cleanEmail(raw);
+    if (raw && !mail) return { error: 'That does not look like an email address.' };
+    await q(`UPDATE company_users SET email = $3 WHERE company_id = $1 AND id = $2`, [id, u.id, mail]);
+    await logEvent(null, 'ADMIN_USER_EMAIL', { companyId: id, userId: u.id, name: u.name, set: !!mail });
+    return { ok: true, warning: mail
+      ? u.name + ' will be written to at ' + mail + '.'
+      : 'The address for ' + u.name + ' has been taken off.' };
 
   } else if (action === 'userrole') {
     /* 4.39.0 — what a person IS on their company. An administrator adds
@@ -364,7 +388,7 @@ export async function companyAction(body) {
     /* 4.8.0 — the owner creates (or resets the PIN of) the company's
        administrator. Everything else about users happens inside the
        application, by that administrator. */
-    const out = await ensureAdmin(id, { name: body.name, pin: body.pin });
+    const out = await ensureAdmin(id, { name: body.name, pin: body.pin, email: body.email });
     if (out.error) return { error: out.error };
     return { ok: true, user: out.user, warning: out.reset
       ? 'The PIN for ' + out.user.name + ' was reset and they are the administrator.'
@@ -450,20 +474,11 @@ export async function licenceAction(body) {
     await q(`UPDATE licences SET state = 'REVOKED' WHERE device_id = $1`, [deviceId]);
     await logEvent(deviceId, 'ADMIN_REVOKE', {});
   } else if (action === 'restore') {
-    /* Restoring puts a machine back on a seat, so the seat count has to be
-       checked here too — otherwise revoke-then-restore is a way past it. */
+    /* 4.42.0 — no seat check: a machine takes no seat, so bringing one
+       back cannot take one. What it may DO is decided when a person signs
+       in on it, and the people are counted where they are created. */
     const rows = await q(`SELECT company_id FROM licences WHERE device_id = $1`, [deviceId]);
     const companyId = rows.length ? rows[0].company_id : null;
-    if (companyId) {
-      const co = (await q(`SELECT name, seats FROM companies WHERE id = $1`, [companyId]))[0];
-      const used = (await q(
-        `SELECT COUNT(*)::int AS n FROM licences WHERE company_id = $1 AND state <> 'REVOKED'`,
-        [companyId]))[0];
-      if (co && Number(used.n) >= Number(co.seats)) {
-        return { error: 'All ' + co.seats + ' seats for ' + co.name +
-          ' are in use. Revoke another machine first, or give the company more seats.' };
-      }
-    }
     await q(`UPDATE licences SET state = 'TRIAL' WHERE device_id = $1`, [deviceId]);
     await logEvent(deviceId, 'ADMIN_RESTORE', { companyId });
   } else if (action === 'delete') {
@@ -732,6 +747,50 @@ th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;le
       </div>
     </div>
 
+    <!-- 4.42.0 — THE ENQUIRIES.
+
+         Everybody who has asked about the software and not yet bought it.
+         The website's contact and demo forms post straight in; the ones
+         that arrive by phone are typed in here. The phone console shows
+         exactly this table from exactly this service, so the two are never
+         out of step with each other. -->
+    <div class="card">
+      <div class="top" style="margin-bottom:6px">
+        <h2 class="grow">Enquiries <span class="sub" style="font-weight:400" id="qsub"></span></h2>
+        <input id="qq" placeholder="Find a name, plant, number, product…" oninput="renderInquiries()" style="min-width:240px">
+        <button class="primary" data-target="newq" onclick="toggle(this)">New enquiry</button>
+      </div>
+      <div id="qstates" class="acts" style="margin:8px 0"></div>
+      <div id="newq" style="display:none;border:1px solid var(--border);border-radius:10px;padding:12px;margin:8px 0 12px">
+        <input type="hidden" id="qId" value="">
+        <div class="row">
+          <label>Name<input id="qName" placeholder="Who asked" style="min-width:180px"></label>
+          <label>Company / plant<input id="qCompany" placeholder="Their plant" style="min-width:200px"></label>
+          <label>Mobile<input id="qPhone" placeholder="WhatsApp / mobile" style="min-width:150px"></label>
+          <label>Email<input id="qEmail" placeholder="address" style="min-width:180px"></label>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <label>Which software<select id="qProduct" style="min-width:230px"></select></label>
+          <label>How it came<select id="qSource" style="min-width:150px"></select></label>
+          <label>Where it has got to<select id="qState" style="min-width:150px"></select></label>
+          <label>Follow up on<input id="qFollow" type="date" style="min-width:150px"></label>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <label style="flex:1">What they asked<input id="qMessage" placeholder="Constructions, volume, what they want" style="width:100%"></label>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <label style="flex:1">Your note<input id="qNotes" placeholder="What you told them, what to do next" style="width:100%"></label>
+          <button class="primary" onclick="saveInquiry()">Save enquiry</button>
+          <button onclick="clearInquiryForm()">Clear</button>
+        </div>
+        <p class="help">For the ones that come by phone, on WhatsApp or at an exhibition. The website&rsquo;s own form fills this table by itself.</p>
+      </div>
+      <div id="qMsg"></div>
+      <div style="overflow-x:auto"><table id="qtbl">
+        <thead><tr><th>Who</th><th>Software</th><th>State</th><th>Came</th><th>Reach them</th><th>Asked</th><th>Follow up</th><th></th></tr></thead><tbody></tbody></table></div>
+      <p class="help">An enquiry is not a customer. When one becomes a customer, create the company in the ordinary way above; the enquiry stays here as the record of where they came from.</p>
+    </div>
+
     <div class="card">
       <div class="top" style="margin-bottom:6px">
         <h2 class="grow">Installations <span class="sub" style="font-weight:400" id="instsub"></span></h2>
@@ -796,6 +855,9 @@ async function load(){
     document.getElementById('sDemo').checked=!!s.demoSignup;
     renderCompanies();
     render();
+    /* 4.42.0 — the leads come with everything else, and never hold up the
+       rest of the page if the service has not been deployed with them. */
+    loadInquiries();
   }catch(e){
     KEY='';
     document.getElementById('gateErr').innerHTML='<div class="msg err">'+esc(e.message)+'</div>';
@@ -808,11 +870,22 @@ function gstPill(c){
   return '<span class="pill s-'+(s==='VERIFIED'?'LICENSED':s)+'" title="'+title+'">'+
     (s==='VERIFIED'?'GST verified':s==='FAILED'?'GST failed':'GST not yet verified')+'</span>';
 }
+/* 4.42.0 — a company with no people cannot USE the software at all.
+
+     "without user sign in app should not work ... means to run software
+      both login is required, apply this rule in console also"
+
+   The company login joins a computer; a person's sign-in is what lets
+   anything be written. So a company with nobody on it is not merely
+   untidy \u2014 every seat it has is read-only, and the plant will ring to
+   ask why the software does nothing. The console says that here, in the
+   words somebody answering the telephone needs. */
 function usersCell(c){
   const n=+c.users_count||0;
   const max=+c.seats||1;   /* one seat = one person */
   const total=+c.users_total||n;
-  if(!n&&!total)return '<b style="color:var(--warn)">none yet</b><small> — set an administrator under People · one per seat</small>';
+  if(!n&&!total)return '<b style="color:var(--bad)">nobody \u2014 every seat is read-only</b>'+
+    '<small> \u2014 set an administrator under People; nothing can be saved until somebody signs in</small>';
   return '<b>'+total+' of '+max+'</b>'+(total>n?'<small> ('+n+' active)</small>':'')+(total>=max?'<small style="color:var(--warn)"> · full</small>':'')+(c.admin_names?'<small> · admin '+esc(c.admin_names)+'</small>':'<small style="color:var(--bad)"> · no administrator</small>');
 }
 function txnCell(used,limit){
@@ -850,7 +923,16 @@ function renderCompanies(){
         '<div><button'+(open?' class="primary"':'')+' data-id="'+c.id+'" onclick="manage(this)">'+(open?'Close':'Manage')+'</button></div>'+
       '</div>'+
       '<div class="co-facts">'+
-        '<div class="fact"><span>Seats</span><b>'+used+' of '+seats+'</b><span class="bar'+(used>=seats?' full':'')+'"><i style="width:'+pct+'%"></i></span></div>'+
+        /* 4.42.0 — A SEAT IS A PERSON, and a plant asking for another one
+           wants to know how many are LEFT, which 'seat 3 of 5' never said.
+           Machines are counted underneath, and are not rationed: since a
+           computer with nobody signed in can only read, charging for it
+           would be charging for a locked door. */
+        '<div class="fact"><span>Seats (people)</span><b>'+used+' of '+seats+'</b>'+
+          '<small>'+(seats-used>0?(seats-used)+' available':'none available')+'</small>'+
+          '<span class="bar'+(used>=seats?' full':'')+'"><i style="width:'+pct+'%"></i></span></div>'+
+        '<div class="fact"><span>Computers</span><b>'+(c.machines_used||0)+'</b>'+
+          '<small>not counted against seats</small></div>'+
         '<div class="fact"><span>'+(state==='EXPIRED'?'Ended':state==='SUSPENDED'?'Suspended · ends':'Days left')+'</span><b>'+(state==='EXPIRED'||state==='SUSPENDED'?fmt(c.expires_at):(c.days_left===0?'today':c.days_left))+'</b>'+(state==='EXPIRED'||state==='SUSPENDED'?'':'<small>'+fmt(c.expires_at)+'</small>')+'</div>'+
         '<div class="fact"><span>Offline allowed</span><b>'+(c.grace_days>0?c.grace_days+' days':'none')+'</b>'+(c.grace_days>0?'':'<small>stops when it cannot reach the service</small>')+'</div>'+
         '<div class="fact"><span>Transactions</span>'+txnCell(c.txn_used,c.txn_limit)+'</div>'+
@@ -959,10 +1041,14 @@ function userRow(cid,u){
     '<td><b>'+esc(u.name)+'</b>'+(u.active?'':' <span class="why">switched off</span>')+'</td>'+
     '<td>'+(u.role==='ADMIN'?'<b>administrator</b>':'user')+'</td>'+
     '<td>'+(u.scope==='ALL'?'sees everyone&rsquo;s work':'sees own work')+'</td>'+
+    /* 4.42.0 — their own address. A person without one is not broken; they
+       simply do not receive the circulars, and it says so plainly. */
+    '<td>'+(u.email?'<code>'+esc(u.email)+'</code>':'<span class="why">no address</span>')+'</td>'+
     '<td class="why">'+esc(when)+'</td>'+
     '<td>'+
       '<button class="small" data-cid="'+cid+'" data-uid="'+u.id+'" data-name="'+esc(u.name)+'" data-role="'+(u.role==='ADMIN'?'USER':'ADMIN')+'" onclick="uRole(this)">'+
         (u.role==='ADMIN'?'Make ordinary user':'Make administrator')+'</button> '+
+      '<button class="small" data-cid="'+cid+'" data-uid="'+u.id+'" data-name="'+esc(u.name)+'" data-email="'+esc(u.email||'')+'" onclick="uEmail(this)">Email…</button> '+
       '<button class="small" data-cid="'+cid+'" data-uid="'+u.id+'" data-name="'+esc(u.name)+'" onclick="uPin(this)">Set PIN…</button> '+
       '<button class="small" data-cid="'+cid+'" data-uid="'+u.id+'" data-name="'+esc(u.name)+'" onclick="uDel(this)">Remove…</button>'+
     '</td></tr>';
@@ -976,11 +1062,15 @@ async function coUsers(btn){
   if(r.error){host.innerHTML='<div class="msg err">'+esc(r.error)+'</div>';return;}
   const cap=r.cap||{max:0,count:0};
   host.innerHTML=
-    '<p class="help"><b>'+cap.count+' of '+cap.max+' seat(s) taken.</b> '+
+    '<p class="help"><b>'+cap.count+' of '+cap.max+' seat(s) taken'+
+      (cap.max-cap.count>0?', '+(cap.max-cap.count)+' available':'; none available')+'.</b> '+
+      (cap.count===0?'<b style="color:var(--bad)">Nobody can do any work on this company yet:</b> '+
+        'the company login joins a computer, but nothing can be created or saved until a PERSON signs in. '+
+        'Set an administrator first. ':'')+
       'A PIN cannot be shown here or anywhere else \u2014 it is stored scrambled, which is what stops anyone who gets the database from signing in as your customers. '+
       'When somebody forgets theirs, set a new one and tell them.</p>'+
     (r.users&&r.users.length
-      ? '<table class="users"><thead><tr><th>Name</th><th>Role</th><th>Sees</th><th>Last signed in</th><th></th></tr></thead><tbody>'+
+      ? '<table class="users"><thead><tr><th>Name</th><th>Role</th><th>Sees</th><th>Email</th><th>Last signed in</th><th></th></tr></thead><tbody>'+
         r.users.map(u=>userRow(cid,u)).join('')+'</tbody></table>'
       : '<p class="help">Nobody has been added to this company yet.</p>')+
     '<button data-id="'+cid+'" onclick="uAdd(this)">Add a person…</button>';
@@ -991,8 +1081,12 @@ async function uAdd(btn){
   if(name===null||!name.trim())return;
   const pin=prompt('PIN for '+name.trim()+' (at least 4 characters). Tell it to them directly; it is not shown again.');
   if(pin===null)return;
+  /* 4.42.0 — their own address, asked for once while we are already asking.
+     Blank is fine; it only means they will not get the circulars. */
+  const email=prompt('Email for '+name.trim()+' (optional).\\n\\nThis is where notices about new versions are sent. Leave it blank if they have none.','');
+  if(email===null)return;
   const admin=confirm('Make '+name.trim()+' an ADMINISTRATOR?\\n\\nOK = administrator (can add and remove people from inside the application).\\nCancel = ordinary user.');
-  const r=await api('/admin/api/company',{method:'POST',body:JSON.stringify({id:cid,action:'useradd',name:name.trim(),pin,role:admin?'ADMIN':'USER'})});
+  const r=await api('/admin/api/company',{method:'POST',body:JSON.stringify({id:cid,action:'useradd',name:name.trim(),pin,email:email.trim(),role:admin?'ADMIN':'USER'})});
   if(r.error){say('<div class="msg err">'+esc(r.error)+'</div>');return;}
   say('<div class="msg ok">'+esc(r.warning||'Added.')+'</div>');
   document.getElementById('users-'+cid).innerHTML='';
@@ -1011,6 +1105,21 @@ async function uRole(btn){
   say('<div class="msg ok">'+esc(r.warning||'Done.')+'</div>');
   document.getElementById('users-'+cid).innerHTML='';
   await coUsers({dataset:{id:cid}});
+}
+/* 4.42.0 — a person's own address, set or taken off. This is what makes
+   "tell every customer about the new version" reach the people who use the
+   software rather than one inbox per plant. */
+async function uEmail(btn){
+  const cid=+btn.dataset.cid;
+  const now=btn.dataset.email||'';
+  const email=prompt('Email for '+btn.dataset.name+'.\\n\\nNotices about new versions are sent here. Leave it blank to take the address off.',now);
+  if(email===null)return;
+  const r=await api('/admin/api/company',{method:'POST',body:JSON.stringify({id:cid,action:'useremail',userId:+btn.dataset.uid,email:email.trim()})});
+  if(r.error){say('<div class="msg err">'+esc(r.error)+'</div>');return;}
+  say('<div class="msg ok">'+esc(r.warning||'Done.')+'</div>');
+  document.getElementById('users-'+cid).innerHTML='';
+  await coUsers({dataset:{id:cid}});
+  await load();
 }
 async function uPin(btn){
   const cid=+btn.dataset.cid;
@@ -1047,7 +1156,9 @@ async function coAdmin(btn){
   if(who===null||!who.trim())return;
   const pin=prompt('PIN for '+who.trim()+' (at least 4 characters). Tell it to them directly; it is not shown again.');
   if(pin===null)return;
-  const r=await api('/admin/api/company',{method:'POST',body:JSON.stringify({id:+btn.dataset.id,action:'adminuser',name:who.trim(),pin})});
+  const email=prompt('Email for '+who.trim()+' (optional).\\n\\nWhere notices about new versions are sent. Blank leaves any address they already have alone.','');
+  if(email===null)return;
+  const r=await api('/admin/api/company',{method:'POST',body:JSON.stringify({id:+btn.dataset.id,action:'adminuser',name:who.trim(),pin,email:email.trim()})});
   if(r.error){say('<div class="msg err">'+esc(r.error)+'</div>');return;}
   say('<div class="msg ok">'+esc(r.warning||'Done.')+'</div>');
   await load();
@@ -1091,6 +1202,146 @@ async function createCo(){
   await load();
   say('<div class="msg ok"><b>'+esc(r.company.name)+'</b> created. Licence key <span class="key">'+esc(r.company.licence_key)+'</span> — give this to the customer; every machine types it at activation.</div>');
 }
+/* ---------- enquiries (4.42.0) ----------------------------------------
+   The same rows the phone console shows, from the same service. Nothing
+   is cached here and nothing is merged: both read /admin/api/inquiries,
+   so "in step" is not a thing that has to be arranged. */
+let QDATA={inquiries:[],products:[],states:[],sources:[]}, QSTATE=null;
+
+function qsay(html){
+  const n=document.getElementById('qMsg');
+  if(!n)return;
+  n.innerHTML=html;
+  if(html)setTimeout(()=>{if(n.innerHTML===html)qsay('')},6000);
+}
+async function loadInquiries(){
+  try{
+    QDATA=await api('/admin/api/inquiries');
+  }catch(e){
+    /* A service that has not been deployed with enquiries yet. The rest of
+       the console is perfectly usable, so this says so once and stops. */
+    QDATA={inquiries:[],products:[],states:[],sources:[]};
+    document.querySelector('#qtbl tbody').innerHTML=
+      '<tr><td colspan="8" class="help">This service does not have enquiries yet — deploy the API to switch them on.</td></tr>';
+    return;
+  }
+  fillSelect('qProduct',QDATA.products);
+  fillSelect('qSource',QDATA.sources);
+  fillSelect('qState',QDATA.states);
+  renderInquiries();
+}
+function fillSelect(id,list){
+  const s=document.getElementById(id);
+  if(!s||!list||!list.length)return;
+  const keep=s.value;
+  /* A code like WEBSITE or QUOTED reads better in lower case; a product
+     name like "AMC & Support" is written the way it is written. All-capitals
+     is the difference, and it is exactly the difference we mean. */
+  s.innerHTML=list.map(v=>'<option value="'+esc(v)+'">'+esc(v===v.toUpperCase()?v.toLowerCase():v)+'</option>').join('');
+  if(keep&&list.indexOf(keep)>=0)s.value=keep;
+}
+function qPill(state){
+  const map={NEW:'TRIAL',CONTACTED:'SELF',DEMO:'EXPIRED',QUOTED:'EXPIRED',WON:'LICENSED',LOST:'REVOKED'};
+  return map[state]||'SELF';
+}
+function renderInquiries(){
+  const term=(document.getElementById('qq').value||'').toLowerCase();
+  const all=QDATA.inquiries||[];
+  const rows=all.filter(q=>(!QSTATE||q.state===QSTATE)&&(!term||
+    [q.name,q.company,q.phone,q.email,q.product,q.message,q.notes].some(v=>String(v||'').toLowerCase().includes(term))));
+  document.getElementById('qsub').textContent='— '+rows.length+' of '+all.length;
+
+  /* The states, as filters that also count. */
+  document.getElementById('qstates').innerHTML=
+    '<button class="small'+(QSTATE?'':' primary')+'" onclick="qFilter(null)">All '+all.length+'</button>'+
+    (QDATA.states||[]).map(s=>{
+      const n=all.filter(q=>q.state===s).length;
+      return '<button class="small'+(QSTATE===s?' primary':'')+'" data-state="'+s+'" onclick="qFilter(this.dataset.state)">'+s.toLowerCase()+' '+n+'</button>';
+    }).join('');
+
+  const today=new Date().toISOString().slice(0,10);
+  document.querySelector('#qtbl tbody').innerHTML=rows.map(q=>{
+    const due=q.followUp&&String(q.followUp).slice(0,10)<=today&&q.state!=='WON'&&q.state!=='LOST';
+    const reach=[];
+    if(q.phone)reach.push('<a href="tel:'+esc(q.phone)+'"><code>'+esc(q.phone)+'</code></a>');
+    if(q.email)reach.push('<a href="mailto:'+esc(q.email)+'"><code>'+esc(q.email)+'</code></a>');
+    return '<tr>'+
+      '<td><b>'+esc(q.name)+'</b>'+(q.company?'<br><span class="why">'+esc(q.company)+'</span>':'')+'</td>'+
+      '<td>'+esc(q.product||'—')+'</td>'+
+      '<td><span class="pill s-'+qPill(q.state)+'">'+esc(String(q.state).toLowerCase())+'</span></td>'+
+      '<td class="why">'+esc(String(q.source||'').toLowerCase())+'<br>'+fmt(q.createdAt)+'</td>'+
+      '<td>'+(reach.join('<br>')||'<span class="why">nothing given</span>')+'</td>'+
+      '<td class="why" style="max-width:260px">'+esc(q.message||'')+(q.notes?'<br><b>note:</b> '+esc(q.notes):'')+'</td>'+
+      '<td'+(due?' style="color:var(--warn);font-weight:700"':' class="why"')+'>'+(q.followUp?esc(String(q.followUp).slice(0,10)):'—')+'</td>'+
+      '<td><div class="acts">'+
+        (QDATA.states||[]).filter(s=>s!==q.state).map(s=>
+          '<button class="small'+(s==='WON'?' primary':'')+'" data-id="'+q.id+'" data-state="'+s+'" onclick="qState(this)">→ '+s.toLowerCase()+'</button>').join('')+
+        '<button class="small" data-id="'+q.id+'" onclick="qEdit(this)">Edit</button>'+
+        '<button class="small danger" data-id="'+q.id+'" data-name="'+esc(q.name)+'" onclick="qDelete(this)">Remove</button>'+
+      '</div></td></tr>';
+  }).join('')||'<tr><td colspan="8" class="help">Nothing here yet. The website&rsquo;s form fills this on its own; add the ones that come by phone with New enquiry.</td></tr>';
+}
+function qFilter(state){QSTATE=state||null;renderInquiries();}
+function clearInquiryForm(){
+  ['qId','qName','qCompany','qPhone','qEmail','qMessage','qNotes','qFollow'].forEach(id=>{
+    const n=document.getElementById(id);if(n)n.value='';
+  });
+}
+function qEdit(btn){
+  const q=(QDATA.inquiries||[]).find(x=>x.id===+btn.dataset.id);
+  if(!q)return;
+  document.getElementById('newq').style.display='';
+  document.getElementById('qId').value=q.id;
+  document.getElementById('qName').value=q.name||'';
+  document.getElementById('qCompany').value=q.company||'';
+  document.getElementById('qPhone').value=q.phone||'';
+  document.getElementById('qEmail').value=q.email||'';
+  document.getElementById('qMessage').value=q.message||'';
+  document.getElementById('qNotes').value=q.notes||'';
+  document.getElementById('qFollow').value=q.followUp?String(q.followUp).slice(0,10):'';
+  if(q.product)document.getElementById('qProduct').value=q.product;
+  if(q.source)document.getElementById('qSource').value=q.source;
+  if(q.state)document.getElementById('qState').value=q.state;
+  document.getElementById('newq').scrollIntoView({behavior:'smooth',block:'nearest'});
+}
+async function saveInquiry(){
+  const id=+document.getElementById('qId').value||0;
+  const name=document.getElementById('qName').value.trim();
+  if(!name){qsay('<div class="msg err">A name is required.</div>');return;}
+  const body={
+    action:id?'update':'create',
+    name,
+    company:document.getElementById('qCompany').value.trim(),
+    phone:document.getElementById('qPhone').value.trim(),
+    email:document.getElementById('qEmail').value.trim(),
+    product:document.getElementById('qProduct').value,
+    source:document.getElementById('qSource').value,
+    state:document.getElementById('qState').value,
+    message:document.getElementById('qMessage').value.trim(),
+    notes:document.getElementById('qNotes').value.trim(),
+    followUp:document.getElementById('qFollow').value||''
+  };
+  if(id)body.id=id;
+  const r=await api('/admin/api/inquiry',{method:'POST',body:JSON.stringify(body)});
+  if(r.error){qsay('<div class="msg err">'+esc(r.error)+'</div>');return;}
+  clearInquiryForm();
+  document.getElementById('newq').style.display='none';
+  qsay('<div class="msg ok">'+(id?'Saved.':'Enquiry added.')+'</div>');
+  await loadInquiries();
+}
+async function qState(btn){
+  const r=await api('/admin/api/inquiry',{method:'POST',body:JSON.stringify({action:'state',id:+btn.dataset.id,state:btn.dataset.state})});
+  if(r.error){qsay('<div class="msg err">'+esc(r.error)+'</div>');return;}
+  await loadInquiries();
+}
+async function qDelete(btn){
+  if(!confirm('Remove '+btn.dataset.name+' from the enquiries?\\n\\nThe row is deleted. If they became a customer, their company is not touched.'))return;
+  const r=await api('/admin/api/inquiry',{method:'POST',body:JSON.stringify({action:'delete',id:+btn.dataset.id})});
+  if(r.error){qsay('<div class="msg err">'+esc(r.error)+'</div>');return;}
+  qsay('<div class="msg ok">Removed.</div>');
+  await loadInquiries();
+}
+
 /* ---------- installations ---------- */
 function showInstallations(btn){COFILTER=+btn.dataset.id;render();document.getElementById('tbl').scrollIntoView({behavior:'smooth',block:'start'});}
 function clearCompanyFilter(){COFILTER=null;render();}
@@ -1112,7 +1363,7 @@ function render(){
     let state=(l.state==='TRIAL'&&l.expired)?'EXPIRED':l.state;
     if(l.co_state==='SUSPENDED'&&state!=='REVOKED')state='SUSPENDED';
     return '<tr>'+
-      '<td><b>'+esc(l.co_name||l.company||'—')+'</b>'+(l.seat_no?' <code>seat '+l.seat_no+' of '+(l.co_seats||1)+'</code>':'')+
+      '<td><b>'+esc(l.co_name||l.company||'—')+'</b>'+(l.seat_no?' <code>computer '+l.seat_no+'</code>':'')+
         '<br><code>'+esc(String(l.device_id).slice(0,12))+'…</code>'+(l.device_name?' <code>'+esc(l.device_name)+'</code>':'')+'</td>'+
       '<td><span class="pill s-'+state+'">'+state.toLowerCase()+'</span></td>'+
       '<td>'+esc(l.email||'—')+'</td>'+

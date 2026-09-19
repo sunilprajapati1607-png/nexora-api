@@ -212,6 +212,60 @@ export function ensureSchema() {
     await q(`CREATE INDEX IF NOT EXISTS sync_records_company_seq_idx ON sync_records (company_id, seq)`);
     await q(`CREATE INDEX IF NOT EXISTS sync_records_calcnumber_idx ON sync_records (company_id, (body->>'calcNumber')) WHERE kind = 'calc'`);
 
+    /* 4.42.0 — ENQUIRIES.
+
+         "enquiry i will add by self for now … jodi do website sathe …
+          pan menually pn thai sake"
+
+       Somebody who has not bought anything yet. The website's contact and
+       demo forms post here, and the owner adds the ones that arrive by
+       phone or in person by hand, so every lead sits in ONE place instead
+       of in an inbox, a WhatsApp thread and somebody's memory.
+
+       `product` is which software they asked about — the same list the
+       website's "I am interested in" select offers. `state` is how far the
+       lead has got; it is a plain string rather than an enum so a new step
+       can be added without a migration.
+
+       Nothing here is a customer yet. When a lead becomes one, a company is
+       created in the ordinary way and `company_id` links the two, which is
+       what makes "how many enquiries turned into customers" answerable. */
+    await q(`
+      CREATE TABLE IF NOT EXISTS inquiries (
+        id          BIGSERIAL PRIMARY KEY,
+        name        TEXT NOT NULL,
+        company     TEXT,
+        phone       TEXT,
+        email       TEXT,
+        product     TEXT,
+        message     TEXT,
+        state       TEXT NOT NULL DEFAULT 'NEW',
+        source      TEXT NOT NULL DEFAULT 'MANUAL',
+        source_page TEXT,
+        channel     TEXT,
+        notes       TEXT,
+        follow_up   DATE,
+        company_id  BIGINT,
+        remote_ip   TEXT,
+        created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+      )`);
+    await q(`CREATE INDEX IF NOT EXISTS inquiries_created_idx ON inquiries (created_at DESC)`);
+    await q(`CREATE INDEX IF NOT EXISTS inquiries_state_idx ON inquiries (state)`);
+
+    /* 4.42.0 — a person's own address.
+
+       Until now the only email the service held was the company's, so a
+       notice about a new version reached one inbox per plant and stopped
+       there. A person may now carry their own, which is what makes it
+       possible to write to everybody who actually uses the software.
+
+       Optional on purpose: a plant that adds five operators with no email
+       is not broken, and nobody is forced to invent addresses to satisfy a
+       form. NOT unique either — a small plant where three people share one
+       address is a real plant, not a mistake to be refused. */
+    await q(`ALTER TABLE company_users ADD COLUMN IF NOT EXISTS email TEXT`);
+
     /* Defaults, written once. ON CONFLICT DO NOTHING means an operator's
        later change is never overwritten by a cold start. */
     await q(`INSERT INTO settings (key, value) VALUES

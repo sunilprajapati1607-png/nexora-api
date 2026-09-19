@@ -29,6 +29,7 @@
  * the body — exactly as the costing route has always been scoped.
  */
 import { scryptSync, randomBytes, timingSafeEqual } from 'node:crypto';
+import { hashPasscode, validPasscode, PASSCODE_MIN } from './passcode.js';
 import { q, logEvent } from './db.js';
 
 /* ---- PINs ------------------------------------------------------------
@@ -55,11 +56,27 @@ export function nameKey(name) {
   return String(name || '').trim().replace(/\s+/g, ' ').toLowerCase();
 }
 
+/** 4.42.0 — an address, or null. Deliberately forgiving: it checks that
+ *  there is something either side of an @ and nothing more, because a
+ *  stricter rule refuses real addresses and a plant is not going to argue
+ *  with a form. An empty string is null, which is how a blank field means
+ *  "leave it alone" rather than "erase it". */
+export function cleanEmail(v) {
+  const s = String(v == null ? '' : v).trim();
+  if (!s) return null;
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s)) return null;
+  return s.slice(0, 160);
+}
+
 /** What the application is told about a person. Never the hash. */
 export function describeUser(u) {
   if (!u) return null;
   return {
     id: Number(u.id), name: u.name,
+    /* 4.42.0 — their own address, so a notice about a new version can reach
+       the people who use the software and not only the plant's one
+       registered inbox. Optional: most operators will not have one. */
+    email: u.email || null,
     role: u.role === 'ADMIN' ? 'ADMIN' : 'USER',
     scope: u.scope === 'ALL' ? 'ALL' : 'OWN',
     permissions: (u.permissions && typeof u.permissions === 'object') ? u.permissions : null,
@@ -121,27 +138,70 @@ export async function listUsers(companyId) {
 /** Create or reset the company's administrator — the owner's action from
  *  the licence console. An existing person of that name becomes the admin
  *  and gets the new PIN; nobody else is touched. */
-export async function ensureAdmin(companyId, { name, pin }) {
+export async function ensureAdmin(companyId, { name, pin, email }) {
   const key = nameKey(name);
   if (!key) return { error: 'A name is required.' };
   if (!validPin(pin)) return { error: 'A PIN of at least 4 characters is required.' };
+  /* An address left blank leaves whatever they already had alone, rather
+     than quietly erasing one because this form did not ask for it. */
+  const mail = cleanEmail(email);
   const existing = await q(`SELECT * FROM company_users WHERE company_id = $1 AND name_key = $2`, [companyId, key]);
   if (existing.length) {
-    await q(`UPDATE company_users SET pin_hash = $2, role = 'ADMIN', scope = 'ALL', active = true, name = $3
-              WHERE id = $1`, [existing[0].id, hashPin(pin), String(name).trim()]);
+    await q(`UPDATE company_users SET pin_hash = $2, role = 'ADMIN', scope = 'ALL', active = true, name = $3,
+                                      email = COALESCE($4, email)
+              WHERE id = $1`, [existing[0].id, hashPin(pin), String(name).trim(), mail]);
     await logEvent(null, 'ADMIN_COMPANY_ADMINUSER', { companyId, userId: existing[0].id, reset: true });
     return { ok: true, user: describeUser((await userById(companyId, existing[0].id))), reset: true };
   }
   const rows = await q(
-    `INSERT INTO company_users (company_id, name, name_key, pin_hash, role, scope, active)
-     VALUES ($1, $2, $3, $4, 'ADMIN', 'ALL', true) RETURNING *`,
-    [companyId, String(name).trim(), key, hashPin(pin)]);
+    `INSERT INTO company_users (company_id, name, name_key, pin_hash, role, scope, active, email)
+     VALUES ($1, $2, $3, $4, 'ADMIN', 'ALL', true, $5) RETURNING *`,
+    [companyId, String(name).trim(), key, hashPin(pin), mail]);
   await logEvent(null, 'ADMIN_COMPANY_ADMINUSER', { companyId, userId: rows[0].id, reset: false });
   return { ok: true, user: describeUser(rows[0]), reset: false };
 }
 
 /** What a signed-in person may do to the user list. An ADMIN manages
  *  everyone; anyone may change their own PIN and nothing else. */
+/* 4.42.0 — THE COMPANY PASSCODE, CHANGED FROM INSIDE THE PLANT.
+
+   The plant's administrator can set a new one without ringing Nexora.
+   Three things are true of it and all three are enforced here rather
+   than in the window, because a rule the client enforces alone is a
+   suggestion:
+
+     \u00b7 only an administrator of THAT company may do it;
+     \u00b7 only a company that registered itself has a passcode at all \u2014 a
+       company Nexora issued a key to joins with the key;
+     \u00b7 the old one is never checked, because it is never known. It is a
+       scrypt hash. Somebody already signed in AS an administrator has
+       proved who they are; asking for a secret nobody can read would
+       prove nothing further.
+
+   Written to the event log, because changing the way into a company is
+   exactly the sort of thing that should be answerable for afterwards.
+   The passcode itself is never written there. */
+export async function setCompanyPasscode(companyId, actor, body) {
+  if (!actor || actor.role !== 'ADMIN') {
+    return { httpStatus: 403, body: { error: 'ADMIN_ONLY',
+      message: 'Only an administrator can change the company passcode.' } };
+  }
+  const co = (await q('SELECT id, name, login_id, self_registered FROM companies WHERE id = $1', [companyId]))[0];
+  if (!co) return { httpStatus: 404, body: { error: 'NO_COMPANY', message: 'No such company.' } };
+  if (!co.self_registered) {
+    return { httpStatus: 409, body: { error: 'NOT_SELF_REGISTERED',
+      message: co.name + ' joins with its licence key, not with a passcode.' } };
+  }
+  const passcode = body && body.passcode != null ? String(body.passcode) : '';
+  if (!validPasscode(passcode)) {
+    return { httpStatus: 400, body: { error: 'BAD_PASSCODE',
+      message: 'A company passcode needs at least ' + PASSCODE_MIN + ' characters.' } };
+  }
+  await q('UPDATE companies SET passcode_hash = $2 WHERE id = $1', [companyId, hashPasscode(passcode)]);
+  await logEvent(null, 'COMPANY_PASSCODE_SET', { companyId, by: actor.id, name: co.name });
+  return { httpStatus: 200, body: { ok: true, loginId: co.login_id } };
+}
+
 export async function userAction(companyId, actor, body) {
   const action = String(body.action || '');
   const isAdmin = actor && actor.role === 'ADMIN';
@@ -372,7 +432,15 @@ export async function push(companyId, user, records) {
 export async function usersSummary(companyId) {
   const rows = await q(
     `SELECT COUNT(*)::int AS n,
-            COALESCE(string_agg(CASE WHEN role = 'ADMIN' THEN name END, ', ' ORDER BY name_key), '') AS admins
+            COALESCE(string_agg(CASE WHEN role = 'ADMIN' THEN name END, ', ' ORDER BY name_key), '') AS admins,
+            /* 4.42.0 — the addresses of the people who are switched on, so
+               a circular can be built from the company list alone instead
+               of asking the service once per company. */
+            COALESCE(string_agg(email, ', ' ORDER BY name_key) FILTER (WHERE email IS NOT NULL), '') AS emails
        FROM company_users WHERE company_id = $1 AND active = true`, [companyId]);
-  return { count: Number(rows[0].n) || 0, admins: rows[0].admins || '' };
+  return {
+    count: Number(rows[0].n) || 0,
+    admins: rows[0].admins || '',
+    emails: rows[0].emails || ''
+  };
 }

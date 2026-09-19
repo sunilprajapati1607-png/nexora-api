@@ -112,14 +112,31 @@ export async function companyOf(row) {
   return rows.length ? rows[0] : null;
 }
 
-async function seatsUsed(companyId) {
+/* 4.42.0 — A SEAT IS A PERSON. A COMPUTER IS NOT.
+
+     "so now company is not seat only user are seat"
+
+   Until now a seat was a MACHINE: joining a company took one, and the
+   sixth computer of a five-seat licence was refused. That made sense
+   while a machine could work on its own. It cannot any more — 4.42.0
+   made a computer with nobody signed in read-only — so counting
+   machines counts the wrong thing twice over: it charges a plant for a
+   spare terminal in the weaving shed that can do nothing, and it lets
+   five machines be shared by fifty people.
+
+   So what is counted is the company's PEOPLE, which is what the plant
+   is actually buying and what userCap() in sync.js has always enforced
+   when a name is created. Machines are now merely numbered, so that a
+   row in the console can be told from its neighbour. */
+async function peopleOn(companyId) {
   const rows = await q(
-    `SELECT COUNT(*)::int AS n FROM licences WHERE company_id = $1 AND state <> 'REVOKED'`,
-    [companyId]);
+    `SELECT COUNT(*)::int AS n FROM company_users WHERE company_id = $1`, [companyId]);
   return rows.length ? Number(rows[0].n) : 0;
 }
 
-async function nextSeat(companyId) {
+/** The next machine's number on this licence — an identifier, not a
+ *  ration. Nothing is refused for running out of these. */
+async function nextComputerNo(companyId) {
   const rows = await q(
     `SELECT COALESCE(MAX(seat_no), 0)::int AS m FROM licences WHERE company_id = $1`, [companyId]);
   return (rows.length ? Number(rows[0].m) : 0) + 1;
@@ -151,7 +168,7 @@ export async function reportUsage(deviceId, usage) {
 
 /** What this LICENCE has used, across every seat on it. */
 export async function companyUsage(companyId) {
-  if (!companyId) return { txnUsed: 0, usageMinutes: 0, seatsReporting: 0 };
+  if (!companyId) return { txnUsed: 0, usageMinutes: 0, seatsReporting: 0, people: 0 };
   try {
     /* 4.6.0 — net of any owner reset (count − base), never below zero. */
     const rows = await q(
@@ -163,10 +180,12 @@ export async function companyUsage(companyId) {
     return {
       txnUsed: Number(r.txns) || 0,
       usageMinutes: Number(r.mins) || 0,
-      seatsReporting: Number(r.reporting) || 0
+      seatsReporting: Number(r.reporting) || 0,
+      /* 4.42.0 — how many of the seats are taken, seats being people. */
+      people: await peopleOn(companyId)
     };
   } catch (e) {
-    return { txnUsed: 0, usageMinutes: 0, seatsReporting: 0 };
+    return { txnUsed: 0, usageMinutes: 0, seatsReporting: 0, people: 0 };
   }
 }
 
@@ -270,7 +289,16 @@ function applyTxnLimit(res, company, usage) {
 }
 
 export function describe(row, company, settings, usage) {
-  return applyTxnLimit(describeState(row, company, settings), company, usage);
+  const out = applyTxnLimit(describeState(row, company, settings), company, usage);
+  /* 4.42.0 — the seat figure the licence card shows is PEOPLE, and the
+     machine's own number is called what it is. seatNo is left in place
+     as well, because a 4.41.0 installation in the field still reads it
+     and would otherwise show a dash where its number used to be. */
+  if (out && out.company) {
+    out.company.seatsUsed = usage && usage.people != null ? Number(usage.people) : null;
+    out.company.computerNo = out.company.seatNo || null;
+  }
+  return out;
 }
 
 function describeState(row, company, settings) {
@@ -307,7 +335,7 @@ function describeState(row, company, settings) {
     gstin: co.gstin || '',
     key: maskKey(co.licence_key),
     seats: Number(co.seats) || 1,
-    maxUsers: Number(co.seats) || 1,   /* one seat = one person */
+    maxUsers: Number(co.seats) || 1,   /* one seat = one person (4.42.0: and only a person) */
     seatNo: Number(row.seat_no) || null,
     isDemo: co.is_demo === true,
     graceDays
@@ -426,14 +454,10 @@ export async function activate({ deviceId, deviceName, company, email, appVersio
        company and keep everything it already has. Seats are checked here
        too, or a customer with 5 seats could quietly activate 50. */
     if (keyed && Number(row2.company_id) !== Number(keyed.id)) {
-      const used = await seatsUsed(keyed.id);
-      if (used >= (Number(keyed.seats) || 1)) {
-        return { httpStatus: 409, body: { error: 'NO_SEATS_LEFT',
-          message: 'All ' + keyed.seats + ' licence' + (keyed.seats === 1 ? '' : 's') + ' for ' +
-                   keyed.name + ' are already in use. Free one in the Nexora licence console, or ask for another.',
-          seats: Number(keyed.seats) || 1, seatsUsed: used } };
-      }
-      const seat = await nextSeat(keyed.id);
+      /* 4.42.0 — no seat check here any more: the machine takes no seat.
+         What it can DO is decided when a person signs in on it, and that
+         is where the count is kept (sync.js userCap). */
+      const seat = await nextComputerNo(keyed.id);
       await q(`UPDATE licences SET company_id = $2, seat_no = $3, state = 'TRIAL' WHERE device_id = $1`,
         [deviceId, keyed.id, seat]);
       await logEvent(deviceId, 'JOIN_COMPANY', { companyId: keyed.id, seat, from: row2.company_id || null });
@@ -457,14 +481,8 @@ export async function activate({ deviceId, deviceName, company, email, appVersio
   let seat = 1;
 
   if (co) {
-    const used = await seatsUsed(co.id);
-    if (used >= (Number(co.seats) || 1)) {
-      return { httpStatus: 409, body: { error: 'NO_SEATS_LEFT',
-        message: 'All ' + co.seats + ' licence' + (co.seats === 1 ? '' : 's') + ' for ' + co.name +
-                 ' are already in use. Free one in the Nexora licence console, or ask for another.',
-        seats: Number(co.seats) || 1, seatsUsed: used } };
-    }
-    seat = await nextSeat(co.id);
+    /* 4.42.0 — a new machine on a known licence is simply numbered. */
+    seat = await nextComputerNo(co.id);
   } else {
     /* 4.23.1 — NO KEY AND NO COMPANY ID.
        Until 4.23.0 this created a company out of whatever name was typed:
