@@ -570,14 +570,30 @@ export async function authorise(request) {
      the token still says. A user row that no longer matches the seat's
      company is treated as signed out. */
   let user = null;
+  /* 4.43.0 — and only if they are signed in HERE. One person, one place:
+     signing in on another machine moves the binding, and this one finds
+     out on its very next call rather than going on working as somebody
+     who has walked away. Not a refusal of the whole request — the licence
+     is still this machine's, and it must be told plainly what happened
+     rather than being handed a 401 it would read as "activate again". */
+  let superseded = null;
   if (body.u && row.company_id) {
     const urows = await q(`SELECT * FROM company_users WHERE id = $1 AND company_id = $2`, [body.u, row.company_id]);
-    if (urows.length && urows[0].active !== false) user = urows[0];
+    if (urows.length && urows[0].active !== false) {
+      const u = urows[0];
+      if (u.session_device && u.session_device !== row.device_id) {
+        const on = (await q(`SELECT device_name FROM licences WHERE device_id = $1`, [u.session_device]))[0];
+        superseded = { name: u.name, at: u.session_at || null,
+          where: (on && on.device_name) || 'another computer' };
+      } else {
+        user = u;
+      }
+    }
   }
 
   const lic = describe(row, co, settings, usage);
   return {
-    ok: true, row, company: co, licence: lic, settings, usage, user,
+    ok: true, row, company: co, licence: lic, settings, usage, user, superseded,
     /* Every data route must filter on this and nothing else. It comes
        from the database, so a client cannot ask for another company's
        rows by editing anything it holds. */

@@ -81,6 +81,10 @@ export function describeUser(u) {
     scope: u.scope === 'ALL' ? 'ALL' : 'OWN',
     permissions: (u.permissions && typeof u.permissions === 'object') ? u.permissions : null,
     active: u.active !== false,
+    /* 4.43.0 — WHERE they are signed in, which is the first question asked
+       when somebody rings to say they were signed out. */
+    sessionDevice: u.session_device || null,
+    sessionAt: u.session_at || null,
     lastLoginAt: u.last_login_at || null,
     createdAt: u.created_at || null
   };
@@ -93,7 +97,7 @@ export async function userById(companyId, id) {
 }
 
 /* ---- sign in ---------------------------------------------------------- */
-export async function login(companyId, { name, pin }) {
+export async function login(companyId, { name, pin }, deviceId) {
   if (!companyId) {
     return { httpStatus: 403, body: { error: 'NO_COMPANY',
       message: 'This installation is not on a company licence yet. Activate it with your licence key first.' } };
@@ -114,9 +118,26 @@ export async function login(companyId, { name, pin }) {
   if (u.active === false) {
     return { httpStatus: 403, body: { error: 'USER_INACTIVE', message: 'This user has been switched off by your Nexora administrator.' } };
   }
-  await q(`UPDATE company_users SET last_login_at = now() WHERE id = $1`, [u.id]);
-  await logEvent(null, 'LOGIN', { companyId, userId: u.id });
-  return { httpStatus: 200, body: { user: describeUser(u) } };
+  /* 4.43.0 — this machine becomes the one place this person is signed in.
+     Whatever machine they were on before keeps working until its next
+     heartbeat, which is when it learns it has been moved and signs itself
+     out. Refusing the new sign-in instead would lock a person out of the
+     machine in front of them because of one they walked away from. */
+  const displaced = u.session_device && deviceId && u.session_device !== deviceId ? u.session_device : null;
+  await q(`UPDATE company_users SET last_login_at = now(), session_device = $2, session_at = now() WHERE id = $1`,
+    [u.id, deviceId || null]);
+  await logEvent(null, 'LOGIN', { companyId, userId: u.id, deviceId: deviceId || null, displaced });
+  return { httpStatus: 200, body: { user: describeUser(u), displaced: displaced ? true : false } };
+}
+
+/** 4.43.0 — signing out gives the person back. Bound to THIS machine
+ *  only: a person who has already signed in elsewhere must not have that
+ *  new session cleared by the machine they left catching up with a
+ *  logout it owed. */
+export async function releaseSession(userId, deviceId) {
+  if (!userId || !deviceId) return;
+  await q(`UPDATE company_users SET session_device = NULL, session_at = NULL
+            WHERE id = $1 AND session_device = $2`, [userId, deviceId]);
 }
 
 /* ---- users ------------------------------------------------------------- */

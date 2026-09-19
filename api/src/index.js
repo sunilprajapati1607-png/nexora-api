@@ -16,7 +16,7 @@ import { ensureSchema } from './db.js';
 import { activate, authorise, touch, issueToken, reportUsage, companyUsage, describe } from './licence.js';
 import { runBom } from './engine.js';
 import { adminAuthorised, listLicences, licenceAction, companyAction, saveSettings, recentEvents, ADMIN_HTML } from './admin.js';
-import { login, listUsers, userAction, pull, push, describeUser, userCap, setCompanyPasscode } from './sync.js';
+import { login, listUsers, userAction, pull, push, describeUser, userCap, setCompanyPasscode, releaseSession } from './sync.js';
 import { ensureInkSchema, getModel, listModels, train as inkTrain, estimate as inkEstimate, reset as inkReset } from './inkstore.js';
 import { register, gstAction, remoteIp } from './register.js';
 import { listInquiries, inquiryAction, publicInquiry } from './inquiry.js';
@@ -99,13 +99,18 @@ export default {
            answer carries their current role and scope so an admin's change
            reaches the seat at the next heartbeat. */
         const uid = a.user ? a.user.id : null;
+        /* 4.43.0 — if this person signed in somewhere else, the machine is
+           told here, in words it can show, and signs itself out. The token
+           is re-issued WITHOUT them, so nothing further is done in their
+           name even if the client ignores the notice. */
+        const ended = a.superseded ? { sessionEnded: a.superseded } : null;
         if (body.usage) {
           await reportUsage(a.row.device_id, body.usage);
           const fresh = await companyUsage(a.row.company_id || null);
           const lic = describe(a.row, a.company, a.settings, fresh);
-          return json({ token: issueToken(a.row, uid), licence: lic, usage: fresh, user: describeUser(a.user) });
+          return json({ token: issueToken(a.row, uid), licence: lic, usage: fresh, user: describeUser(a.user), ...ended });
         }
-        return json({ token: issueToken(a.row, uid), licence: a.licence, usage: a.usage, user: describeUser(a.user) });
+        return json({ token: issueToken(a.row, uid), licence: a.licence, usage: a.usage, user: describeUser(a.user), ...ended });
       }
 
       /* ---- 4.8.0 — people and company-wide sync ---------------------- */
@@ -114,7 +119,7 @@ export default {
         const a = await authorise(request);
         if (!a.ok) return json(a.error, a.httpStatus);
         const body = await readJson(request);
-        const out = await login(a.companyId, body);
+        const out = await login(a.companyId, body, a.row.device_id);
         if (out.httpStatus !== 200) return json(out.body, out.httpStatus);
         return json({ token: issueToken(a.row, out.body.user.id), user: out.body.user, licence: a.licence,
           company: a.company ? { id: a.company.id, name: a.company.name } : null });
@@ -123,6 +128,13 @@ export default {
         await ensureSchema();
         const a = await authorise(request);
         if (!a.ok) return json(a.error, a.httpStatus);
+        /* 4.43.0 — signing out here releases the person, so their next
+           sign-in anywhere displaces nobody. Only if they are still bound
+           to THIS machine: a person who has already moved on must not have
+           their new session cleared by the old machine catching up. */
+        if (a.user) {
+          await releaseSession(a.user.id, a.row.device_id);
+        }
         return json({ token: issueToken(a.row, null), licence: a.licence });
       }
       if (path === '/v1/users' && (method === 'GET' || method === 'POST')) {

@@ -42,9 +42,16 @@ export async function listLicences() {
            COALESCE(c.expires_at, l.expires_at) AS expires_at,
            GREATEST(0, ((COALESCE(c.expires_at, l.expires_at) AT TIME ZONE INTERVAL '+05:30')::date
                         - (now() AT TIME ZONE INTERVAL '+05:30')::date))::int AS days_left,
-           (COALESCE(c.expires_at, l.expires_at) < now()) AS expired
+           (COALESCE(c.expires_at, l.expires_at) < now()) AS expired,
+           /* 4.43.0 — who is signed in ON THIS MACHINE, now. One person is
+              signed in at one place at a time, so there is at most one, and
+              a machine with nobody on it can do nothing but show its
+              sign-in screen — which is worth seeing from here when a plant
+              rings to say "it is not working". */
+           u.name AS on_user, u.session_at AS on_since
       FROM licences l
       LEFT JOIN companies c ON c.id = l.company_id
+      LEFT JOIN company_users u ON u.session_device = l.device_id
      ORDER BY l.created_at DESC
      LIMIT 500`);
   const settings = await getSettings();
@@ -248,7 +255,34 @@ export async function companyAction(body) {
        way, for the same reason. */
     const list = await listUsers(id);
     const cap = await userCap(id);
+    /* 4.43.0 — a device id is sixteen characters of hex and means
+       nothing to the person reading it. Name the machine. */
+    const machines = await q(`SELECT device_id, device_name FROM licences WHERE company_id = $1`, [id]);
+    const nameOf = {};
+    machines.forEach((m) => { nameOf[m.device_id] = m.device_name || null; });
+    list.forEach((u) => { u.sessionDeviceName = u.sessionDevice ? (nameOf[u.sessionDevice] || null) : null; });
     return { ok: true, users: list, cap: cap };
+
+  } else if (action === 'usersignout') {
+    /* 4.43.0 — SIGN SOMEBODY OUT FROM HERE.
+
+       One person is signed in at one place at a time, and a session ends
+       when the application closes. That leaves one case the plant cannot
+       fix for itself: the machine is gone — stolen, wiped, or sitting
+       switched off in a shed — and it will never close tidily. The name
+       stays bound to it, and the person cannot get on anywhere because
+       they would displace a machine that is not there to be displaced.
+
+       This releases the binding. It does not change the PIN and it does
+       not remove anybody: the very next sign-in, anywhere, simply works. */
+    const u = (await q(`SELECT id, name, session_device FROM company_users WHERE id = $1 AND company_id = $2`,
+      [body.userId, id]))[0];
+    if (!u) return { error: 'No such person on this company.' };
+    if (!u.session_device) return { ok: true, warning: u.name + ' is not signed in anywhere.' };
+    await q(`UPDATE company_users SET session_device = NULL, session_at = NULL WHERE id = $1`, [u.id]);
+    await logEvent(null, 'ADMIN_USER_SIGNOUT', { companyId: id, userId: u.id, was: u.session_device });
+    return { ok: true, warning: u.name + ' has been signed out. The machine they were on finds out at its next ' +
+      'check and shows the sign-in screen; they can sign in anywhere now.' };
 
   } else if (action === 'useradd') {
     const name = String(body.name || '').trim();
@@ -1035,21 +1069,43 @@ async function coReset(btn){
 /* 4.39.0 — the people on a company. What is shown is everything there
    IS to show: a PIN is a scrypt hash, so there is no PIN to print here
    or anywhere else. A forgotten one is SET again, not read. */
+/* 4.43.0 — WHO IS ON WHICH MACHINE, RIGHT NOW.
+
+     "update in console that i can know which user is currently online on
+      machine"
+
+   One person may be signed in at one place at a time, so there is a
+   single honest answer for each name and this is where it is shown. It
+   is the first thing needed when somebody rings to say they were signed
+   out: they were not " thrown out", somebody signed in as them
+   somewhere, and the console can say where.
+
+   A person's session ends when the application is closed, so a name with
+   nothing here is simply not working at the moment. */
+function onlineCell(u){
+  if(!u.sessionDevice)return '<span class="why">not signed in</span>';
+  const where=u.sessionDeviceName||u.sessionDevice.slice(0,12);
+  return '<b style="color:var(--good)">on '+esc(where)+'</b>'+
+    (u.sessionAt?'<br><span class="why">since '+esc(fmt(u.sessionAt))+'</span>':'');
+}
 function userRow(cid,u){
   const when=u.lastLoginAt?('last signed in '+fmt(u.lastLoginAt)):'never signed in';
   return '<tr'+(u.active?'':' class="off"')+'>'+
-    '<td><b>'+esc(u.name)+'</b>'+(u.active?'':' <span class="why">switched off</span>')+'</td>'+
+    '<td><b>'+esc(u.name)+'</b>'+(u.active?'':' <span class="why">switched off</span>')+
+      (u.sessionDevice?' <span class="pill s-LICENSED">signed in</span>':'')+'</td>'+
     '<td>'+(u.role==='ADMIN'?'<b>administrator</b>':'user')+'</td>'+
     '<td>'+(u.scope==='ALL'?'sees everyone&rsquo;s work':'sees own work')+'</td>'+
     /* 4.42.0 — their own address. A person without one is not broken; they
        simply do not receive the circulars, and it says so plainly. */
     '<td>'+(u.email?'<code>'+esc(u.email)+'</code>':'<span class="why">no address</span>')+'</td>'+
+    '<td>'+onlineCell(u)+'</td>'+
     '<td class="why">'+esc(when)+'</td>'+
     '<td>'+
       '<button class="small" data-cid="'+cid+'" data-uid="'+u.id+'" data-name="'+esc(u.name)+'" data-role="'+(u.role==='ADMIN'?'USER':'ADMIN')+'" onclick="uRole(this)">'+
         (u.role==='ADMIN'?'Make ordinary user':'Make administrator')+'</button> '+
       '<button class="small" data-cid="'+cid+'" data-uid="'+u.id+'" data-name="'+esc(u.name)+'" data-email="'+esc(u.email||'')+'" onclick="uEmail(this)">Email…</button> '+
       '<button class="small" data-cid="'+cid+'" data-uid="'+u.id+'" data-name="'+esc(u.name)+'" onclick="uPin(this)">Set PIN…</button> '+
+      (u.sessionDevice?'<button class="small" data-cid="'+cid+'" data-uid="'+u.id+'" data-name="'+esc(u.name)+'" onclick="uSignOut(this)">Sign out…</button> ':'')+
       '<button class="small" data-cid="'+cid+'" data-uid="'+u.id+'" data-name="'+esc(u.name)+'" onclick="uDel(this)">Remove…</button>'+
     '</td></tr>';
 }
@@ -1070,7 +1126,7 @@ async function coUsers(btn){
       'A PIN cannot be shown here or anywhere else \u2014 it is stored scrambled, which is what stops anyone who gets the database from signing in as your customers. '+
       'When somebody forgets theirs, set a new one and tell them.</p>'+
     (r.users&&r.users.length
-      ? '<table class="users"><thead><tr><th>Name</th><th>Role</th><th>Sees</th><th>Email</th><th>Last signed in</th><th></th></tr></thead><tbody>'+
+      ? '<table class="users"><thead><tr><th>Name</th><th>Role</th><th>Sees</th><th>Email</th><th>Signed in now</th><th>Last signed in</th><th></th></tr></thead><tbody>'+
         r.users.map(u=>userRow(cid,u)).join('')+'</tbody></table>'
       : '<p class="help">Nobody has been added to this company yet.</p>')+
     '<button data-id="'+cid+'" onclick="uAdd(this)">Add a person…</button>';
@@ -1128,6 +1184,20 @@ async function uPin(btn){
   const r=await api('/admin/api/company',{method:'POST',body:JSON.stringify({id:cid,action:'userpin',userId:+btn.dataset.uid,pin})});
   if(r.error){say('<div class="msg err">'+esc(r.error)+'</div>');return;}
   say('<div class="msg ok">'+esc(r.warning||'Done.')+'</div>');
+}
+/* 4.43.0 — the button beside somebody who is signed in. Only needed
+   when the machine they are on will never close tidily — stolen, wiped,
+   or switched off in a shed — because an ordinary close ends the session
+   by itself. */
+async function uSignOut(btn){
+  const cid=+btn.dataset.cid;
+  if(!confirm('Sign '+btn.dataset.name+' out?\\n\\nUse this when the computer they were on is gone or will not be opened again. '+
+    'Their PIN does not change and nothing they saved is touched — they can simply sign in again anywhere.'))return;
+  const r=await api('/admin/api/company',{method:'POST',body:JSON.stringify({id:cid,action:'usersignout',userId:+btn.dataset.uid})});
+  if(r.error){say('<div class="msg err">'+esc(r.error)+'</div>');return;}
+  say('<div class="msg ok">'+esc(r.warning||'Signed out.')+'</div>');
+  document.getElementById('users-'+cid).innerHTML='';
+  await coUsers({dataset:{id:cid}});
 }
 async function uDel(btn){
   const cid=+btn.dataset.cid;
@@ -1364,6 +1434,9 @@ function render(){
     if(l.co_state==='SUSPENDED'&&state!=='REVOKED')state='SUSPENDED';
     return '<tr>'+
       '<td><b>'+esc(l.co_name||l.company||'—')+'</b>'+(l.seat_no?' <code>computer '+l.seat_no+'</code>':'')+
+        (l.on_user
+          ? '<br><span class="pill s-LICENSED">'+esc(l.on_user)+' is signed in</span>'
+          : '<br><span class="why">nobody signed in — this machine shows its sign-in screen</span>')+
         '<br><code>'+esc(String(l.device_id).slice(0,12))+'…</code>'+(l.device_name?' <code>'+esc(l.device_name)+'</code>':'')+'</td>'+
       '<td><span class="pill s-'+state+'">'+state.toLowerCase()+'</span></td>'+
       '<td>'+esc(l.email||'—')+'</td>'+

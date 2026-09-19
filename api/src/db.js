@@ -266,6 +266,25 @@ export function ensureSchema() {
        address is a real plant, not a mistake to be refused. */
     await q(`ALTER TABLE company_users ADD COLUMN IF NOT EXISTS email TEXT`);
 
+    /* 4.43.0 — ONE PERSON, ONE PLACE AT A TIME.
+
+         "one user can only login at one place on same time"
+
+       A seat is a person (4.42.0), but nothing stopped one PIN being used
+       on ten machines at once — so five seats could be worked by fifty
+       people simply by passing the PIN round, and the count the plant pays
+       for meant nothing. The person is now bound to the machine they last
+       signed in on: signing in elsewhere moves the binding, and the machine
+       left behind is told at its next heartbeat and signs itself out.
+
+       Deliberately the DEVICE and not a session token: the device id is
+       already what every request proves, so there is nothing new to keep in
+       step, and nothing to leak. `session_at` is kept so the console can
+       say WHERE somebody is, which is the first question asked when
+       somebody rings to say they were signed out. */
+    await q(`ALTER TABLE company_users ADD COLUMN IF NOT EXISTS session_device TEXT`);
+    await q(`ALTER TABLE company_users ADD COLUMN IF NOT EXISTS session_at TIMESTAMPTZ`);
+
     /* Defaults, written once. ON CONFLICT DO NOTHING means an operator's
        later change is never overwritten by a cold start. */
     await q(`INSERT INTO settings (key, value) VALUES
