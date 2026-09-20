@@ -23,6 +23,7 @@
  */
 import { createHmac, timingSafeEqual, randomInt } from 'node:crypto';
 import { q, getSettings, logEvent } from './db.js';
+import { cleanPlan, featuresFor } from './plans.js';
 
 const SECRET = process.env.NEXORA_TOKEN_SECRET || '';
 const TOKEN_TTL_SEC = 24 * 60 * 60;
@@ -338,8 +339,13 @@ function describeState(row, company, settings) {
     maxUsers: Number(co.seats) || 1,   /* one seat = one person (4.42.0: and only a person) */
     seatNo: Number(row.seat_no) || null,
     isDemo: co.is_demo === true,
-    graceDays
+    graceDays,
+    /* 4.48.0 — the plan, and the features it resolves to. A demo is
+       always PRO with everything on; a STANDARD company is one seat. */
+    plan: co.is_demo === true ? 'PRO' : cleanPlan(co.plan),
+    features: featuresFor(co.plan, settings, co.is_demo === true)
   } : null;
+  if (profile && profile.plan === 'STANDARD') { profile.seats = 1; profile.maxUsers = 1; }
 
   const base = { expiresAt, offlineMinutes, company: profile };
 

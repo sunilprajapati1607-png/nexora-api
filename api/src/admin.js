@@ -12,6 +12,7 @@
  * real accounts the day there is more than one operator.
  */
 import { q, getSettings, logEvent } from './db.js';
+import { cleanPlan, cleanPlanFeatures, PLAN_FEATURES } from './plans.js';
 import { hashPasscode, validPasscode, PASSCODE_MIN } from './passcode.js';
 import { newLicenceKey } from './licence.js';
 import { ensureAdmin, usersSummary, userCap, listUsers, hashPin, validPin, nameKey, cleanEmail } from './sync.js';
@@ -66,7 +67,7 @@ export async function listLicences() {
 export async function listCompanies() {
   const rows = await q(`
     SELECT c.id, c.name, c.licence_key, c.email, c.phone, c.state, c.seats, c.gstin,
-           c.grace_days, c.is_demo, c.expires_at, c.created_at, c.notes, c.txn_limit,
+           c.grace_days, c.is_demo, c.expires_at, c.created_at, c.notes, c.txn_limit, c.plan,
            /* 4.23.0 — self-registration: who registered, from where, and
               what the GST check said. The passcode hash is never listed. */
            c.login_id, c.self_registered, c.registered_ip, c.registered_device, c.registered_at,
@@ -115,20 +116,22 @@ export async function companyAction(body) {
   if (action === 'create') {
     const name = String(body.name || '').trim();
     if (!name) return { error: 'A company name is required.' };
-    const seats = Math.max(1, Math.min(500, parseInt(body.seats, 10) || 1));
+    /* 4.48.0 — the plan; STANDARD is one seat whatever was typed. */
+    const plan = cleanPlan(body.plan);
+    const seats = plan === 'STANDARD' ? 1 : Math.max(1, Math.min(500, parseInt(body.seats, 10) || 1));
     const grace = Math.max(0, Math.min(365, parseInt(body.graceDays, 10) || 0));
     for (let attempt = 0; attempt < 5; attempt++) {
       const key = newLicenceKey();
       try {
         const rows = await q(
           `INSERT INTO companies (name, licence_key, email, phone, state, seats, grace_days,
-                                  is_demo, expires_at, notes, gstin)
-           VALUES ($1,$2,$3,$4,'LICENSED',$5,$6,false, nexora_eod(now() + make_interval(days => $7::int)), $8, $9)
+                                  is_demo, expires_at, notes, gstin, plan)
+           VALUES ($1,$2,$3,$4,'LICENSED',$5,$6,false, nexora_eod(now() + make_interval(days => $7::int)), $8, $9, $10)
            RETURNING *`,
           [name, key, body.email || null, body.phone || null, seats, grace, days, body.notes || null,
-           (String(body.gstin || '').trim().toUpperCase() || null)]);
+           (String(body.gstin || '').trim().toUpperCase() || null), plan]);
         if (rows.length) {
-          await logEvent(null, 'ADMIN_COMPANY_CREATE', { id: rows[0].id, name, seats, days, grace });
+          await logEvent(null, 'ADMIN_COMPANY_CREATE', { id: rows[0].id, name, seats, days, grace, plan });
           return { ok: true, company: rows[0] };
         }
       } catch (e) {
@@ -158,6 +161,11 @@ export async function companyAction(body) {
 
   } else if (action === 'seats') {
     const seats = Math.max(1, Math.min(500, parseInt(body.seats, 10) || 1));
+    /* 4.48.0 — STANDARD is one seat by definition; the plan changes first. */
+    const planRow = (await q(`SELECT plan, is_demo FROM companies WHERE id = $1`, [id]))[0];
+    if (planRow && cleanPlan(planRow.plan) === 'STANDARD' && planRow.is_demo !== true && seats > 1) {
+      return { error: 'Standard is one seat. Change the plan to Pro first, then add seats.' };
+    }
     /* Reducing below what is in use is ALLOWED and stops nothing. Silently
        revoking somebody's PC to satisfy a number is exactly the kind of
        data loss rule #29 forbids — so it warns and leaves them running. */
@@ -176,6 +184,17 @@ export async function companyAction(body) {
       ' seats now allowed. Nobody was removed — the application refuses the next person until seats are raised.');
     if (warn.length) return { ok: true, warning: 'Saved. ' + warn.join(' ') };
 
+  } else if (action === 'plan') {
+    /* 4.48.0 — STANDARD or PRO. Going to STANDARD sets the seats to one;
+       people already on the company are not removed (rule #29), the
+       application refuses the next sign-in beyond the seat. */
+    const plan = cleanPlan(body.plan);
+    await q(`UPDATE companies SET plan = $2, seats = CASE WHEN $2 = 'STANDARD' THEN 1 ELSE seats END WHERE id = $1`, [id, plan]);
+    await logEvent(null, 'ADMIN_COMPANY_PLAN', { id, plan });
+    if (plan === 'STANDARD') {
+      const people = (await q(`SELECT COUNT(*)::int AS n FROM company_users WHERE company_id = $1 AND active = true`, [id]))[0];
+      if (Number(people.n) > 1) return { ok: true, warning: 'Saved as Standard (one seat). ' + people.n + ' people are on this company; nobody was removed, but only one may be signed in and the application refuses the next person.' };
+    }
   } else if (action === 'grace') {
     const grace = Math.max(0, Math.min(365, parseInt(body.graceDays, 10) || 0));
     await q(`UPDATE companies SET grace_days = $2 WHERE id = $1`, [id, grace]);
@@ -545,6 +564,8 @@ export async function saveSettings(body) {
   if (body.demoSignup !== undefined) pairs.push(['demo_signup', body.demoSignup ? 'yes' : 'no']);
   if (body.demoGraceDays !== undefined) pairs.push(['demo_grace_days', String(Math.max(0, Math.min(365, parseInt(body.demoGraceDays, 10) || 0)))]);
   if (body.sessionMinutes !== undefined) pairs.push(['session_minutes', String(Math.min(720, Math.max(5, parseInt(body.sessionMinutes, 10) || 30)))]);
+  /* 4.48.0 — which features each plan carries. */
+  if (body.planFeatures !== undefined) pairs.push(['plan_features', JSON.stringify(cleanPlanFeatures(body.planFeatures))]);
   for (const [k, v] of pairs) {
     await q(`INSERT INTO settings (key, value) VALUES ($1,$2)
              ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`, [k, v]);
@@ -762,6 +783,7 @@ th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;le
     </div>
     <nav class="jump" id="jump">
       <a href="#sec-companies">Companies <b id="jump-co">–</b></a>
+      <a href="#sec-plans">Plans</a>
       <a href="#sec-inquiries">Enquiries <b id="jump-q">–</b></a>
       <a href="#sec-feedback">Feedback &amp; problems <b id="jump-fb">–</b></a>
       <a href="#sec-broadcast">Message plants</a>
@@ -784,6 +806,20 @@ th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;le
       <p class="help"><b>Accept new registrations</b> is how a plant that downloads Nexora starts: company, GSTIN, email, mobile, a company id and passcode. <b>Anonymous demos</b> is the old way &mdash; a licence key left blank creates a company from whatever name is typed, with nothing to tell a real plant from a made-up one; leave it off unless you are demonstrating on a prospect&rsquo;s machine yourself. A demo with 0 offline days stops the moment it cannot reach this service. The working window is only how long a good answer is reused before the application asks again. Offline days for a paying customer are set on the company.</p>
     </div>
 
+    <!-- 4.48.0 — "give this plan wise access things in console so i can
+         control app feature from console as per plan". What each plan
+         carries; a demo always gets everything. -->
+    <div class="card" id="sec-plans">
+      <div class="top" style="margin-bottom:6px">
+        <h2 class="grow">Plans <span class="sub" style="font-weight:400">— what Standard and Pro carry; every installation reads this at its next check</span></h2>
+        <button class="primary" onclick="savePlans()">Save plans</button>
+      </div>
+      <div style="overflow-x:auto"><table id="plantbl">
+        <thead><tr><th>Feature</th><th>Standard</th><th>Pro</th><th>Demo</th></tr></thead><tbody></tbody></table></div>
+      <div id="plMsg"></div>
+      <p class="help">Calculation and costing are the product and are always on. A feature unticked for a plan disappears from every installation on that plan &mdash; its window, button and shortcut &mdash; and the application says it belongs to the other plan when somebody asks for it. <b>Standard is one seat.</b> A <b>demo</b> always has everything, whatever its plan, so a prospect sees the whole application. Each company&rsquo;s plan is set under Manage &rarr; Licence.</p>
+    </div>
+
     <div class="card" id="sec-companies">
       <div class="top" style="margin-bottom:6px">
         <h2 class="grow">Companies</h2>
@@ -793,6 +829,7 @@ th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;le
       <div id="newco" style="display:none;border:1px solid var(--border);border-radius:10px;padding:12px;margin:8px 0 12px">
         <div class="row">
           <label>Company name<input id="nName" placeholder="Company name" style="min-width:220px"></label>
+          <label>Plan<select id="nPlan"><option value="PRO">Pro — everything</option><option value="STANDARD">Standard — one seat, calculation &amp; costing</option></select></label>
           <label>Seats<input id="nSeats" type="number" min="1" max="500" value="1" style="width:80px"></label>
           <label>Licence days<input id="nDays" type="number" min="1" max="3650" value="365" style="width:90px"></label>
           <label>Offline days<input id="nGrace" type="number" min="0" max="365" value="0" style="width:90px"></label>
@@ -806,6 +843,7 @@ th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;le
       <div id="coMsg"></div>
       <div id="colist"></div>
       <div class="legend">
+        <div><b>Plan</b>is Standard (one seat; calculation and costing) or Pro (everything ticked under Plans). A demo has everything until it is made licensed.</div>
         <div><b>Suspend</b>stops every machine of the company at its next check. Nothing is deleted; Restore puts it all back. Use it when a customer has not paid.</div>
         <div><b>Revoke</b>(on one installation) stops that one machine. It frees no seat — seats are people, and a machine never held one. The company keeps running.</div>
         <div><b>Delete</b>removes the company, its machines, its people and everything they synced. It cannot be undone from here — the name must be typed to confirm.</div>
@@ -994,6 +1032,7 @@ async function load(){
     document.getElementById('sMode').value=s.expiredMode;
     document.getElementById('sOpen').checked=!!s.signupsOpen;
     document.getElementById('sDemo').checked=!!s.demoSignup;
+    renderPlans();
     renderCompanies();
     render();
     /* 4.42.0 — the leads come with everything else, and never hold up the
@@ -1053,6 +1092,7 @@ function renderCompanies(){
         '<div class="grow" style="flex:1">'+
           '<span class="co-name">'+esc(c.name)+'</span> '+
           '<span class="pill s-'+state+'">'+(state==='DEMO'?'demo':state.toLowerCase())+'</span> '+
+          (c.is_demo?'':'<span class="pill s-'+(c.plan==='STANDARD'?'SELF':'LICENSED')+'" title="'+(c.plan==='STANDARD'?'Standard: one seat, calculation and costing':'Pro: everything')+'">'+(c.plan==='STANDARD'?'standard':'pro')+'</span> ')+
           (c.self_registered?'<span class="pill s-SELF" title="Registered by the plant itself on '+esc(fmt(c.registered_at))+(c.registered_ip?' from '+esc(c.registered_ip):'')+'">self-registered</span> ':'')+
           (c.gstin?gstPill(c):'')+
           '<div class="co-meta">'+
@@ -1072,6 +1112,8 @@ function renderCompanies(){
            Machines are counted underneath, and are not rationed: since a
            computer with nobody signed in can only read, charging for it
            would be charging for a locked door. */
+        '<div class="fact"><span>Plan</span><b>'+(c.is_demo?'demo':(c.plan==='STANDARD'?'Standard':'Pro'))+'</b>'+
+          '<small>'+(c.is_demo?'everything, while it is a demo':(c.plan==='STANDARD'?'one seat \u00b7 calculation and costing':'every feature'))+'</small></div>'+
         '<div class="fact"><span>Seats (people)</span><b>'+used+' of '+seats+'</b>'+
           '<small>'+(seats-used>0?(seats-used)+' available':'none available')+'</small>'+
           '<span class="bar'+(used>=seats?' full':'')+'"><i style="width:'+pct+'%"></i></span></div>'+
@@ -1086,6 +1128,7 @@ function renderCompanies(){
       '<div class="manage'+(open?' open':'')+'" id="mg-'+c.id+'">'+
         '<div class="group"><h4>Licence</h4><div class="acts">'+
           (c.is_demo?'<button class="primary" data-id="'+c.id+'" data-action="licence" data-days="365" onclick="coAct(this)">Make licensed for 1 year</button><span class="why">turns this demo into a paying customer</span>':'')+
+          '<button data-id="'+c.id+'" data-plan="'+esc(c.plan||'PRO')+'" onclick="coPlan(this)">Plan: '+(c.plan==='STANDARD'?'Standard':'Pro')+'…</button><span class="why">Standard = one seat, calculation and costing; Pro = everything under Plans above</span>'+
           '<button data-id="'+c.id+'" onclick="coDays(this)">Add days…</button>'+
           '<button data-id="'+c.id+'" data-action="extend" data-days="365" onclick="coAct(this)">+1 year</button>'+
         '</div></div>'+
@@ -1146,6 +1189,37 @@ async function coDays(btn){
   const days=parseInt(v,10);
   if(!(days>0)){say('<div class="msg err">Enter a number of days.</div>');return;}
   btn.dataset.action='extend';btn.dataset.days=String(days);await coAct(btn);
+}
+/* ---------- plans (4.48.0) ---------- */
+const PLAN_LABELS={quotation:'Quotation',chat:'Company conversation (chat)',notes:'Notes pad',bomWorkflow:'BOM workflow automation',onlinePrices:'Prices from the producer\u2019s list',bagView:'3D bag view',ink:'Ink assumption',sharing:'Email & WhatsApp sharing'};
+function renderPlans(){
+  const m=(DATA.settings&&DATA.settings.planFeatures)||{STANDARD:{},PRO:{}};
+  const tb=document.querySelector('#plantbl tbody');
+  if(!tb)return;
+  tb.innerHTML=Object.keys(PLAN_LABELS).map(id=>
+    '<tr><td>'+esc(PLAN_LABELS[id])+'</td>'+
+    '<td><input type="checkbox" data-plan="STANDARD" data-feat="'+id+'"'+(m.STANDARD&&m.STANDARD[id]?' checked':'')+'></td>'+
+    '<td><input type="checkbox" data-plan="PRO" data-feat="'+id+'"'+(m.PRO&&m.PRO[id]?' checked':'')+'></td>'+
+    '<td><input type="checkbox" checked disabled title="A demo always has everything"></td></tr>').join('');
+}
+async function savePlans(){
+  const out={STANDARD:{},PRO:{}};
+  document.querySelectorAll('#plantbl input[data-plan]').forEach(c=>{out[c.dataset.plan][c.dataset.feat]=c.checked;});
+  try{
+    await api('/admin/api/settings',{method:'POST',body:JSON.stringify({planFeatures:out})});
+    const n=document.getElementById('plMsg');n.innerHTML='<div class="msg ok">Plans saved \u2014 every installation reads them at its next check.</div>';
+    setTimeout(()=>{n.innerHTML='';},6000);
+    await load();
+  }catch(e){document.getElementById('plMsg').innerHTML='<div class="msg err">'+esc(e.message)+'</div>';}
+}
+async function coPlan(btn){
+  const now=btn.dataset.plan==='STANDARD'?'STANDARD':'PRO';
+  const next=now==='STANDARD'?'PRO':'STANDARD';
+  if(!confirm('Change this company from '+(now==='STANDARD'?'Standard':'Pro')+' to '+(next==='STANDARD'?'Standard (one seat, calculation and costing)':'Pro (everything)')+'?'))return;
+  const r=await api('/admin/api/company',{method:'POST',body:JSON.stringify({id:+btn.dataset.id,action:'plan',plan:next})});
+  if(r.error){say('<div class="msg err">'+esc(r.error)+'</div>');return;}
+  if(r.warning)say('<div class="msg warn">'+esc(r.warning)+'</div>');
+  await load();
 }
 async function coSeats(btn){
   const v=prompt('How many machines may run on this licence?',btn.dataset.now);
@@ -1371,6 +1445,7 @@ async function createCo(){
   if(!name){say('<div class="msg err">A company name is required.</div>');return;}
   const r=await api('/admin/api/company',{method:'POST',body:JSON.stringify({
     action:'create',name,
+    plan:document.getElementById('nPlan').value,
     seats:+document.getElementById('nSeats').value,
     days:+document.getElementById('nDays').value,
     graceDays:+document.getElementById('nGrace').value,

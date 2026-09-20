@@ -13,6 +13,7 @@
  * the only client, so it owns its own tables.
  */
 import { createClient } from './pgmini.js';
+import { parsePlanFeatures } from './plans.js';
 
 export const pool = createClient(process.env.DATABASE_URL);
 
@@ -101,6 +102,10 @@ export function ensureSchema() {
        per customer" work needs to FIND a company by GSTIN, which an
        index gives; it does not need the database to forbid a second. */
     await q(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS gstin TEXT`);
+    /* 4.48.0 — the PLAN: STANDARD (one seat, calculation and costing) or
+       PRO (everything). Every company that already exists reads PRO,
+       which is what it has been getting; a demo answers PRO regardless. */
+    await q(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS plan TEXT NOT NULL DEFAULT 'PRO'`);
     await q(`CREATE INDEX IF NOT EXISTS companies_gstin_idx ON companies (gstin)`);
 
     /* ADD COLUMN IF NOT EXISTS is the safe form: it does nothing on a
@@ -414,7 +419,9 @@ export async function getSettings() {
     /* With no grace at all the app would need a round trip per keystroke,
        which is absurd. This is the working window a good answer stays
        usable for — caching, not grace. The app re-checks well inside it. */
-    sessionMinutes: Math.min(720, Math.max(5, parseInt(s.session_minutes, 10) || 30))
+    sessionMinutes: Math.min(720, Math.max(5, parseInt(s.session_minutes, 10) || 30)),
+    /* 4.48.0 — which features each plan carries; the console edits it. */
+    planFeatures: parsePlanFeatures(s.plan_features)
   };
 }
 
