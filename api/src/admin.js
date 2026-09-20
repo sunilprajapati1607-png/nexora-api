@@ -675,6 +675,19 @@ label input,label select{font-size:14px;color:var(--text)}
 .group h4{margin:0 0 6px;font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
 .acts{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
 .acts .why{color:var(--muted);font-size:12px;margin-left:4px}
+/* 4.45.0 — a row of doors to each section, with what is waiting in each,
+   pinned under the title so a long page is one press from anywhere. */
+.jump{position:sticky;top:0;z-index:5;display:flex;gap:6px;flex-wrap:wrap;align-items:center;
+  padding:8px 0 10px;margin:0 0 6px;background:var(--bg)}
+.jump a{display:inline-flex;align-items:center;gap:7px;padding:6px 12px;border-radius:999px;
+  border:1px solid var(--border);background:var(--bg-elevated);color:var(--text);font-weight:700;
+  font-size:12.5px;text-decoration:none;box-shadow:var(--shadow-sm)}
+.jump a:hover{border-color:var(--accent);color:var(--accent)}
+.jump a b{display:inline-block;min-width:18px;padding:0 6px;border-radius:999px;background:var(--accentbg);
+  color:var(--accent);font-size:11px;text-align:center;line-height:18px}
+.jump a b.hot{background:var(--badbg);color:var(--bad)}
+.jump a b.zero{background:var(--bg-sunken);color:var(--muted)}
+.say{white-space:pre-wrap;max-width:380px;display:block;line-height:1.45}
 table{width:100%;border-collapse:collapse;font-size:13px}
 th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--border);vertical-align:middle}
 th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.04em}
@@ -747,6 +760,14 @@ th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;le
       <button data-target="settings" onclick="toggle(this)">Service settings</button>
       <button onclick="signOut()" title="Forget the key in this browser tab">Sign out</button>
     </div>
+    <nav class="jump" id="jump">
+      <a href="#sec-companies">Companies <b id="jump-co">–</b></a>
+      <a href="#sec-inquiries">Enquiries <b id="jump-q">–</b></a>
+      <a href="#sec-feedback">Feedback &amp; problems <b id="jump-fb">–</b></a>
+      <a href="#sec-installations">Installations <b id="jump-inst">–</b></a>
+      <a href="#appcard">Phone app</a>
+      <a href="#settings" onclick="document.getElementById('settings').style.display='';">Service settings</a>
+    </nav>
 
     <div class="card" id="settings" style="display:none">
       <h2>Service settings <span class="sub" style="font-weight:400">— apply to every installation from its next check</span></h2>
@@ -762,7 +783,7 @@ th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;le
       <p class="help"><b>Accept new registrations</b> is how a plant that downloads Nexora starts: company, GSTIN, email, mobile, a company id and passcode. <b>Anonymous demos</b> is the old way &mdash; a licence key left blank creates a company from whatever name is typed, with nothing to tell a real plant from a made-up one; leave it off unless you are demonstrating on a prospect&rsquo;s machine yourself. A demo with 0 offline days stops the moment it cannot reach this service. The working window is only how long a good answer is reused before the application asks again. Offline days for a paying customer are set on the company.</p>
     </div>
 
-    <div class="card">
+    <div class="card" id="sec-companies">
       <div class="top" style="margin-bottom:6px">
         <h2 class="grow">Companies</h2>
         <input id="cq" placeholder="Find a company, key, email, GSTIN…" oninput="renderCompanies()" style="min-width:240px">
@@ -838,7 +859,7 @@ th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;le
          that arrive by phone are typed in here. The phone console shows
          exactly this table from exactly this service, so the two are never
          out of step with each other. -->
-    <div class="card">
+    <div class="card" id="sec-inquiries">
       <div class="top" style="margin-bottom:6px">
         <h2 class="grow">Enquiries <span class="sub" style="font-weight:400" id="qsub"></span></h2>
         <input id="qq" placeholder="Find a name, plant, number, product…" oninput="renderInquiries()" style="min-width:240px">
@@ -875,7 +896,23 @@ th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;le
       <p class="help">An enquiry is not a customer. When one becomes a customer, create the company in the ordinary way above; the enquiry stays here as the record of where they came from.</p>
     </div>
 
-    <div class="card">
+    <!-- 4.45.0 — what the plants say from inside the application:
+         Help → Nexora Contact → Send feedback / Report a problem. The
+         phone console lists the same rows from the same service. -->
+    <div class="card" id="sec-feedback">
+      <div class="top" style="margin-bottom:6px">
+        <h2 class="grow">Feedback &amp; problem reports <span class="sub" style="font-weight:400" id="fbsub"></span></h2>
+        <input id="fq" placeholder="Find a plant, person, word…" oninput="renderFeedback()" style="min-width:240px">
+        <button onclick="loadFeedback()">Refresh</button>
+      </div>
+      <div id="fbstates" class="acts" style="margin:8px 0"></div>
+      <div id="fbMsg"></div>
+      <div style="overflow-x:auto"><table id="fbtbl">
+        <thead><tr><th>Kind</th><th>From</th><th>Says</th><th>Where</th><th>Screen</th><th>State</th><th></th></tr></thead><tbody></tbody></table></div>
+      <p class="help">Sent from <b>Help &rarr; Nexora Contact</b> inside the application. A problem report carries a picture of the screen as it was when the person opened the menu &mdash; <b>View</b> opens it full size. <b>Note</b> is yours: it stays here and on the phone and is never sent back to the plant. Call-back numbers are the ones the plant typed, or its registered mobile.</p>
+    </div>
+
+    <div class="card" id="sec-installations">
       <div class="top" style="margin-bottom:6px">
         <h2 class="grow">Installations <span class="sub" style="font-weight:400" id="instsub"></span></h2>
         <input id="q" placeholder="Search company, key, email, device…" oninput="render()" style="min-width:240px">
@@ -943,6 +980,7 @@ async function load(){
        rest of the page if the service has not been deployed with them. */
     loadInquiries();
     loadReleases();
+    loadFeedback();
   }catch(e){
     KEY='';
     document.getElementById('gateErr').innerHTML='<div class="msg err">'+esc(e.message)+'</div>';
@@ -1465,6 +1503,7 @@ function renderInquiries(){
   const rows=all.filter(q=>(!QSTATE||q.state===QSTATE)&&(!term||
     [q.name,q.company,q.phone,q.email,q.product,q.message,q.notes].some(v=>String(v||'').toLowerCase().includes(term))));
   document.getElementById('qsub').textContent='— '+rows.length+' of '+all.length;
+  const jq=document.getElementById('jump-q');if(jq){const nn=all.filter(q=>q.state==='NEW').length;jq.textContent=nn;jq.className=nn?'hot':'zero';}
 
   /* The states, as filters that also count. */
   document.getElementById('qstates').innerHTML=
@@ -1557,6 +1596,101 @@ async function qDelete(btn){
   await loadInquiries();
 }
 
+/* ---------- feedback & problem reports (4.45.0) ----------------------
+   The same rows the phone console shows, from the same service. The
+   picture is fetched only when View is pressed: a table of three hundred
+   reports must not weigh three hundred screenshots. */
+let FBDATA={feedback:[],kinds:[],states:[]}, FBKIND=null, FBSTATE=null, FBOPEN=0;
+function fbsay(html){
+  const n=document.getElementById('fbMsg');
+  if(!n)return;
+  n.innerHTML=html;
+  if(html)setTimeout(()=>{if(n.innerHTML===html)fbsay('')},6000);
+}
+async function loadFeedback(){
+  try{
+    FBDATA=await api('/admin/api/feedback');
+  }catch(e){
+    FBDATA={feedback:[],kinds:[],states:[]};
+    document.querySelector('#fbtbl tbody').innerHTML=
+      '<tr><td colspan="7" class="help">This service does not have reports yet \u2014 deploy the API to switch them on.</td></tr>';
+    return;
+  }
+  FBOPEN=(FBDATA.feedback||[]).filter(f=>f.state==='NEW'||f.state==='SEEN').length;
+  const k=document.getElementById('kpiFbN');if(k)k.textContent=FBOPEN;
+  renderFeedback();
+}
+function fbPill(state){
+  return {NEW:'TRIAL',SEEN:'SELF',FIXED:'LICENSED',CLOSED:'REVOKED'}[state]||'SELF';
+}
+function renderFeedback(){
+  const term=(document.getElementById('fq').value||'').toLowerCase();
+  const all=FBDATA.feedback||[];
+  const rows=all.filter(f=>(!FBKIND||f.kind===FBKIND)&&(!FBSTATE||f.state===FBSTATE)&&(!term||
+    [f.subject,f.message,f.name,f.company,f.coName,f.userName,f.deviceName,f.view,f.reply,f.appVersion].some(v=>String(v||'').toLowerCase().includes(term))));
+  document.getElementById('fbsub').textContent='\u2014 '+rows.length+' of '+all.length;
+  const jf=document.getElementById('jump-fb');
+  if(jf){const nn=all.filter(f=>f.state==='NEW').length;jf.textContent=nn;jf.className=nn?'hot':'zero';}
+  document.getElementById('fbstates').innerHTML=
+    '<button class="small'+(FBKIND?'':' primary')+'" onclick="fbKind(null)">All '+all.length+'</button>'+
+    (FBDATA.kinds||[]).map(k=>'<button class="small'+(FBKIND===k?' primary':'')+'" data-kind="'+k+'" onclick="fbKind(this.dataset.kind)">'+(k==='BUG'?'problems':'feedback')+' '+all.filter(f=>f.kind===k).length+'</button>').join('')+
+    '<span class="why">\u00b7</span>'+
+    (FBDATA.states||[]).map(s=>'<button class="small'+(FBSTATE===s?' primary':'')+'" data-state="'+s+'" onclick="fbState(this.dataset.state)">'+s.toLowerCase()+' '+all.filter(f=>f.state===s).length+'</button>').join('');
+  document.querySelector('#fbtbl tbody').innerHTML=rows.map(f=>{
+    const reach=[];
+    if(f.phone)reach.push('<a href="tel:'+esc(f.phone)+'"><code>'+esc(f.phone)+'</code></a>');
+    if(f.email)reach.push('<a href="mailto:'+esc(f.email)+'"><code>'+esc(f.email)+'</code></a>');
+    return '<tr>'+
+      '<td><span class="pill s-'+(f.kind==='BUG'?'REVOKED':'LICENSED')+'">'+(f.kind==='BUG'?'problem':'feedback')+'</span><br><span class="why">'+fmt(f.createdAt)+'</span></td>'+
+      '<td><b>'+esc(f.coName||f.company||'\u2014')+'</b>'+((f.name||f.userName)?'<br>'+esc(f.name||f.userName):'')+(reach.length?'<br>'+reach.join('<br>'):'')+'</td>'+
+      '<td><b>'+esc(f.subject||'')+'</b><span class="say why">'+esc(f.message||'')+'</span>'+(f.reply?'<span class="say"><b>note:</b> '+esc(f.reply)+'</span>':'')+'</td>'+
+      '<td class="why">'+esc(f.view||'\u2014')+'<br>'+esc(f.appVersion||'')+(f.edition?' '+esc(String(f.edition).toLowerCase()):'')+(f.deviceName?'<br><code>'+esc(f.deviceName)+'</code>':'')+'</td>'+
+      '<td>'+(f.hasShot?'<button class="small" data-id="'+f.id+'" onclick="fbShot(this)">View</button>':'<span class="why">none</span>')+'</td>'+
+      '<td><span class="pill s-'+fbPill(f.state)+'">'+esc(String(f.state).toLowerCase())+'</span></td>'+
+      '<td><div class="acts">'+
+        (FBDATA.states||[]).filter(s=>s!==f.state).map(s=>
+          '<button class="small'+(s==='FIXED'?' primary':'')+'" data-id="'+f.id+'" data-state="'+s+'" onclick="fbMove(this)">\u2192 '+s.toLowerCase()+'</button>').join('')+
+        '<button class="small" data-id="'+f.id+'" onclick="fbReply(this)">Note</button>'+
+        '<button class="small danger" data-id="'+f.id+'" onclick="fbDelete(this)">Remove</button>'+
+      '</div></td></tr>';
+  }).join('')||'<tr><td colspan="7" class="help">Nothing here yet. Reports arrive from Help \u2192 Nexora Contact inside the application.</td></tr>';
+}
+function fbKind(k){FBKIND=k||null;renderFeedback();}
+function fbState(s){FBSTATE=(FBSTATE===s)?null:s;renderFeedback();}
+async function fbMove(btn){
+  const r=await api('/admin/api/feedback',{method:'POST',body:JSON.stringify({action:'state',id:+btn.dataset.id,state:btn.dataset.state})});
+  if(r.error){fbsay('<div class="msg err">'+esc(r.error)+'</div>');return;}
+  await loadFeedback();
+}
+async function fbReply(btn){
+  const f=(FBDATA.feedback||[]).find(x=>x.id===+btn.dataset.id);
+  const note=prompt('Your note on this report (kept here and on the phone, never sent to the plant):',(f&&f.reply)||'');
+  if(note===null)return;
+  const r=await api('/admin/api/feedback',{method:'POST',body:JSON.stringify({action:'reply',id:+btn.dataset.id,reply:note})});
+  if(r.error){fbsay('<div class="msg err">'+esc(r.error)+'</div>');return;}
+  await loadFeedback();
+}
+async function fbDelete(btn){
+  if(!confirm('Remove this report?\\n\\nThe row and its picture are deleted.'))return;
+  const r=await api('/admin/api/feedback',{method:'POST',body:JSON.stringify({action:'delete',id:+btn.dataset.id})});
+  if(r.error){fbsay('<div class="msg err">'+esc(r.error)+'</div>');return;}
+  fbsay('<div class="msg ok">Removed.</div>');
+  await loadFeedback();
+}
+async function fbShot(btn){
+  btn.disabled=true;btn.textContent='Loading\u2026';
+  try{
+    const r=await api('/admin/api/feedback/shot?id='+(+btn.dataset.id));
+    if(r.error||!r.shot){fbsay('<div class="msg err">'+esc(r.error||'No picture on that report.')+'</div>');return;}
+    const w=window.open('','_blank');
+    if(!w){fbsay('<div class="msg warn">The browser blocked the window \u2014 allow pop-ups for this page.</div>');return;}
+    w.document.write('<!doctype html><title>Report #'+(+btn.dataset.id)+'</title><body style="margin:0;background:#12141c;display:flex;align-items:flex-start;justify-content:center"><img src="'+r.shot+'" style="max-width:100%;height:auto"></body>');
+    w.document.close();
+  }catch(e){
+    fbsay('<div class="msg err">'+esc(e.message||'Could not fetch the picture.')+'</div>');
+  }finally{btn.disabled=false;btn.textContent='View';}
+}
+
 /* ---------- installations ---------- */
 function showInstallations(btn){COFILTER=+btn.dataset.id;render();document.getElementById('tbl').scrollIntoView({behavior:'smooth',block:'start'});}
 function clearCompanyFilter(){COFILTER=null;render();}
@@ -1569,7 +1703,10 @@ function render(){
     '<div class="kpi"><b>'+cos.filter(c=>!c.is_demo).length+'</b><span>Customers</span></div>'+
     '<div class="kpi"><b>'+cos.filter(c=>c.is_demo).length+'</b><span>Demos</span></div>'+
     '<div class="kpi"><b>'+all.length+'</b><span>Installations</span></div>'+
-    '<div class="kpi"><b>'+live+'</b><span>Running</span></div>';
+    '<div class="kpi"><b>'+live+'</b><span>Running</span></div>'+
+    '<div class="kpi"><b id="kpiFbN">'+FBOPEN+'</b><span>Reports open</span></div>';
+  const jc=document.getElementById('jump-co');if(jc){jc.textContent=cos.length;jc.className=cos.length?'':'zero';}
+  const ji=document.getElementById('jump-inst');if(ji){ji.textContent=all.length;ji.className=all.length?'':'zero';}
   document.getElementById('sub').textContent=cos.length+' compan'+(cos.length===1?'y':'ies')+' · '+all.length+' installation'+(all.length===1?'':'s');
   const fc=COFILTER?cos.find(c=>c.id===COFILTER):null;
   document.getElementById('instsub').textContent=fc?'— '+fc.name+' only':'— '+rows.length+' of '+all.length;

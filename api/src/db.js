@@ -253,6 +253,42 @@ export function ensureSchema() {
     await q(`CREATE INDEX IF NOT EXISTS inquiries_created_idx ON inquiries (created_at DESC)`);
     await q(`CREATE INDEX IF NOT EXISTS inquiries_state_idx ON inquiries (state)`);
 
+    /* 4.45.0 — FEEDBACK AND PROBLEM REPORTS, from Help → Nexora Contact.
+
+       One row per report. `kind` is FEEDBACK or BUG; `shot` is the picture
+       of the screen a BUG carries, as a JPEG data URL — kept in the row
+       rather than in a bucket because the free tier has no bucket, a
+       report is opened a handful of times, and the list never selects
+       it. `company_id` is set when the application sent a good token,
+       which is what lets the console say which plant is speaking. */
+    await q(`
+      CREATE TABLE IF NOT EXISTS feedback (
+        id          BIGSERIAL PRIMARY KEY,
+        kind        TEXT NOT NULL DEFAULT 'FEEDBACK',
+        subject     TEXT,
+        message     TEXT NOT NULL,
+        name        TEXT,
+        phone       TEXT,
+        email       TEXT,
+        company     TEXT,
+        company_id  BIGINT,
+        licence_key TEXT,
+        user_name   TEXT,
+        device_id   TEXT,
+        device_name TEXT,
+        app_version TEXT,
+        edition     TEXT,
+        view        TEXT,
+        shot        TEXT,
+        state       TEXT NOT NULL DEFAULT 'NEW',
+        reply       TEXT,
+        remote_ip   TEXT,
+        created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+      )`);
+    await q(`CREATE INDEX IF NOT EXISTS feedback_created_idx ON feedback (created_at DESC)`);
+    await q(`CREATE INDEX IF NOT EXISTS feedback_state_idx ON feedback (state)`);
+
     /* 4.44.0 — WHAT THE PHONE CONSOLE SHOULD BE RUNNING.
 
        The Android console is not on Play, so nothing tells it a new build

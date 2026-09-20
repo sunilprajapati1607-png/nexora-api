@@ -21,6 +21,7 @@ import { send as chatSend, since as chatSince, remove as chatRemove } from './ch
 import { ensureInkSchema, getModel, listModels, train as inkTrain, estimate as inkEstimate, reset as inkReset } from './inkstore.js';
 import { register, gstAction, remoteIp } from './register.js';
 import { listInquiries, inquiryAction, publicInquiry } from './inquiry.js';
+import { listFeedback, feedbackShot, feedbackAction, publicFeedback } from './feedback.js';
 import { latestRelease, listReleases, releaseAction } from './appupdate.js';
 import { logoResponse } from './brand.js';
 
@@ -50,6 +51,21 @@ export default {
 
     try {
       /* ---- open ---------------------------------------------------- */
+      /* 4.45.0 — a report from Help → Nexora Contact. Open, like an
+         enquiry, so a machine that has not activated can still speak;
+         signed when the application has a token, which is what puts the
+         row against its company. A bad or stale token is not a reason
+         to lose the report — it is simply kept unsigned. */
+      if (path === '/feedback' && method === 'POST') {
+        await ensureSchema();
+        let auth = null;
+        if (request.headers.get('authorization')) {
+          try { const a = await authorise(request); if (a && a.ok) auth = a; } catch (e) { auth = null; }
+        }
+        const ip = request.headers.get('x-forwarded-for') || request.headers.get('cf-connecting-ip') || null;
+        const out = await publicFeedback(await readJson(request), ip ? String(ip).split(',')[0].trim() : null, auth);
+        return json(out, out.ok ? 200 : (out.error === 'TOO_MANY' ? 429 : 400));
+      }
       if (path === '/health' || path === '/') {
         await ensureSchema();
         return json({ ok: true, service: 'nexora-api', version: '1.0.0', time: new Date().toISOString() });
@@ -306,6 +322,10 @@ export default {
         /* 4.42.0 — enquiries: the leads, before they are customers. */
         if (path === '/admin/api/inquiries' && method === 'GET') return json(await listInquiries());
         if (path === '/admin/api/inquiry' && method === 'POST') return json(await inquiryAction(await readJson(request)));
+        /* 4.45.0 — feedback and problem reports from the application. */
+        if (path === '/admin/api/feedback' && method === 'GET') return json(await listFeedback());
+        if (path === '/admin/api/feedback/shot' && method === 'GET') return json(await feedbackShot(url.searchParams.get('id')));
+        if (path === '/admin/api/feedback' && method === 'POST') return json(await feedbackAction(await readJson(request)));
         /* 4.44.0 — the phone console's own releases. */
         if (path === '/admin/api/app' && method === 'GET') return json(await listReleases());
         if (path === '/admin/api/app' && method === 'POST') return json(await releaseAction(await readJson(request)));
