@@ -203,8 +203,22 @@
       if (!r.web) return;
       r.groups.forEach(function (g) { lengthGroups[g] = lengthGroups[g] || []; lengthGroups[g].push(r); });
     });
+    /* 4.49.0 — "missing meter in bom window". A plant's RM master calls
+       the film "BOPP", "BOPP PRINTED", "Bopp Film 20 mic" — the rule
+       above wants exactly BOPP FILM. The group is read for what it says
+       rather than for its spelling: anything with BOPP in it is BOPP film,
+       METALLI is metallised film, LINER is liner, FABRIC is fabric. */
+    function webGroupOf(g) {
+      var u = String(g || '').toUpperCase();
+      if (lengthGroups[u]) return u;
+      if (u.indexOf('BOPP') > -1) return 'BOPP FILM';
+      if (u.indexOf('METALLI') > -1) return 'METALLISED FILM';
+      if (u.indexOf('LINER') > -1) return 'LINER';
+      if (u.indexOf('FABRIC') > -1) return 'FABRIC';
+      return u;
+    }
     materials.forEach(function (m) {
-      var rules = lengthGroups[String(m.group || '').toUpperCase()];
+      var rules = lengthGroups[webGroupOf(m.group)];
       if (!rules || !rules.length) return;                  // not a running web — no metres, by design
       var len = 0, kg = 0;
       components.forEach(function (c) {
@@ -250,7 +264,10 @@
       var madeAt = -1;
       for (var w = 0; w < live.length; w++) {
         if (live[w].sourcing === 'BUY') continue;          // bought in, not made here
-        if (/FABRIC/i.test(String(producesOf(live[w].process) || ''))) { madeAt = w; break; }
+        /* 4.49.0 — a weaving process whose "produces" was never set still
+           makes the fabric; its own name says so when the master does not. */
+        var made = String(producesOf(live[w].process) || '');
+        if (/FABRIC/i.test(made) || (!made && /WEAV|LOOM|FABRIC/i.test(String(live[w].processName || '')))) { madeAt = w; break; }
       }
       if (madeAt >= 0 && bags > 0) {
         var factor = 1;

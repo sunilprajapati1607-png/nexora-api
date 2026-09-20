@@ -17,7 +17,7 @@ import { activate, authorise, touch, issueToken, reportUsage, companyUsage, desc
 import { runBom } from './engine.js';
 import { adminAuthorised, listLicences, licenceAction, companyAction, saveSettings, recentEvents, ADMIN_HTML } from './admin.js';
 import { login, listUsers, userAction, pull, push, describeUser, userCap, setCompanyPasscode, releaseSession } from './sync.js';
-import { send as chatSend, since as chatSince, remove as chatRemove, listBroadcasts, broadcastAction } from './chat.js';
+import { send as chatSend, since as chatSince, remove as chatRemove, clearBy as chatClearBy, listBroadcasts, broadcastAction } from './chat.js';
 import { ensureInkSchema, getModel, listModels, train as inkTrain, estimate as inkEstimate, reset as inkReset } from './inkstore.js';
 import { register, gstAction, remoteIp } from './register.js';
 import { listInquiries, inquiryAction, publicInquiry } from './inquiry.js';
@@ -169,6 +169,15 @@ export default {
         if (!a.ok) return json(a.error, a.httpStatus);
         const b2 = await readJson(request);
         const out = await chatRemove(a.companyId, a.user, b2 && b2.id);
+        return json(out.body, out.httpStatus);
+      }
+      /* 4.49.0 — everything one person said, taken back at once. */
+      if (path === '/v1/chat/clear' && method === 'POST') {
+        await ensureSchema();
+        const a = await authorise(request);
+        if (!a.ok) return json(a.error, a.httpStatus);
+        const b3 = await readJson(request);
+        const out = await chatClearBy(a.companyId, a.user, b3 && b3.userId);
         return json(out.body, out.httpStatus);
       }
 

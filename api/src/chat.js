@@ -133,6 +133,26 @@ export async function remove(companyId, actor, id) {
   return { httpStatus: 200, body: { message: describe(after) } };
 }
 
+/** 4.49.0 — "chat has user wise clear": everything one person said,
+ *  taken back at once. Your own, or anybody's if you are an administrator.
+ *  The rows stay as "message removed", exactly as a single removal does,
+ *  so the conversation keeps its shape. What Nexora said is not a
+ *  plant's to clear. */
+export async function clearBy(companyId, actor, targetId) {
+  if (!actor) return { httpStatus: 401, body: { error: 'SIGN_IN', message: 'Sign in first.' } };
+  const target = Number(targetId);
+  if (!target) return { httpStatus: 400, body: { error: 'WHO', message: 'Say whose messages to clear.' } };
+  const mine = target === Number(actor.id);
+  if (!mine && actor.role !== 'ADMIN') {
+    return { httpStatus: 403, body: { error: 'NOT_YOURS', message: 'Only an administrator can clear what somebody else said.' } };
+  }
+  const rows = await q(
+    `UPDATE chat_messages SET body = '', tags = '[]'::jsonb, deleted = true
+      WHERE company_id = $1 AND user_id = $2 AND deleted = false RETURNING id`, [companyId, target]);
+  await logEvent(null, 'CHAT_CLEAR', { companyId, target, by: actor.id, n: rows.length });
+  return { httpStatus: 200, body: { ok: true, cleared: rows.map((r) => Number(r.id)) } };
+}
+
 /* ---------------------------------------------------------------------
    4.47.1 — NEXORA SPEAKS IN EVERY ROOM
      "i think can be pushed directly in chat so every user get and
