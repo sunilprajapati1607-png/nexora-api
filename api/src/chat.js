@@ -40,7 +40,11 @@ const MAX_TAGS = 12;
    which window opens it; `ref` is the number or code as the reader would
    type it. Nothing else is stored, because nothing else is needed and
    anything else would be the plant's data leaving the plant. */
-const TAG_KINDS = { CALC: 1, BOM: 1, QUOTE: 1, ITEM: 1 };
+/* 4.47.1 — the masters (4.45.0) and people (4.46.0) were being stripped
+   here: the application tagged them and the service threw the tag away,
+   so "mentioned you" never fired on the live service. Every kind the
+   application writes, and UPDATE, which only Nexora writes (below). */
+const TAG_KINDS = { CALC: 1, BOM: 1, QUOTE: 1, ITEM: 1, RM: 1, STRUCTURE: 1, ROUTE: 1, PROCESS: 1, PERSON: 1, UPDATE: 1 };
 
 function cleanTags(v) {
   if (!Array.isArray(v)) return [];
@@ -127,4 +131,51 @@ export async function remove(companyId, actor, id) {
   await logEvent(null, 'CHAT_DELETE', { companyId, id: Number(id), by: actor.id });
   const after = (await q(`SELECT * FROM chat_messages WHERE id = $1`, [id]))[0];
   return { httpStatus: 200, body: { message: describe(after) } };
+}
+
+/* ---------------------------------------------------------------------
+   4.47.1 — NEXORA SPEAKS IN EVERY ROOM
+     "i think can be pushed directly in chat so every user get and
+      sender will be nexora with like update information"
+   A published build — or anything else Nexora has to tell the plants —
+   is written into EVERY company's room as a message from "Nexora": no
+   user_id (there is no such user), the name written in, the same body in
+   each room. Only the console can do this, behind the admin key; nobody
+   at a plant can write as Nexora, and nobody at a plant can remove what
+   it said (the application does not offer the cross for these rows) —
+   the console withdraws it from every room at once. */
+export async function listBroadcasts() {
+  const rows = await q(
+    `SELECT body, min(at) AS at, count(*)::int AS rooms, min(tags::text) AS tags
+       FROM chat_messages
+      WHERE user_id IS NULL AND name = 'Nexora' AND deleted = false
+      GROUP BY body ORDER BY min(at) DESC LIMIT 30`);
+  return { broadcasts: rows.map((r) => ({ body: r.body, at: r.at, rooms: Number(r.rooms) || 0,
+    tags: (function () { try { return JSON.parse(r.tags || '[]'); } catch (e) { return []; } })() })) };
+}
+
+export async function broadcastAction(body) {
+  const action = String((body && body.action) || 'send').toLowerCase();
+  if (action === 'withdraw') {
+    const text = String((body && body.body) || '');
+    if (!text) return { error: 'EMPTY', message: 'Say which message.' };
+    const rows = await q(
+      `UPDATE chat_messages SET body = '', tags = '[]'::jsonb, deleted = true
+        WHERE user_id IS NULL AND name = 'Nexora' AND body = $1 AND deleted = false RETURNING id`, [text]);
+    await logEvent(null, 'BROADCAST_WITHDRAW', { rooms: rows.length });
+    return { ok: true, rooms: rows.length };
+  }
+  const text = String((body && body.body) || '').trim().slice(0, MAX_BODY);
+  if (!text) return { error: 'EMPTY', message: 'There is nothing to send.' };
+  const tags = cleanTags(body && body.tags);
+  const companies = await q(`SELECT id FROM companies ORDER BY id`);
+  let rooms = 0;
+  for (const c of companies) {
+    await q(
+      `INSERT INTO chat_messages (company_id, user_id, name, body, tags)
+       VALUES ($1, NULL, 'Nexora', $2, $3::jsonb)`, [c.id, text, JSON.stringify(tags)]);
+    rooms++;
+  }
+  await logEvent(null, 'BROADCAST', { rooms, chars: text.length });
+  return { ok: true, rooms };
 }

@@ -17,7 +17,7 @@ import { activate, authorise, touch, issueToken, reportUsage, companyUsage, desc
 import { runBom } from './engine.js';
 import { adminAuthorised, listLicences, licenceAction, companyAction, saveSettings, recentEvents, ADMIN_HTML } from './admin.js';
 import { login, listUsers, userAction, pull, push, describeUser, userCap, setCompanyPasscode, releaseSession } from './sync.js';
-import { send as chatSend, since as chatSince, remove as chatRemove } from './chat.js';
+import { send as chatSend, since as chatSince, remove as chatRemove, listBroadcasts, broadcastAction } from './chat.js';
 import { ensureInkSchema, getModel, listModels, train as inkTrain, estimate as inkEstimate, reset as inkReset } from './inkstore.js';
 import { register, gstAction, remoteIp } from './register.js';
 import { listInquiries, inquiryAction, publicInquiry } from './inquiry.js';
@@ -326,6 +326,9 @@ export default {
         if (path === '/admin/api/feedback' && method === 'GET') return json(await listFeedback());
         if (path === '/admin/api/feedback/shot' && method === 'GET') return json(await feedbackShot(url.searchParams.get('id')));
         if (path === '/admin/api/feedback' && method === 'POST') return json(await feedbackAction(await readJson(request)));
+        /* 4.47.1 — Nexora speaks in every plant's room. */
+        if (path === '/admin/api/broadcast' && method === 'GET') return json(await listBroadcasts());
+        if (path === '/admin/api/broadcast' && method === 'POST') return json(await broadcastAction(await readJson(request)));
         /* 4.44.0 — the phone console's own releases. */
         if (path === '/admin/api/app' && method === 'GET') return json(await listReleases());
         if (path === '/admin/api/app' && method === 'POST') return json(await releaseAction(await readJson(request)));

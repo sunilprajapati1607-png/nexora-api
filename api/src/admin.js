@@ -764,6 +764,7 @@ th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;le
       <a href="#sec-companies">Companies <b id="jump-co">–</b></a>
       <a href="#sec-inquiries">Enquiries <b id="jump-q">–</b></a>
       <a href="#sec-feedback">Feedback &amp; problems <b id="jump-fb">–</b></a>
+      <a href="#sec-broadcast">Message plants</a>
       <a href="#sec-installations">Installations <b id="jump-inst">–</b></a>
       <a href="#appcard">Phone app</a>
       <a href="#settings" onclick="document.getElementById('settings').style.display='';">Service settings</a>
@@ -896,6 +897,25 @@ th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;le
       <p class="help">An enquiry is not a customer. When one becomes a customer, create the company in the ordinary way above; the enquiry stays here as the record of where they came from.</p>
     </div>
 
+    <!-- 4.47.1 — a message from Nexora into every plant's conversation:
+         "pushed directly in chat so every user get and sender will be
+         nexora with like update information". -->
+    <div class="card" id="sec-broadcast">
+      <div class="top" style="margin-bottom:6px">
+        <h2 class="grow">Message every plant <span class="sub" style="font-weight:400">as “Nexora”, in each company&rsquo;s conversation</span></h2>
+        <button onclick="loadBroadcasts()">Refresh</button>
+      </div>
+      <textarea id="bcText" rows="3" style="width:100%;box-sizing:border-box;font:inherit" placeholder="Nexora 4.47.1 is published — Settings → Help → Updates installs it. What changed: …"></textarea>
+      <div class="acts" style="margin:8px 0">
+        <input id="bcVersion" placeholder="Version it announces (optional), e.g. 4.47.1" style="min-width:280px">
+        <button class="primary" onclick="sendBroadcast()">Send to every plant</button>
+      </div>
+      <div id="bcMsg"></div>
+      <div style="overflow-x:auto"><table id="bctbl">
+        <thead><tr><th>Sent</th><th>Says</th><th>Rooms</th><th></th></tr></thead><tbody></tbody></table></div>
+      <p class="help">Appears in every company&rsquo;s conversation as <b>Nexora</b>, with the small popup and the unread count like any other message, and the application looks for an update the moment it arrives. A version named here becomes a tag that opens the plant&rsquo;s update window. Publishing a build sends one of these by itself. <b>Withdraw</b> takes a message back from every room (it stays as &ldquo;message removed&rdquo;).</p>
+    </div>
+
     <!-- 4.45.0 — what the plants say from inside the application:
          Help → Nexora Contact → Send feedback / Report a problem. The
          phone console lists the same rows from the same service. -->
@@ -981,6 +1001,7 @@ async function load(){
     loadInquiries();
     loadReleases();
     loadFeedback();
+    loadBroadcasts();
   }catch(e){
     KEY='';
     document.getElementById('gateErr').innerHTML='<div class="msg err">'+esc(e.message)+'</div>';
@@ -1594,6 +1615,62 @@ async function qDelete(btn){
   if(r.error){qsay('<div class="msg err">'+esc(r.error)+'</div>');return;}
   qsay('<div class="msg ok">Removed.</div>');
   await loadInquiries();
+}
+
+/* ---------- a message from Nexora into every room (4.47.1) ---------- */
+let BCDATA={broadcasts:[]};
+function bcsay(html){
+  const n=document.getElementById('bcMsg');
+  if(!n)return;
+  n.innerHTML=html;
+  if(html)setTimeout(()=>{if(n.innerHTML===html)bcsay('')},6000);
+}
+async function loadBroadcasts(){
+  try{
+    BCDATA=await api('/admin/api/broadcast');
+  }catch(e){
+    BCDATA={broadcasts:[]};
+    document.querySelector('#bctbl tbody').innerHTML=
+      '<tr><td colspan="4" class="help">This service cannot speak in the rooms yet \u2014 deploy the API to switch it on.</td></tr>';
+    return;
+  }
+  renderBroadcasts();
+}
+function renderBroadcasts(){
+  const rows=BCDATA.broadcasts||[];
+  document.querySelector('#bctbl tbody').innerHTML=rows.length?rows.map((b,i)=>
+    '<tr><td><span class="why">'+fmt(b.at)+'</span></td>'+
+    '<td style="white-space:pre-wrap;max-width:560px">'+esc(b.body)+'</td>'+
+    '<td>'+b.rooms+'</td>'+
+    '<td><button class="small" data-i="'+i+'" onclick="withdrawBroadcast(this)">Withdraw</button></td></tr>').join('')
+    :'<tr><td colspan="4" class="help">Nothing sent yet.</td></tr>';
+}
+async function sendBroadcast(){
+  const text=(document.getElementById('bcText').value||'').trim();
+  const v=(document.getElementById('bcVersion').value||'').trim();
+  if(!text){bcsay('<div class="msg err">Write the message first.</div>');return;}
+  if(!confirm('Send this to the conversation of every plant, as Nexora?'))return;
+  const body=v&&text.indexOf(v)<0?text+' ('+v+')':text;
+  const tags=v?[{kind:'UPDATE',ref:v}]:[];
+  try{
+    const r=await api('/admin/api/broadcast',{method:'POST',body:JSON.stringify({action:'send',body:body,tags:tags})});
+    if(r.error)throw new Error(r.message||r.error);
+    bcsay('<div class="msg ok">Sent to '+r.rooms+' room'+(r.rooms===1?'':'s')+'.</div>');
+    document.getElementById('bcText').value='';
+    document.getElementById('bcVersion').value='';
+    await loadBroadcasts();
+  }catch(e){bcsay('<div class="msg err">'+esc(e.message)+'</div>');}
+}
+async function withdrawBroadcast(btn){
+  const b=(BCDATA.broadcasts||[])[+btn.dataset.i];
+  if(!b)return;
+  if(!confirm('Take this message back from every room?'))return;
+  try{
+    const r=await api('/admin/api/broadcast',{method:'POST',body:JSON.stringify({action:'withdraw',body:b.body})});
+    if(r.error)throw new Error(r.message||r.error);
+    bcsay('<div class="msg ok">Withdrawn from '+r.rooms+' room'+(r.rooms===1?'':'s')+'.</div>');
+    await loadBroadcasts();
+  }catch(e){bcsay('<div class="msg err">'+esc(e.message)+'</div>');}
 }
 
 /* ---------- feedback & problem reports (4.45.0) ----------------------
