@@ -116,9 +116,9 @@ export async function companyAction(body) {
   if (action === 'create') {
     const name = String(body.name || '').trim();
     if (!name) return { error: 'A company name is required.' };
-    /* 4.48.0 — the plan; STANDARD is one seat whatever was typed. */
+    /* 4.48.0 — the plan. Seats are the owner's to set on either plan (4.48.1). */
     const plan = cleanPlan(body.plan);
-    const seats = plan === 'STANDARD' ? 1 : Math.max(1, Math.min(500, parseInt(body.seats, 10) || 1));
+    const seats = Math.max(1, Math.min(500, parseInt(body.seats, 10) || 1));
     const grace = Math.max(0, Math.min(365, parseInt(body.graceDays, 10) || 0));
     for (let attempt = 0; attempt < 5; attempt++) {
       const key = newLicenceKey();
@@ -161,11 +161,6 @@ export async function companyAction(body) {
 
   } else if (action === 'seats') {
     const seats = Math.max(1, Math.min(500, parseInt(body.seats, 10) || 1));
-    /* 4.48.0 — STANDARD is one seat by definition; the plan changes first. */
-    const planRow = (await q(`SELECT plan, is_demo FROM companies WHERE id = $1`, [id]))[0];
-    if (planRow && cleanPlan(planRow.plan) === 'STANDARD' && planRow.is_demo !== true && seats > 1) {
-      return { error: 'Standard is one seat. Change the plan to Pro first, then add seats.' };
-    }
     /* Reducing below what is in use is ALLOWED and stops nothing. Silently
        revoking somebody's PC to satisfy a number is exactly the kind of
        data loss rule #29 forbids — so it warns and leaves them running. */
@@ -185,16 +180,11 @@ export async function companyAction(body) {
     if (warn.length) return { ok: true, warning: 'Saved. ' + warn.join(' ') };
 
   } else if (action === 'plan') {
-    /* 4.48.0 — STANDARD or PRO. Going to STANDARD sets the seats to one;
-       people already on the company are not removed (rule #29), the
-       application refuses the next sign-in beyond the seat. */
+    /* 4.48.0 — STANDARD or PRO. Seats are untouched: they are the owner's
+       to set on either plan (4.48.1). */
     const plan = cleanPlan(body.plan);
-    await q(`UPDATE companies SET plan = $2, seats = CASE WHEN $2 = 'STANDARD' THEN 1 ELSE seats END WHERE id = $1`, [id, plan]);
+    await q(`UPDATE companies SET plan = $2 WHERE id = $1`, [id, plan]);
     await logEvent(null, 'ADMIN_COMPANY_PLAN', { id, plan });
-    if (plan === 'STANDARD') {
-      const people = (await q(`SELECT COUNT(*)::int AS n FROM company_users WHERE company_id = $1 AND active = true`, [id]))[0];
-      if (Number(people.n) > 1) return { ok: true, warning: 'Saved as Standard (one seat). ' + people.n + ' people are on this company; nobody was removed, but only one may be signed in and the application refuses the next person.' };
-    }
   } else if (action === 'grace') {
     const grace = Math.max(0, Math.min(365, parseInt(body.graceDays, 10) || 0));
     await q(`UPDATE companies SET grace_days = $2 WHERE id = $1`, [id, grace]);
@@ -708,6 +698,20 @@ label input,label select{font-size:14px;color:var(--text)}
   color:var(--accent);font-size:11px;text-align:center;line-height:18px}
 .jump a b.hot{background:var(--badbg);color:var(--bad)}
 .jump a b.zero{background:var(--bg-sunken);color:var(--muted)}
+/* 4.48.1 — the tabs */
+.jump button.tab{display:inline-flex;align-items:center;gap:7px;padding:7px 14px;border-radius:999px;
+  border:1px solid var(--border);background:var(--bg-elevated);color:var(--text);font-weight:700;
+  font-size:12.5px;cursor:pointer;box-shadow:var(--shadow-sm);font:inherit;font-weight:700}
+.jump button.tab:hover{border-color:var(--accent);color:var(--accent)}
+.jump button.tab.active{background:var(--accent);border-color:var(--accent);color:#fff}
+.jump button.tab.active b{background:rgba(255,255,255,.22);color:#fff}
+.jump button.tab b{display:inline-block;min-width:18px;padding:0 6px;border-radius:999px;background:var(--accentbg);
+  color:var(--accent);font-size:11px;text-align:center;line-height:18px}
+.jump button.tab b.hot{background:var(--badbg);color:var(--bad)}
+.jump button.tab b.zero{background:var(--bg-sunken);color:var(--muted)}
+.jump button.tab.active b.hot,.jump button.tab.active b.zero{background:rgba(255,255,255,.22);color:#fff}
+#app>.card.sec{display:none}
+#app>.card.sec.on{display:block}
 .say{white-space:pre-wrap;max-width:380px;display:block;line-height:1.45}
 table{width:100%;border-collapse:collapse;font-size:13px}
 th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--border);vertical-align:middle}
@@ -778,18 +782,21 @@ th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;le
         <span class="mode-mark mode-sun">\u2600</span><span class="mode-mark mode-moon">\u263e</span>
         <span class="mode-knob">\u2600</span></button>
       <button onclick="load()">Refresh</button>
-      <button data-target="settings" onclick="toggle(this)">Service settings</button>
+      <button onclick="showSec('settings')">Service settings</button>
       <button onclick="signOut()" title="Forget the key in this browser tab">Sign out</button>
     </div>
-    <nav class="jump" id="jump">
-      <a href="#sec-companies">Companies <b id="jump-co">–</b></a>
-      <a href="#sec-plans">Plans</a>
-      <a href="#sec-inquiries">Enquiries <b id="jump-q">–</b></a>
-      <a href="#sec-feedback">Feedback &amp; problems <b id="jump-fb">–</b></a>
-      <a href="#sec-broadcast">Message plants</a>
-      <a href="#sec-installations">Installations <b id="jump-inst">–</b></a>
-      <a href="#appcard">Phone app</a>
-      <a href="#settings" onclick="document.getElementById('settings').style.display='';">Service settings</a>
+    <!-- 4.48.1 — TABS. "make tab in console its look still tricky": one
+         section on screen at a time, the counts on the tabs, the last tab
+         remembered in this browser. -->
+    <nav class="jump tabs" id="jump">
+      <button class="tab" data-sec="sec-companies" onclick="showSec('sec-companies')">Companies <b id="jump-co">–</b></button>
+      <button class="tab" data-sec="sec-plans" onclick="showSec('sec-plans')">Plans</button>
+      <button class="tab" data-sec="sec-inquiries" onclick="showSec('sec-inquiries')">Enquiries <b id="jump-q">–</b></button>
+      <button class="tab" data-sec="sec-feedback" onclick="showSec('sec-feedback')">Feedback &amp; problems <b id="jump-fb">–</b></button>
+      <button class="tab" data-sec="sec-broadcast" onclick="showSec('sec-broadcast')">Message plants</button>
+      <button class="tab" data-sec="sec-installations" onclick="showSec('sec-installations')">Installations <b id="jump-inst">–</b></button>
+      <button class="tab" data-sec="appcard" onclick="showSec('appcard')">Phone app</button>
+      <button class="tab" data-sec="settings" onclick="showSec('settings')">Service settings</button>
     </nav>
 
     <div class="card" id="settings" style="display:none">
@@ -817,7 +824,7 @@ th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;le
       <div style="overflow-x:auto"><table id="plantbl">
         <thead><tr><th>Feature</th><th>Standard</th><th>Pro</th><th>Demo</th></tr></thead><tbody></tbody></table></div>
       <div id="plMsg"></div>
-      <p class="help">Calculation and costing are the product and are always on. A feature unticked for a plan disappears from every installation on that plan &mdash; its window, button and shortcut &mdash; and the application says it belongs to the other plan when somebody asks for it. <b>Standard is one seat.</b> A <b>demo</b> always has everything, whatever its plan, so a prospect sees the whole application. Each company&rsquo;s plan is set under Manage &rarr; Licence.</p>
+      <p class="help">Calculation and costing are the product and are always on. A feature unticked for a plan disappears from every installation on that plan &mdash; its window, button and shortcut &mdash; and the application says it belongs to the other plan when somebody asks for it. Seats are separate from the plan: you decide how many people each company may have, on either plan. A <b>demo</b> always has everything, whatever its plan, so a prospect sees the whole application. Each company&rsquo;s plan is set on its card.</p>
     </div>
 
     <div class="card" id="sec-companies">
@@ -829,7 +836,7 @@ th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;le
       <div id="newco" style="display:none;border:1px solid var(--border);border-radius:10px;padding:12px;margin:8px 0 12px">
         <div class="row">
           <label>Company name<input id="nName" placeholder="Company name" style="min-width:220px"></label>
-          <label>Plan<select id="nPlan"><option value="PRO">Pro — everything</option><option value="STANDARD">Standard — one seat, calculation &amp; costing</option></select></label>
+          <label>Plan<select id="nPlan"><option value="PRO">Pro — everything</option><option value="STANDARD">Standard — calculation &amp; costing</option></select></label>
           <label>Seats<input id="nSeats" type="number" min="1" max="500" value="1" style="width:80px"></label>
           <label>Licence days<input id="nDays" type="number" min="1" max="3650" value="365" style="width:90px"></label>
           <label>Offline days<input id="nGrace" type="number" min="0" max="365" value="0" style="width:90px"></label>
@@ -843,7 +850,7 @@ th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;le
       <div id="coMsg"></div>
       <div id="colist"></div>
       <div class="legend">
-        <div><b>Plan</b>is Standard (one seat; calculation and costing) or Pro (everything ticked under Plans). A demo has everything until it is made licensed.</div>
+        <div><b>Plan</b>is Standard (calculation and costing) or Pro (everything ticked under Plans); seats are set separately. A demo has everything until it is made licensed.</div>
         <div><b>Suspend</b>stops every machine of the company at its next check. Nothing is deleted; Restore puts it all back. Use it when a customer has not paid.</div>
         <div><b>Revoke</b>(on one installation) stops that one machine. It frees no seat — seats are people, and a machine never held one. The company keeps running.</div>
         <div><b>Delete</b>removes the company, its machines, its people and everything they synced. It cannot be undone from here — the name must be typed to confirm.</div>
@@ -1033,6 +1040,7 @@ async function load(){
     document.getElementById('sOpen').checked=!!s.signupsOpen;
     document.getElementById('sDemo').checked=!!s.demoSignup;
     renderPlans();
+    showSec(currentSec());
     renderCompanies();
     render();
     /* 4.42.0 — the leads come with everything else, and never hold up the
@@ -1092,7 +1100,7 @@ function renderCompanies(){
         '<div class="grow" style="flex:1">'+
           '<span class="co-name">'+esc(c.name)+'</span> '+
           '<span class="pill s-'+state+'">'+(state==='DEMO'?'demo':state.toLowerCase())+'</span> '+
-          (c.is_demo?'':'<span class="pill s-'+(c.plan==='STANDARD'?'SELF':'LICENSED')+'" title="'+(c.plan==='STANDARD'?'Standard: one seat, calculation and costing':'Pro: everything')+'">'+(c.plan==='STANDARD'?'standard':'pro')+'</span> ')+
+          (c.is_demo?'':'<span class="pill s-'+(c.plan==='STANDARD'?'SELF':'LICENSED')+'" title="'+(c.plan==='STANDARD'?'Standard: calculation and costing':'Pro: everything')+'">'+(c.plan==='STANDARD'?'standard':'pro')+'</span> ')+
           (c.self_registered?'<span class="pill s-SELF" title="Registered by the plant itself on '+esc(fmt(c.registered_at))+(c.registered_ip?' from '+esc(c.registered_ip):'')+'">self-registered</span> ':'')+
           (c.gstin?gstPill(c):'')+
           '<div class="co-meta">'+
@@ -1113,7 +1121,7 @@ function renderCompanies(){
            computer with nobody signed in can only read, charging for it
            would be charging for a locked door. */
         '<div class="fact"><span>Plan</span><b>'+(c.is_demo?'demo':(c.plan==='STANDARD'?'Standard':'Pro'))+'</b>'+
-          '<small>'+(c.is_demo?'everything, while it is a demo':(c.plan==='STANDARD'?'one seat \u00b7 calculation and costing':'every feature'))+'</small></div>'+
+          '<small>'+(c.is_demo?'everything, while it is a demo':(c.plan==='STANDARD'?'calculation and costing':'every feature'))+'</small></div>'+
         '<div class="fact"><span>Seats (people)</span><b>'+used+' of '+seats+'</b>'+
           '<small>'+(seats-used>0?(seats-used)+' available':'none available')+'</small>'+
           '<span class="bar'+(used>=seats?' full':'')+'"><i style="width:'+pct+'%"></i></span></div>'+
@@ -1128,7 +1136,7 @@ function renderCompanies(){
       '<div class="manage'+(open?' open':'')+'" id="mg-'+c.id+'">'+
         '<div class="group"><h4>Licence</h4><div class="acts">'+
           (c.is_demo?'<button class="primary" data-id="'+c.id+'" data-action="licence" data-days="365" onclick="coAct(this)">Make licensed for 1 year</button><span class="why">turns this demo into a paying customer</span>':'')+
-          '<button data-id="'+c.id+'" data-plan="'+esc(c.plan||'PRO')+'" onclick="coPlan(this)">Plan: '+(c.plan==='STANDARD'?'Standard':'Pro')+'…</button><span class="why">Standard = one seat, calculation and costing; Pro = everything under Plans above</span>'+
+          '<button data-id="'+c.id+'" data-plan="'+esc(c.plan||'PRO')+'" onclick="coPlan(this)">Plan: '+(c.plan==='STANDARD'?'Standard':'Pro')+'…</button><span class="why">Standard = calculation and costing; Pro = everything ticked under Plans. Seats are set separately.</span>'+
           '<button data-id="'+c.id+'" onclick="coDays(this)">Add days…</button>'+
           '<button data-id="'+c.id+'" data-action="extend" data-days="365" onclick="coAct(this)">+1 year</button>'+
         '</div></div>'+
@@ -1190,8 +1198,19 @@ async function coDays(btn){
   if(!(days>0)){say('<div class="msg err">Enter a number of days.</div>');return;}
   btn.dataset.action='extend';btn.dataset.days=String(days);await coAct(btn);
 }
+/* ---------- the tabs (4.48.1) ---------- */
+const SECS=['sec-companies','sec-plans','sec-inquiries','sec-feedback','sec-broadcast','sec-installations','appcard','settings'];
+function showSec(id){
+  if(SECS.indexOf(id)<0)id='sec-companies';
+  SECS.forEach(s=>{const n=document.getElementById(s);if(!n)return;n.classList.add('sec');n.classList.toggle('on',s===id);if(s===id)n.style.display='';});
+  document.querySelectorAll('#jump .tab').forEach(t=>t.classList.toggle('active',t.dataset.sec===id));
+  try{sessionStorage.setItem('nexora_admin_tab',id);}catch(e){}
+  window.scrollTo({top:0});
+}
+function currentSec(){try{return sessionStorage.getItem('nexora_admin_tab')||'sec-companies';}catch(e){return 'sec-companies';}}
 /* ---------- plans (4.48.0) ---------- */
-const PLAN_LABELS={quotation:'Quotation',chat:'Company conversation (chat)',notes:'Notes pad',bomWorkflow:'BOM workflow automation',onlinePrices:'Prices from the producer\u2019s list',bagView:'3D bag view',ink:'Ink assumption',sharing:'Email & WhatsApp sharing'};
+const PLAN_LABELS={quotation:'Quotation',chat:'Company conversation (chat)',notes:'Notes pad',bomWorkflow:'BOM workflow automation',onlinePrices:'Prices from the producer\u2019s list',bagView:'3D bag view',ink:'Ink assumption',sharing:'Email & WhatsApp sharing',
+  exportExcel:'Export to Excel',exportPdf:'Export to PDF',priceHistory:'RM price history (price versions)',activityLog:'Activity log',backup:'Backup & restore',numberSeries:'Document number series',tableSettings:'Table Settings (own column names)'};
 function renderPlans(){
   const m=(DATA.settings&&DATA.settings.planFeatures)||{STANDARD:{},PRO:{}};
   const tb=document.querySelector('#plantbl tbody');
@@ -1215,7 +1234,7 @@ async function savePlans(){
 async function coPlan(btn){
   const now=btn.dataset.plan==='STANDARD'?'STANDARD':'PRO';
   const next=now==='STANDARD'?'PRO':'STANDARD';
-  if(!confirm('Change this company from '+(now==='STANDARD'?'Standard':'Pro')+' to '+(next==='STANDARD'?'Standard (one seat, calculation and costing)':'Pro (everything)')+'?'))return;
+  if(!confirm('Change this company from '+(now==='STANDARD'?'Standard':'Pro')+' to '+(next==='STANDARD'?'Standard (calculation and costing)':'Pro (everything)')+'?'))return;
   const r=await api('/admin/api/company',{method:'POST',body:JSON.stringify({id:+btn.dataset.id,action:'plan',plan:next})});
   if(r.error){say('<div class="msg err">'+esc(r.error)+'</div>');return;}
   if(r.warning)say('<div class="msg warn">'+esc(r.warning)+'</div>');
@@ -1844,7 +1863,7 @@ async function fbShot(btn){
 }
 
 /* ---------- installations ---------- */
-function showInstallations(btn){COFILTER=+btn.dataset.id;render();document.getElementById('tbl').scrollIntoView({behavior:'smooth',block:'start'});}
+function showInstallations(btn){COFILTER=+btn.dataset.id;render();showSec('sec-installations');document.getElementById('tbl').scrollIntoView({behavior:'smooth',block:'start'});}
 function clearCompanyFilter(){COFILTER=null;render();}
 function render(){
   const term=(document.getElementById('q').value||'').toLowerCase();

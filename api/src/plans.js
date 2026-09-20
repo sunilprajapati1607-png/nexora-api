@@ -16,7 +16,8 @@
  * is the things a plant may or may not have paid for on top.
  *
  * A DEMO always answers with everything on, whatever its plan says: a
- * prospect is shown the whole application. A company that existed before
+ * prospect is shown the whole application. SEATS are not a plan matter
+ * (4.48.1): Nexora sets them per company, on either plan. A company that existed before
  * plans reads as PRO, which is what it has been getting.
  */
 
@@ -33,7 +34,15 @@ export const PLAN_FEATURES = [
   { id: 'onlinePrices', label: 'Prices from the producer’s list', standard: false },
   { id: 'bagView',      label: '3D bag view',                        standard: false },
   { id: 'ink',          label: 'Ink assumption',                     standard: false },
-  { id: 'sharing',      label: 'Email & WhatsApp sharing',           standard: false }
+  { id: 'sharing',      label: 'Email & WhatsApp sharing',           standard: false },
+  /* 4.48.1 — "u can add more feature under plan section" */
+  { id: 'exportExcel',  label: 'Export to Excel',                    standard: false },
+  { id: 'exportPdf',    label: 'Export to PDF',                      standard: true  },
+  { id: 'priceHistory', label: 'RM price history (price versions)',  standard: false },
+  { id: 'activityLog',  label: 'Activity log',                       standard: false },
+  { id: 'backup',       label: 'Backup & restore',                   standard: true  },
+  { id: 'numberSeries', label: 'Document number series',             standard: false },
+  { id: 'tableSettings', label: 'Table Settings (own column names)', standard: false }
 ];
 
 export const PLANS = ['STANDARD', 'PRO'];

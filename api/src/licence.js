@@ -341,11 +341,11 @@ function describeState(row, company, settings) {
     isDemo: co.is_demo === true,
     graceDays,
     /* 4.48.0 — the plan, and the features it resolves to. A demo is
-       always PRO with everything on; a STANDARD company is one seat. */
+       always PRO with everything on. Seats are set per company by Nexora
+       and have nothing to do with the plan (4.48.1). */
     plan: co.is_demo === true ? 'PRO' : cleanPlan(co.plan),
     features: featuresFor(co.plan, settings, co.is_demo === true)
   } : null;
-  if (profile && profile.plan === 'STANDARD') { profile.seats = 1; profile.maxUsers = 1; }
 
   const base = { expiresAt, offlineMinutes, company: profile };
 
