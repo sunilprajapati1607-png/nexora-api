@@ -20,7 +20,7 @@
  *        ↓ priced, then each stage adds its own material + resources
  *      cost per bag
  *
- * Four bases for a line, because not everything is a share of mass:
+ * Five bases for a line, because not everything is a share of mass:
  *   PCT       — % of this stage's gross quantity (granules, coating, film)
  *   PER1000   — kg per 1000 bags (yarn, handle, liner, zipper — per-piece
  *               items whose consumption follows bag count, not weight)
@@ -29,6 +29,11 @@
  *               knows the body base-fabric, coating, BOPP, metallised, patch,
  *               valve, yarn, liner and tape weights per bag, so the BOM can
  *               use them instead of anyone re-typing a percentage.
+ *   PART_G    — grams per bag of a NAMED figure from the calculation
+ *               (partWeights.js: a part’s fabric, coating, BOPP
+ *               component, whole part…), grossed by this stage’s waste,
+ *               so the stage is issued what it must be FED rather than
+ *               what comes out the far end. Added 4.53.0.
  *   ABS       — an absolute kg figure for the whole order.
  *
  * A line's material is either a raw material (src RM) or the OUTPUT OF AN
@@ -159,7 +164,7 @@
     }
     if (bagWeightG <= 0) errors.push('Bag weight must be greater than zero — the calculation has to be valid first.');
 
-    const BASES = { PCT: 1, PER1000: 1, PERBAG_G: 1, ABS: 1 };
+    const BASES = { PCT: 1, PER1000: 1, PERBAG_G: 1, PART_G: 1, ABS: 1 };
     const BASES_RES = { KG: 1, BAG: 1, PER1000: 1 };
     const stages = steps.map((st, i) => {
       const key = i + '|' + st.p;
@@ -227,10 +232,38 @@
     const demand = stages.map(() => 0);
     if (n) demand[n - 1] = fgKg;
 
-    function qtyOf(l, grossKg) {
+    /* 4.53.0 — PART_G: grams per bag of a named figure from the weight
+       calculation (a part's fabric, coating, BOPP component…), GROSSED
+       by this stage's waste.
+
+         "1000 lamination required in 3l: 600kg fabric, 100kg bopp and
+          rest 300kg rm — if it will push as per substract weight then i
+          don't have issue"
+
+       Those 600/100/300 are what ENDS UP in the laminate. To hand 1,000
+       kg of good laminate to the next stage at 3 % waste the machine
+       must be FED 1,030.9 kg, so it must be issued 618.6 / 103.1 /
+       309.3. A line stating the finished content and never grossing it
+       leaves the stage short by exactly its waste — every time.
+
+       This falls out identically to the layer percentages the Suggest
+       button already produces, which is the check: a part weight that is
+       60 % of the part, and a PCT line typed as 60, issue the same
+       kilograms to the last decimal (`partbom.test.js`).
+
+       PERBAG_G is NOT changed. It is the basis every existing BOM,
+       recipe and workflow was built on — yarn, handle, liner, easy-open
+       tapes — and moving it would move saved costings. A new basis moves
+       nothing that exists. */
+    function qtyOf(l, grossKg, wastePct) {
       if (l.basis === 'PCT') return grossKg * (l.value / 100);
       if (l.basis === 'PER1000') return (bags / 1000) * l.value;
       if (l.basis === 'PERBAG_G') return (bags * l.value) / 1000;
+      if (l.basis === 'PART_G') {
+        const yieldOf = 1 - num(wastePct) / 100;
+        const net = (bags * l.value) / 1000;
+        return yieldOf > 0 ? net / yieldOf : net;
+      }
       return l.value;                       // ABS — kg for the whole order
     }
 
@@ -251,7 +284,7 @@
       let addedKg = 0, sfgKg = 0, hasSfg = false;
       s.lines.forEach((l) => {
         if (l.invalid) { l.kg = 0; return; }
-        l.kg = mround(qtyOf(l, s.grossKg), qtyStep);
+        l.kg = mround(qtyOf(l, s.grossKg, s.wastePct), qtyStep);
         if (l.src === 'SFG') {
           hasSfg = true; sfgKg += l.kg;
           demand[l.sfgStep] += l.kg;        // pull it from that stage
