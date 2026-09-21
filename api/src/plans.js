@@ -42,7 +42,12 @@ export const PLAN_FEATURES = [
   { id: 'activityLog',  label: 'Activity log',                       standard: false },
   { id: 'backup',       label: 'Backup & restore',                   standard: true  },
   { id: 'numberSeries', label: 'Document number series',             standard: false },
-  { id: 'tableSettings', label: 'Table Settings (own column names)', standard: false }
+  { id: 'tableSettings', label: 'Table Settings (own column names)', standard: false },
+  /* 4.51.0 — "this bom mlm will be feature and also add this in
+     console, user can use it or use it normal standard suggetion also".
+     With it off, the BOM behaves exactly as it always did: an empty
+     section stays empty and Suggest is pressed by hand. */
+  { id: 'sectionSuggest', label: 'BOM sections learned from the plant', standard: false }
 ];
 
 export const PLANS = ['STANDARD', 'PRO'];

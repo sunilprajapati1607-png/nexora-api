@@ -1210,7 +1210,7 @@ function showSec(id){
 function currentSec(){try{return sessionStorage.getItem('nexora_admin_tab')||'sec-companies';}catch(e){return 'sec-companies';}}
 /* ---------- plans (4.48.0) ---------- */
 const PLAN_LABELS={quotation:'Quotation',chat:'Company conversation (chat)',notes:'Notes pad',bomWorkflow:'BOM workflow automation',onlinePrices:'Prices from the producer\u2019s list',bagView:'3D bag view',ink:'Ink assumption',sharing:'Email & WhatsApp sharing',
-  exportExcel:'Export to Excel',exportPdf:'Export to PDF',priceHistory:'RM price history (price versions)',activityLog:'Activity log',backup:'Backup & restore',numberSeries:'Document number series',tableSettings:'Table Settings (own column names)'};
+  exportExcel:'Export to Excel',exportPdf:'Export to PDF',priceHistory:'RM price history (price versions)',activityLog:'Activity log',backup:'Backup & restore',numberSeries:'Document number series',tableSettings:'Table Settings (own column names)',sectionSuggest:'BOM sections learned from the plant'};
 function renderPlans(){
   const m=(DATA.settings&&DATA.settings.planFeatures)||{STANDARD:{},PRO:{}};
   const tb=document.querySelector('#plantbl tbody');
