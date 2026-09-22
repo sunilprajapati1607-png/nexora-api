@@ -47,7 +47,11 @@ export const PLAN_FEATURES = [
      console, user can use it or use it normal standard suggetion also".
      With it off, the BOM behaves exactly as it always did: an empty
      section stays empty and Suggest is pressed by hand. */
-  { id: 'sectionSuggest', label: 'BOM sections learned from the plant', standard: false }
+  /* 4.55.0 — named for what it is. The console showed "BOM sections
+     learned from the plant", which describes one thing it does; the
+     owner sells it as the learning itself, and asked for it to stand
+     beside workflow automation as its own line on the plan. */
+  { id: 'sectionSuggest', label: 'BOM learning (MLM)', standard: false }
 ];
 
 export const PLANS = ['STANDARD', 'PRO'];
