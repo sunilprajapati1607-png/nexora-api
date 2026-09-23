@@ -255,15 +255,29 @@
        recipe and workflow was built on — yarn, handle, liner, easy-open
        tapes — and moving it would move saved costings. A new basis moves
        nothing that exists. */
-    function qtyOf(l, grossKg, wastePct) {
+    /* 4.58.6 — …AND BY THE WASTE OF EVERY STAGE AFTER IT.
+
+         "cost hamesa first tab na last stage nu j ganavu joiye"
+
+       Grams per bag are what ends up in the FINISHED bag. A stage that
+       sits before segregation and packing, which lose some bags too, must
+       make enough for those losses as well — or the last stage hands over
+       fewer kilograms than the order, and the cost per kilogram read at
+       block bottom is not the cost per kilogram of the bag.
+
+       So a PART_G line is grossed by its own yield AND the yields of the
+       stages its output passes through on the way to the bag, followed
+       exactly as the material flows: a stage that names the stage it
+       takes from sends its factor there, one that does not sends it to
+       the stage before it. On the last stage the factor is its own yield
+       only — exactly what 4.53.0 did — so a PART_G line there, or on a
+       route with no waste after it, issues what it always issued. */
+    const reach = downstreamFactors(stages);
+    function qtyOf(l, grossKg, wastePct, i) {
       if (l.basis === 'PCT') return grossKg * (l.value / 100);
       if (l.basis === 'PER1000') return (bags / 1000) * l.value;
       if (l.basis === 'PERBAG_G') return (bags * l.value) / 1000;
-      if (l.basis === 'PART_G') {
-        const yieldOf = 1 - num(wastePct) / 100;
-        const net = (bags * l.value) / 1000;
-        return yieldOf > 0 ? net / yieldOf : net;
-      }
+      if (l.basis === 'PART_G') return ((bags * l.value) / 1000) * reach[i];
       return l.value;                       // ABS — kg for the whole order
     }
 
@@ -284,7 +298,7 @@
       let addedKg = 0, sfgKg = 0, hasSfg = false;
       s.lines.forEach((l) => {
         if (l.invalid) { l.kg = 0; return; }
-        l.kg = mround(qtyOf(l, s.grossKg, s.wastePct), qtyStep);
+        l.kg = mround(qtyOf(l, s.grossKg, s.wastePct, i), qtyStep);
         if (l.src === 'SFG') {
           hasSfg = true; sfgKg += l.kg;
           demand[l.sfgStep] += l.kg;        // pull it from that stage
@@ -490,6 +504,31 @@
     };
   }
 
+  /** 4.58.6 — for each stage, the kilograms it must be fed per kilogram of
+   *  finished bag: 1 ÷ (its yield × the yields downstream of it). Walked
+   *  backwards along the flow: a stage with an "earlier stage" row sends
+   *  its factor to that stage, one without sends it to the stage before.
+   *  The first (latest) consumer decides; a stage nothing draws from
+   *  counts from the finished bag. Waste of 100 % or more is read as 0,
+   *  the same as the roll-up reads it. */
+  function downstreamFactors(stages) {
+    const n = stages.length;
+    const into = stages.map(() => null);
+    const out = stages.map(() => 1);
+    if (n) into[n - 1] = 1;
+    for (let i = n - 1; i >= 0; i--) {
+      const s = stages[i];
+      const w = num(s.wastePct);
+      const y = w > 0 && w < 100 ? 1 - w / 100 : 1;
+      const f = (into[i] === null ? 1 : into[i]) / y;
+      out[i] = f;
+      const sfg = (s.lines || []).filter((l) => l.src === 'SFG' && !l.invalid && l.sfgStep !== null && l.sfgStep < i);
+      if (sfg.length) sfg.forEach((l) => { if (into[l.sfgStep] === null) into[l.sfgStep] = f; });
+      else if (i > 0 && into[i - 1] === null) into[i - 1] = f;
+    }
+    return out;
+  }
+
   /* ---- the calculation basis -------------------------------------------
      Turns {mode, value} into the bag count everything else is built from,
      and says in words where that came from and how — a number on a costing
@@ -542,5 +581,5 @@
 
   function fmtKg(v) { return (Math.round(v * 100) / 100).toFixed(2); }
 
-  return { build, resolveBasis, helpers: { mround, r3 } };
+  return { build, resolveBasis, downstreamFactors, helpers: { mround, r3 } };
 });
