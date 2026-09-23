@@ -347,7 +347,22 @@ function describeState(row, company, settings) {
     features: featuresFor(co.plan, settings, co.is_demo === true)
   } : null;
 
-  const base = { expiresAt, offlineMinutes, company: profile };
+  /* 4.57.0 — WHEN IT STARTED, not only when it ends.
+
+       "licence ke demo kai date thi start thayo ane kyare patese"
+
+     The company's CURRENT stretch where there is a company — renewed
+     last Tuesday means Tuesday, not the day the customer first
+     downloaded a demo. Where there is no company yet, the machine's own
+     trial_started_at, which is the same fact for a device that has not
+     been adopted. periodDays counts the stretch in IST calendar days,
+     exactly as daysLeft counts what is left of it, so the application
+     and the console can never disagree by a day. */
+  const startedAt = (co && (co.period_started_at || co.created_at)) || row.trial_started_at || null;
+  const periodDays = startedAt
+    ? Math.max(0, istDay(new Date(expiresAt).getTime()) - istDay(new Date(startedAt).getTime()))
+    : null;
+  const base = { expiresAt, startedAt, periodDays, offlineMinutes, company: profile };
 
   /* Order matters: the narrowest refusal is checked first, so a revoked
      device inside a healthy company is still refused. */

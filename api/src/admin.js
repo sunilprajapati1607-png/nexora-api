@@ -68,6 +68,12 @@ export async function listCompanies() {
   const rows = await q(`
     SELECT c.id, c.name, c.licence_key, c.email, c.phone, c.state, c.seats, c.gstin,
            c.grace_days, c.is_demo, c.expires_at, c.created_at, c.notes, c.txn_limit, c.plan,
+           /* 4.57.0 - when THIS stretch began, and how long it is. Both
+              in SQL, in IST like days_left, so the console and the
+              Android app cannot disagree with each other by a day. */
+           COALESCE(c.period_started_at, c.created_at) AS period_started_at,
+           GREATEST(0, ((c.expires_at AT TIME ZONE INTERVAL '+05:30')::date
+                        - (COALESCE(c.period_started_at, c.created_at) AT TIME ZONE INTERVAL '+05:30')::date))::int AS period_days,
            /* 4.23.0 — self-registration: who registered, from where, and
               what the GST check said. The passcode hash is never listed. */
            c.login_id, c.self_registered, c.registered_ip, c.registered_device, c.registered_at,
@@ -146,16 +152,23 @@ export async function companyAction(body) {
 
   if (action === 'extend') {
     /* From whichever is later, so extending a live licence adds time
-       rather than shortening it. */
+       rather than shortening it.
+
+       4.57.0 — and the stretch starts again TODAY, because that is the
+       honest answer to "when did this start": a licence extended on
+       Tuesday began on Tuesday, not on the day the customer first
+       downloaded a demo. */
     await q(`UPDATE companies
-                SET expires_at = nexora_eod(GREATEST(now(), expires_at) + make_interval(days => $2::int))
+                SET expires_at = nexora_eod(GREATEST(now(), expires_at) + make_interval(days => $2::int)),
+                    period_started_at = now()
               WHERE id = $1`, [id, days]);
     await logEvent(null, 'ADMIN_COMPANY_EXTEND', { id, days });
 
   } else if (action === 'licence') {
     await q(`UPDATE companies
                 SET state = 'LICENSED', is_demo = false,
-                    expires_at = nexora_eod(GREATEST(now(), expires_at) + make_interval(days => $2::int))
+                    expires_at = nexora_eod(GREATEST(now(), expires_at) + make_interval(days => $2::int)),
+                    period_started_at = now()
               WHERE id = $1`, [id, days]);
     await logEvent(null, 'ADMIN_COMPANY_LICENCE', { id, days });
 
@@ -498,7 +511,8 @@ export async function licenceAction(body) {
       return { ok: true, scope: 'device' };
     }
     await q(`UPDATE companies
-                SET expires_at = nexora_eod(GREATEST(now(), expires_at) + make_interval(days => $2::int))
+                SET expires_at = nexora_eod(GREATEST(now(), expires_at) + make_interval(days => $2::int)),
+                    period_started_at = now()
                   ${action === 'licence' ? ", state = 'LICENSED', is_demo = false" : ''}
               WHERE id = $1`, [companyId, days]);
     await logEvent(deviceId, action === 'licence' ? 'ADMIN_LICENCE' : 'ADMIN_EXTEND',
@@ -1127,6 +1141,11 @@ function renderCompanies(){
           '<span class="bar'+(used>=seats?' full':'')+'"><i style="width:'+pct+'%"></i></span></div>'+
         '<div class="fact"><span>Computers</span><b>'+(c.machines_used||0)+'</b>'+
           '<small>not counted against seats</small></div>'+
+        /* 4.57.0 - WHEN IT STARTED, beside when it ends. "Days left 3"
+           is a number with no scale: three of seven is a demo about to
+           lapse, three of 365 is next year's conversation. */
+        '<div class="fact"><span>'+(c.is_demo?'Demo started':'Licence started')+'</span><b>'+fmt(c.period_started_at)+'</b>'+
+          '<small>'+(c.period_days?c.period_days+'-day '+(c.is_demo?'demo':'licence'):'\u2014')+'</small></div>'+
         '<div class="fact"><span>'+(state==='EXPIRED'?'Ended':state==='SUSPENDED'?'Suspended · ends':'Days left')+'</span><b>'+(state==='EXPIRED'||state==='SUSPENDED'?fmt(c.expires_at):(c.days_left===0?'today':c.days_left))+'</b>'+(state==='EXPIRED'||state==='SUSPENDED'?'':'<small>'+fmt(c.expires_at)+'</small>')+'</div>'+
         '<div class="fact"><span>Offline allowed</span><b>'+(c.grace_days>0?c.grace_days+' days':'none')+'</b>'+(c.grace_days>0?'':'<small>stops when it cannot reach the service</small>')+'</div>'+
         '<div class="fact"><span>Transactions</span>'+txnCell(c.txn_used,c.txn_limit)+'</div>'+

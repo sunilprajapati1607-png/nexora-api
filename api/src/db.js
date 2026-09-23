@@ -106,6 +106,22 @@ export function ensureSchema() {
        PRO (everything). Every company that already exists reads PRO,
        which is what it has been getting; a demo answers PRO regardless. */
     await q(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS plan TEXT NOT NULL DEFAULT 'PRO'`);
+    /* 4.57.0 — WHEN THIS STRETCH BEGAN.
+
+         "licence ke demo kai date thi start thayo ane kyare patese"
+
+       expires_at said when it ends and days_left said how far off that
+       was, but nothing said when it STARTED — so "3 days left" had no
+       scale. Three of seven and three of three hundred and sixty-five
+       read identically and mean nothing like the same thing.
+
+       Not created_at, which is when the COMPANY was made: right for a
+       demo, and a year out of date for a licence that has been renewed
+       twice since. This is the current stretch, reset whenever the
+       clock is actually moved. Every company that exists today is
+       backfilled from created_at, which IS when its demo began. */
+    await q(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS period_started_at TIMESTAMPTZ`);
+    await q(`UPDATE companies SET period_started_at = created_at WHERE period_started_at IS NULL`);
     await q(`CREATE INDEX IF NOT EXISTS companies_gstin_idx ON companies (gstin)`);
 
     /* ADD COLUMN IF NOT EXISTS is the safe form: it does nothing on a
