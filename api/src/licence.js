@@ -608,6 +608,12 @@ export async function authorise(request) {
           where: (on && on.device_name) || 'another computer' };
       } else {
         user = u;
+        /* 4.58.1 — "last active": at most once a minute, and never allowed
+           to fail the call it rides on */
+        try {
+          await q(`UPDATE company_users SET last_seen_at = now()
+                    WHERE id = $1 AND (last_seen_at IS NULL OR last_seen_at < now() - interval '1 minute')`, [u.id]);
+        } catch (e) { /* a counter never fails a request */ }
       }
     }
   }

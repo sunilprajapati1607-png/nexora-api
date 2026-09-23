@@ -795,7 +795,7 @@ th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;le
       <button class="mode-switch" id="mode-switch" role="switch" aria-checked="false" onclick="flipMode()" title="Light \u2014 click for dark">
         <span class="mode-mark mode-sun">\u2600</span><span class="mode-mark mode-moon">\u263e</span>
         <span class="mode-knob">\u2600</span></button>
-      <button onclick="load()">Refresh</button>
+      <button id="refreshBtn" onclick="refreshNow()">Refresh</button><span class="sub" id="refreshed" style="align-self:center"></span>
       <button onclick="showSec('settings')">Service settings</button>
       <button onclick="signOut()" title="Forget the key in this browser tab">Sign out</button>
     </div>
@@ -1029,6 +1029,31 @@ function flipMode(){setMode(document.documentElement.getAttribute('data-theme')=
 })();
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function fmt(d){return d?new Date(d).toLocaleDateString(undefined,{day:'2-digit',month:'short',year:'2-digit'}):'—'}
+/* 4.58.1 — a DATE is not enough for "when did they last sign in": a
+   sign-in at nine and one at four read the same all day. The time, and
+   how long ago in words. */
+function fmtTime(d){if(!d)return '—';const t=new Date(d);return t.toLocaleDateString(undefined,{day:'2-digit',month:'short',year:'2-digit'})+', '+t.toLocaleTimeString(undefined,{hour:'2-digit',minute:'2-digit'});}
+function ago(d){if(!d)return '';const s=Math.max(0,Math.round((Date.now()-new Date(d).getTime())/1000));
+  if(s<60)return 'just now';const m=Math.round(s/60);if(m<60)return m+' min ago';const h=Math.round(m/60);if(h<48)return h+' h ago';return Math.round(h/24)+' days ago';}
+/* 4.58.1 — "refresh is not working proper". It worked, silently: nothing
+   on the page said it had happened, and a failure (the service waking)
+   was written onto the hidden key screen, so a press that failed looked
+   exactly like a press that did nothing. Now the button says it is
+   working, the time of the last good read stands beside it, and a
+   failure is said where it can be seen. */
+async function refreshNow(){
+  const b=document.getElementById('refreshBtn');
+  if(b){b.disabled=true;b.textContent='Refreshing…';}
+  try{await load();}finally{if(b){b.disabled=false;b.textContent='Refresh';}}
+}
+function stampRefreshed(ok,msg){
+  const n=document.getElementById('refreshed');if(!n)return;
+  n.innerHTML=ok?('updated '+new Date().toLocaleTimeString(undefined,{hour:'2-digit',minute:'2-digit',second:'2-digit'}))
+    :'<b style="color:var(--bad)">'+esc(msg||'could not refresh')+'</b>';
+}
+/* and the open company's people keep themselves current, every minute
+   while this tab is in front */
+setInterval(()=>{if(document.hidden||!KEY||!OPEN)return;const h=document.getElementById('users-'+OPEN);if(h&&h.style.display!=='none')coUsers({dataset:{id:OPEN}},true);},60000);
 function toggle(btn){const id=typeof btn==='string'?btn:btn.dataset.target;const n=document.getElementById(id);n.style.display=n.style.display==='none'?'':'none';}
 function say(html){document.getElementById('coMsg').innerHTML=html;if(html)setTimeout(()=>{if(document.getElementById('coMsg').innerHTML===html)say('')},6000);}
 function signOut(){try{sessionStorage.removeItem('nexora_admin_key')}catch(e){}location.reload();}
@@ -1041,8 +1066,10 @@ async function api(path,opts){
 }
 async function load(){
   KEY=KEY||document.getElementById('key').value.trim();
+  const already=document.getElementById('app').style.display!=='none'&&!!DATA;
   try{
     DATA=await api('/admin/api/licences');
+    stampRefreshed(true);
     try{sessionStorage.setItem('nexora_admin_key',KEY)}catch(e){}
     document.getElementById('gate').style.display='none';
     document.getElementById('app').style.display='';
@@ -1056,6 +1083,8 @@ async function load(){
     renderPlans();
     showSec(currentSec());
     renderCompanies();
+    /* and the open company's people are read again with everything else */
+    if(OPEN)coUsers({dataset:{id:OPEN}},true);
     render();
     /* 4.42.0 — the leads come with everything else, and never hold up the
        rest of the page if the service has not been deployed with them. */
@@ -1064,6 +1093,9 @@ async function load(){
     loadFeedback();
     loadBroadcasts();
   }catch(e){
+    /* signed in already: say it HERE and keep the key — the service may
+       only be waking, and the next press will work */
+    if(already){stampRefreshed(false,'could not refresh — '+e.message);return;}
     KEY='';
     document.getElementById('gateErr').innerHTML='<div class="msg err">'+esc(e.message)+'</div>';
   }
@@ -1103,6 +1135,16 @@ function txnCell(used,limit){
 }
 function hoursText(mins){mins=+mins||0;const h=Math.floor(mins/60),m=mins%60;return h?h+' h '+m+' m':m+' m';}
 function renderCompanies(){
+  /* 4.58.1 — THE PEOPLE SURVIVE A REDRAW. Every redraw of the list wrote
+     "Reading…" into the open company's People panel, and only OPENING a
+     company ever asked for the people — so after Refresh (or a search) the
+     panel said Reading… for ever. What was on screen is kept here, and
+     load() reads the people again. */
+  const keptPeople=OPEN&&document.getElementById('users-'+OPEN)?document.getElementById('users-'+OPEN).innerHTML:null;
+  renderCompanyList();
+  if(keptPeople&&!/Reading/.test(keptPeople)){const h=document.getElementById('users-'+OPEN);if(h)h.innerHTML=keptPeople;}
+}
+function renderCompanyList(){
   const term=(document.getElementById('cq').value||'').toLowerCase();
   const cos=(DATA.companies||[]).filter(c=>!term||[c.name,c.licence_key,c.email,c.gstin,c.login_id,c.phone].some(v=>String(v||'').toLowerCase().includes(term)));
   document.getElementById('colist').innerHTML=cos.map(c=>{
@@ -1308,10 +1350,14 @@ function onlineCell(u){
   if(!u.sessionDevice)return '<span class="why">not signed in</span>';
   const where=u.sessionDeviceName||u.sessionDevice.slice(0,12);
   return '<b style="color:var(--good)">on '+esc(where)+'</b>'+
-    (u.sessionAt?'<br><span class="why">since '+esc(fmt(u.sessionAt))+'</span>':'');
+    (u.sessionAt?'<br><span class="why">since '+esc(fmtTime(u.sessionAt))+'</span>':'');
 }
 function userRow(cid,u){
-  const when=u.lastLoginAt?('last signed in '+fmt(u.lastLoginAt)):'never signed in';
+  /* 4.58.1 — date AND time, and when their software last spoke to the
+     service: a remembered session never types the PIN again, so "signed
+     in" alone stood still while the person worked every day */
+  const when=(u.lastLoginAt?('signed in '+fmtTime(u.lastLoginAt)):'never signed in')+
+    (u.lastSeenAt?'<br>active <b>'+esc(ago(u.lastSeenAt))+'</b> <span title="'+esc(fmtTime(u.lastSeenAt))+'">('+esc(fmtTime(u.lastSeenAt))+')</span>':'');
   return '<tr'+(u.active?'':' class="off"')+'>'+
     '<td><b>'+esc(u.name)+'</b>'+(u.active?'':' <span class="why">switched off</span>')+
       (u.sessionDevice?' <span class="pill s-LICENSED">signed in</span>':'')+'</td>'+
@@ -1321,7 +1367,7 @@ function userRow(cid,u){
        simply do not receive the circulars, and it says so plainly. */
     '<td>'+(u.email?'<code>'+esc(u.email)+'</code>':'<span class="why">no address</span>')+'</td>'+
     '<td>'+onlineCell(u)+'</td>'+
-    '<td class="why">'+esc(when)+'</td>'+
+    '<td class="why">'+when+'</td>'+
     '<td>'+
       '<button class="small" data-cid="'+cid+'" data-uid="'+u.id+'" data-name="'+esc(u.name)+'" data-role="'+(u.role==='ADMIN'?'USER':'ADMIN')+'" onclick="uRole(this)">'+
         (u.role==='ADMIN'?'Make ordinary user':'Make administrator')+'</button> '+
@@ -1331,12 +1377,20 @@ function userRow(cid,u){
       '<button class="small" data-cid="'+cid+'" data-uid="'+u.id+'" data-name="'+esc(u.name)+'" onclick="uDel(this)">Remove…</button>'+
     '</td></tr>';
 }
-async function coUsers(btn){
-  const cid=+btn.dataset.id, host=document.getElementById('users-'+cid);
+async function coUsers(btn,quiet){
+  const cid=+btn.dataset.id; let host=document.getElementById('users-'+cid);
   if(!host)return;
   host.style.display='';
-  host.innerHTML='<p class="help">Reading…</p>';
+  /* a quiet (timed) refresh keeps what is on screen until the answer is in */
+  if(!quiet)host.innerHTML='<p class="help">Reading…</p>';
   const r=await api('/admin/api/company',{method:'POST',body:JSON.stringify({id:cid,action:'users'})});
+  /* 4.58.1 — WHERE IT IS NOW, not where it was when the question left.
+     Refresh asks for the people and then redraws the company list, so the
+     panel this call started with had been replaced by the time the answer
+     came back: the answer went into a panel nobody could see, and the one
+     on screen said Reading… for ever. That was the Refresh that did not work. */
+  host=document.getElementById('users-'+cid)||host;
+  host.style.display='';
   if(r.error){host.innerHTML='<div class="msg err">'+esc(r.error)+'</div>';return;}
   const cap=r.cap||{max:0,count:0};
   host.innerHTML=
@@ -1348,7 +1402,7 @@ async function coUsers(btn){
       'A PIN cannot be shown here or anywhere else \u2014 it is stored scrambled, which is what stops anyone who gets the database from signing in as your customers. '+
       'When somebody forgets theirs, set a new one and tell them.</p>'+
     (r.users&&r.users.length
-      ? '<table class="users"><thead><tr><th>Name</th><th>Role</th><th>Sees</th><th>Email</th><th>Signed in now</th><th>Last signed in</th><th></th></tr></thead><tbody>'+
+      ? '<table class="users"><thead><tr><th>Name</th><th>Role</th><th>Sees</th><th>Email</th><th>Signed in now</th><th>Last signed in / active</th><th></th></tr></thead><tbody>'+
         r.users.map(u=>userRow(cid,u)).join('')+'</tbody></table>'
       : '<p class="help">Nobody has been added to this company yet.</p>')+
     '<button data-id="'+cid+'" onclick="uAdd(this)">Add a person…</button>';

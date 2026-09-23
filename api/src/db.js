@@ -396,6 +396,11 @@ export function ensureSchema() {
 
     await q(`ALTER TABLE company_users ADD COLUMN IF NOT EXISTS session_device TEXT`);
     await q(`ALTER TABLE company_users ADD COLUMN IF NOT EXISTS session_at TIMESTAMPTZ`);
+    /* 4.58.1 — the last time this person's software spoke to the service.
+       last_login_at moves only when a name and PIN are typed; a person
+       who opens the software every morning on a remembered session never
+       types them, so their "last signed in" stood still for weeks. */
+    await q(`ALTER TABLE company_users ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ`);
 
     /* Defaults, written once. ON CONFLICT DO NOTHING means an operator's
        later change is never overwritten by a cold start. */

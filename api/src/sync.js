@@ -86,6 +86,8 @@ export function describeUser(u) {
     sessionDevice: u.session_device || null,
     sessionAt: u.session_at || null,
     lastLoginAt: u.last_login_at || null,
+    /* 4.58.1 — the last time their software spoke to the service */
+    lastSeenAt: u.last_seen_at || null,
     createdAt: u.created_at || null
   };
 }

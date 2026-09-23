@@ -34,7 +34,10 @@ const CORS = {
 function json(body, status) {
   return new Response(JSON.stringify(body), {
     status: status || 200,
-    headers: Object.assign({ 'content-type': 'application/json; charset=utf-8' }, CORS)
+    /* 4.58.1 — no-store. A figure in the console is "now" or it is wrong;
+       without this a browser or a proxy is free to hand back the answer it
+       got last time, and Refresh appears to do nothing. */
+    headers: Object.assign({ 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' }, CORS)
   });
 }
 async function readJson(request) {
