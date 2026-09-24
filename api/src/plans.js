@@ -51,7 +51,12 @@ export const PLAN_FEATURES = [
      learned from the plant", which describes one thing it does; the
      owner sells it as the learning itself, and asked for it to stand
      beside workflow automation as its own line on the plan. */
-  { id: 'sectionSuggest', label: 'BOM learning (MLM)', standard: false }
+  { id: 'sectionSuggest', label: 'BOM learning (MLM)', standard: false },
+  /* 4.65.0 — "in console under plan add these all feature": the three
+     cost tools, each its own line on the plan. */
+  { id: 'priceImpact',  label: 'Price Impact',                       standard: false },
+  { id: 'compare',      label: 'Compare calculations',               standard: false },
+  { id: 'targetCost',   label: 'Target Cost',                        standard: false }
 ];
 
 export const PLANS = ['STANDARD', 'PRO'];
