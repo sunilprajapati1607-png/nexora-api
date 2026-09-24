@@ -92,6 +92,9 @@
     { codes: ['BACKSEAM_GRANULE'], re: /backseam granules/i, groups: ['PASTING GRANULE'] },
     /* No metres for tape: "meter are start from fabric". */
     { codes: ['CREEP_TAPE', 'PULL_TAPE'], re: /creep tape|pull tape/i, groups: ['TAPE'] },
+    /* 4.59.0 — the pinch-bottom bag's zipper and easy-open strip */
+    { codes: ['ZIPPER'], re: /zipper/i, groups: ['ZIPPER'] },
+    { codes: ['PINCH_EO_STRIP'], re: /easy-open strip/i, groups: ['TAPE'] },
     { codes: ['BODY_FABRIC_UL', 'PATCH_FABRIC_UL'], re: /fabric/i,
       groups: ['FABRIC', 'WOVEN FABRIC'], web: true, sfgOk: true }
   ];
