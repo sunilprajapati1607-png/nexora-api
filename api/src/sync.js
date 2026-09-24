@@ -333,8 +333,13 @@ export async function userAction(companyId, actor, body) {
      calc     id = the calculation's id, body = the record. Owned.
      bom      id = the calculation's id, body = the saved BOM. Owned with
               its calculation.
+     quote    (4.66.0) id = the quotation's key (its calculation's id, or
+              'quote:<uuid>' for one made without a calculation), body =
+              the saved quotation. Owned, by the same rules as calc and
+              bom: scope OWN sees its own, scope ALL (every admin) sees
+              everyone's, and another person's arrives as a STUB.
    Every write takes a fresh seq, so "everything since seq N" is exact. */
-const KINDS = { master: true, calc: true, bom: true };
+const KINDS = { master: true, calc: true, bom: true, quote: true };
 const PAGE = 200;
 const MAX_BODY = 4 * 1024 * 1024;   // one record; a calculation with its trace is ~50 KB
 
@@ -353,6 +358,15 @@ function stubOf(row) {
   return { id: row.id, stub: true, calcNumber: b.calcNumber || null, itemCode: b.itemCode || null,
     revision: b.revision || null, ownerId: row.owner_id == null ? null : Number(row.owner_id), createdBy: b.createdBy || null };
 }
+/** 4.66.0 — the same for a quotation: its number and owner, never the
+ *  buyer, the rates or the cost it was quoted at. The number is what a
+ *  seat with scope OWN needs so its next quotation number is free. */
+function quoteStubOf(row) {
+  const b = row.body || {};
+  return { calcId: row.id, stub: true, quoteNumber: b.quoteNumber || null,
+    ownerId: row.owner_id == null ? null : Number(row.owner_id) };
+}
+const STUBS = { calc: stubOf, quote: quoteStubOf };
 
 export async function pull(companyId, user, since, limit) {
   const from = Math.max(0, parseInt(since, 10) || 0);
@@ -365,12 +379,13 @@ export async function pull(companyId, user, since, limit) {
   const page = rows.slice(0, lim);
   const records = page.map((r) => {
     const visible = canSee(user, r);
+    const stubbed = !visible && !r.deleted && !!STUBS[r.kind];
     return {
       seq: Number(r.seq), kind: r.kind, id: r.id, deleted: r.deleted === true,
       ownerId: r.owner_id == null ? null : Number(r.owner_id),
       updatedAt: r.updated_at, updatedBy: r.updated_by == null ? null : Number(r.updated_by),
-      body: r.deleted ? null : (visible ? r.body : (r.kind === 'calc' ? stubOf(r) : null)),
-      stub: !visible && !r.deleted && r.kind === 'calc'
+      body: r.deleted ? null : (visible ? r.body : (stubbed ? STUBS[r.kind](r) : null)),
+      stub: stubbed
     };
   }).filter((r) => r.body !== null || r.deleted);
   const next = page.length ? Number(page[page.length - 1].seq) : from;

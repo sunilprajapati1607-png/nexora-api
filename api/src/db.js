@@ -212,7 +212,7 @@ export function ensureSchema() {
         last_login_at TIMESTAMPTZ,
         UNIQUE (company_id, name_key)
       )`);
-    /* One row per synced record. kind master|calc|bom; id is the storage
+    /* One row per synced record. kind master|calc|bom|quote (4.66.0); id is the storage
        key for a master, the calculation id otherwise. seq is taken fresh
        on EVERY write (see the upsert in sync.js), so "everything since
        seq N" is exact and cheap. Full bodies as JSONB — the owner chose to

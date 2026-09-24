@@ -44,7 +44,9 @@ const MAX_TAGS = 12;
    here: the application tagged them and the service threw the tag away,
    so "mentioned you" never fired on the live service. Every kind the
    application writes, and UPDATE, which only Nexora writes (below). */
-const TAG_KINDS = { CALC: 1, BOM: 1, QUOTE: 1, ITEM: 1, RM: 1, STRUCTURE: 1, ROUTE: 1, PROCESS: 1, PERSON: 1, UPDATE: 1 };
+const TAG_KINDS = { CALC: 1, BOM: 1, QUOTE: 1, ITEM: 1, RM: 1, STRUCTURE: 1, ROUTE: 1, PROCESS: 1, PERSON: 1, UPDATE: 1,
+  /* 4.66.0 — a change waiting for the administrator (AP-XXXXXX) */
+  APPROVAL: 1 };
 
 function cleanTags(v) {
   if (!Array.isArray(v)) return [];

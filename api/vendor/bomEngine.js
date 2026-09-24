@@ -165,7 +165,7 @@
     if (bagWeightG <= 0) errors.push('Bag weight must be greater than zero — the calculation has to be valid first.');
 
     const BASES = { PCT: 1, PER1000: 1, PERBAG_G: 1, PART_G: 1, ABS: 1 };
-    const BASES_RES = { KG: 1, BAG: 1, PER1000: 1 };
+    const BASES_RES = { KG: 1, BAG: 1, PER1000: 1, PERN: 1 };
     const stages = steps.map((st, i) => {
       const key = i + '|' + st.p;
       const cfg = sections[key] || {};
@@ -437,10 +437,15 @@
           s.resourceCosts = resList.map((r) => {
             const basis = BASES_RES[r.basis] ? r.basis : 'KG';
             const rate = num(r.costPerKg);
+            /* 4.66.0 — PERN: per any number of bags (perBags), 1000 if unset */
+            const perN = basis === 'PERN' ? (num(r.perBags) > 0 ? num(r.perBags) : 1000) : 0;
             const cost = basis === 'KG' ? s.grossKg * rate
                        : basis === 'BAG' ? bags * rate
+                       : basis === 'PERN' ? (bags / perN) * rate
                        : (bags / 1000) * rate;
-            return { name: r.name, type: r.type, basis: basis, rate: rate, cost: cost };
+            const rc = { name: r.name, type: r.type, basis: basis, rate: rate, cost: cost };
+            if (basis === 'PERN') rc.perBags = perN;
+            return rc;
           });
           s.processCost = s.resourceCosts.reduce((t, r) => t + r.cost, 0);
         } else {
