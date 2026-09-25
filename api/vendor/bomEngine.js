@@ -183,6 +183,12 @@
         // undefined = "use every resource defined on the process"; an array
         // = the resources picked for this section specifically.
         resources: cfg.resources === undefined ? undefined : (cfg.resources || []),
+        /* 4.66.6 — where a stage with no "earlier stage" row takes its
+           input from, when that is NOT simply the stage before it: a
+           stage index, or -1 for a stage that starts its own line (BOPP
+           printing takes film, not the fabric woven before it). Absent =
+           the stage before, exactly as always. */
+        from: (cfg.from === undefined || cfg.from === null || !isFinite(Number(cfg.from))) ? undefined : Math.floor(Number(cfg.from)),
         lines: (cfg.lines || []).map((l) => {
           const src = l.src === 'SFG' ? 'SFG' : 'RM';
           return {
@@ -322,6 +328,15 @@
            screen can say exactly where the input came from. */
         s.inputFrom = s.lines.filter((l) => l.src === 'SFG' && !l.invalid)
           .map((l) => ({ index: l.sfgStep, kg: l.kg, explicit: true }));
+      } else if (s.from !== undefined && s.from < i) {
+        /* 4.66.6 — the input comes from a named stage (or from none) */
+        s.inputKg = Math.max(0, s.grossKg - addedKg);
+        s.purchasedKg = 0;
+        s.branchFrom = s.from;
+        if (s.from >= 0) {
+          demand[s.from] += s.inputKg;
+          if (s.inputKg > 0) s.inputFrom = [{ index: s.from, kg: s.inputKg, explicit: false, branch: true }];
+        }
       } else {
         s.inputKg = Math.max(0, s.grossKg - addedKg);
         s.purchasedKg = 0;
@@ -350,7 +365,7 @@
         f.processName = ref ? ref.processName : 'unknown stage';
         f.stepLabel = 'Stage ' + (f.index + 1) + ' — ' + f.processName;
       });
-      if (!s.explicitInput && anyExplicit && !s.beforeWall && s.sourcing === 'MAKE') {
+      if (!s.explicitInput && s.branchFrom === undefined && anyExplicit && !s.beforeWall && s.sourcing === 'MAKE') {
         warnings.push(s.processName + ' takes its input from ' + s.inputFrom[0].stepLabel +
           ' only because that step comes before it in the route. Other steps name their source explicitly, so if this one should take a different stage, add an "Earlier stage" row to its section and choose it.');
       }
@@ -365,6 +380,15 @@
       if (s.outputKg > 0.0001) return;
       warnings.push(s.processName + ' makes nothing: no later stage takes its output, so every quantity on it is zero. '
         + 'Point the stage that should consume it at ' + ('Stage ' + (i + 1) + ' — ' + s.processName) + ', or remove the step from the route.');
+    });
+
+    /* 4.66.6 — a stage that starts its own line has nothing before it to
+       feed it: whatever its own materials do not make up is not issued. */
+    stages.forEach((s) => {
+      if (s.branchFrom === -1 && !s.beforeWall && s.sourcing === 'MAKE' && s.inputKg > 0.05) {
+        warnings.push(s.processName + ' starts its own line, so its own material must make up what it hands on — '
+          + fmtKg(s.inputKg) + ' kg is not issued yet. Add the film (or whatever it runs on) in Edit section.');
+      }
     });
 
     // First costed stage must supply its own mass entirely from its recipe.
@@ -421,7 +445,11 @@
             material += l.cost;
           }
         });
-        s.inputCost = s.explicitInput ? sfgCost : prevOutCost;
+        /* 4.66.6 — an input taken from a named stage is priced at that
+           stage's cost per kg; one that starts its own line carries none */
+        s.inputCost = s.explicitInput ? sfgCost
+          : (s.branchFrom !== undefined ? (s.branchFrom >= 0 && stages[s.branchFrom] ? s.inputKg * num(stages[s.branchFrom].costPerKg) : 0)
+            : prevOutCost);
         // Resources: the ones picked for this section, or every resource on
         // the process when the section has not narrowed them.
         s.resourceLines = s.resources === undefined ? null : s.resources;
@@ -529,6 +557,7 @@
       out[i] = f;
       const sfg = (s.lines || []).filter((l) => l.src === 'SFG' && !l.invalid && l.sfgStep !== null && l.sfgStep < i);
       if (sfg.length) sfg.forEach((l) => { if (into[l.sfgStep] === null) into[l.sfgStep] = f; });
+      else if (s.from !== undefined && s.from < i) { if (s.from >= 0 && into[s.from] === null) into[s.from] = f; }   // 4.66.6
       else if (i > 0 && into[i - 1] === null) into[i - 1] = f;
     }
     return out;

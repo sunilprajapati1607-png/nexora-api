@@ -129,7 +129,15 @@ export async function login(companyId, { name, pin }, deviceId) {
   await q(`UPDATE company_users SET last_login_at = now(), session_device = $2, session_at = now() WHERE id = $1`,
     [u.id, deviceId || null]);
   await logEvent(null, 'LOGIN', { companyId, userId: u.id, deviceId: deviceId || null, displaced });
-  return { httpStatus: 200, body: { user: describeUser(u), displaced: displaced ? true : false } };
+  /* 4.66.6 — displacedDevice stays on the service: index.js tells that
+     machine at once (waiters.js) instead of at its next heartbeat. */
+  return { httpStatus: 200, body: { user: describeUser(u), displaced: displaced ? true : false }, displacedDevice: displaced };
+}
+
+/** 4.66.6 — the newest change the company has, for /v1/sync/wait. */
+export async function maxSeq(companyId) {
+  const rows = await q(`SELECT COALESCE(MAX(seq), 0) AS s FROM sync_records WHERE company_id = $1`, [companyId]);
+  return Number(rows[0] && rows[0].s) || 0;
 }
 
 /** 4.43.0 — signing out gives the person back. Bound to THIS machine

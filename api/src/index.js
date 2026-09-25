@@ -16,7 +16,8 @@ import { ensureSchema } from './db.js';
 import { activate, authorise, touch, issueToken, reportUsage, companyUsage, describe } from './licence.js';
 import { runBom } from './engine.js';
 import { adminAuthorised, listLicences, licenceAction, companyAction, saveSettings, recentEvents, ADMIN_HTML } from './admin.js';
-import { login, listUsers, userAction, pull, push, describeUser, userCap, setCompanyPasscode, releaseSession } from './sync.js';
+import { login, listUsers, userAction, pull, push, describeUser, userCap, setCompanyPasscode, releaseSession, maxSeq } from './sync.js';
+import { waitFor, wakeCompany, endSessionOn, WAIT_MS } from './waiters.js';
 import { send as chatSend, since as chatSince, remove as chatRemove, clearBy as chatClearBy, listBroadcasts, broadcastAction } from './chat.js';
 import { ensureInkSchema, getModel, listModels, train as inkTrain, estimate as inkEstimate, reset as inkReset } from './inkstore.js';
 import { register, gstAction, remoteIp } from './register.js';
@@ -143,6 +144,13 @@ export default {
         const body = await readJson(request);
         const out = await login(a.companyId, body, a.row.device_id);
         if (out.httpStatus !== 200) return json(out.body, out.httpStatus);
+        /* 4.66.6 — the machine this person left is told now, not at its
+           next heartbeat: "another one is logout after 1 min but this
+           should be quick". */
+        if (out.displacedDevice) {
+          endSessionOn(a.companyId, out.body.user.id, out.displacedDevice,
+            { name: out.body.user.name, at: new Date().toISOString(), where: a.row.device_name || 'another computer' });
+        }
         return json({ token: issueToken(a.row, out.body.user.id), user: out.body.user, licence: a.licence,
           company: a.company ? { id: a.company.id, name: a.company.name } : null });
       }
@@ -240,7 +248,30 @@ export default {
            too: saved work still comes down (pull), nothing new goes up. */
         if (!a.licence.canCalculate) return json({ error: 'LICENCE_REQUIRED', licence: a.licence, message: a.licence.message || 'This licence has ended — saved work can be opened and printed, but nothing new is saved to the company.' }, 402);
         const body = await readJson(request);
-        return json(await push(a.companyId, a.user, body.records));
+        const pushed = await push(a.companyId, a.user, body.records);
+        /* 4.66.6 — every other machine of the company pulls now */
+        if (pushed && pushed.applied && pushed.applied.length) wakeCompany(a.companyId, a.row.device_id);
+        return json(pushed);
+      }
+      /* 4.66.6 — "within 5 second ma sync thai javu joiye". A signed-in
+         machine keeps this one request open; it is answered the moment
+         another machine pushes, or this person signs in elsewhere, or
+         after WAIT_MS with nothing to say. Nothing waits on the database. */
+      if (path === '/v1/sync/wait' && method === 'GET') {
+        await ensureSchema();
+        const a = await authorise(request);
+        if (!a.ok) return json(a.error, a.httpStatus);
+        if (!a.user) {
+          if (a.superseded) return json({ sessionEnded: a.superseded });
+          return json({ error: 'SIGN_IN', message: 'Sign in to synchronise.' }, 401);
+        }
+        const since = Math.max(0, parseInt(url.searchParams.get('since'), 10) || 0);
+        const top = await maxSeq(a.companyId);
+        if (top > since) return json({ changed: true, seq: top });
+        const ms = parseInt(url.searchParams.get('ms'), 10) || WAIT_MS;
+        const heard = await waitFor(a.companyId, a.user.id, a.row.device_id, ms);
+        if (heard.ended) return json({ sessionEnded: heard.ended });
+        return json({ changed: !!heard.changed });
       }
 
       /* ---- 4.16.0 BETA — the ink assumption -------------------------
