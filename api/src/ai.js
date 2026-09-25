@@ -184,36 +184,220 @@ function readAnswer(body) {
   };
 }
 
-/** POST /v1/ai/check-bom */
-export async function checkBom(companyId, payload, lang, fetchImpl) {
-  if (!aiConfigured()) return { httpStatus: 503, body: { error: 'AI_OFF', message: 'Nexora AI is not switched on at the service yet.' } };
-  const p = clean(payload);
-  if (!p.stages.length) return { httpStatus: 400, body: { error: 'NOTHING', message: 'There is no route on this BOM to check yet.' } };
+
+/* ---- one call to Gemini, shared by every Nexora AI question ------------- */
+async function ask(companyId, system, prompt, fetchImpl) {
+  if (!aiConfigured()) return { fail: { httpStatus: 503, body: { error: 'AI_OFF', message: 'Nexora AI is not switched on at the service yet.' } } };
   const t = take(companyId);
-  if (t.busy) return { httpStatus: 429, body: { error: 'AI_BUSY', retryAfter: t.busy, message: 'Nexora AI is busy — try again in ' + t.busy + ' seconds.' } };
-  if (t.spent) return { httpStatus: 429, body: { error: 'AI_DAILY', message: 'This company has used today’s ' + daily() + ' Nexora AI checks. They come back tomorrow.' } };
+  if (t.busy) return { fail: { httpStatus: 429, body: { error: 'AI_BUSY', retryAfter: t.busy, message: 'Nexora AI is busy — try again in ' + t.busy + ' seconds.' } } };
+  if (t.spent) return { fail: { httpStatus: 429, body: { error: 'AI_DAILY', message: 'This company has used today’s ' + daily() + ' Nexora AI checks. They come back tomorrow.' } } };
   const name = await resolveModel(false, fetchImpl);
-  if (!name) return { httpStatus: 503, body: { error: 'AI_MODEL', message: 'Nexora AI has no model it can use right now.' } };
+  if (!name) return { fail: { httpStatus: 503, body: { error: 'AI_MODEL', message: 'Nexora AI has no model it can use right now.' } } };
   let r;
   try {
     r = await gfetch(API + '/models/' + encodeURIComponent(name) + ':generateContent', {
       method: 'POST',
       body: JSON.stringify({
-        systemInstruction: { parts: [{ text: SYSTEM }] },
-        contents: [{ role: 'user', parts: [{ text: promptFor(p, lang) }] }],
+        systemInstruction: { parts: [{ text: system }] },
+        contents: [{ role: 'user', parts: Array.isArray(prompt) ? prompt : [{ text: prompt }] }],   /* text, or parts (a recording + text) */
         generationConfig: { temperature: 0.2, responseMimeType: 'application/json', maxOutputTokens: 2048 }
       })
     }, fetchImpl);
   } catch (e) {
-    return { httpStatus: 504, body: { error: 'AI_TIMEOUT', message: 'Nexora AI did not answer in time. Try again.' } };
+    return { fail: { httpStatus: 504, body: { error: 'AI_TIMEOUT', message: 'Nexora AI did not answer in time. Try again.' } } };
   }
   if (!r.ok) {
     if (r.status === 404) resolveModel(true, fetchImpl).catch(() => {});      // the model went away: look again
     const busy = r.status === 429;
-    return { httpStatus: busy ? 429 : 502, body: { error: busy ? 'AI_BUSY' : 'AI_FAILED', retryAfter: busy ? 60 : undefined,
-      message: busy ? 'Nexora AI is busy (Google’s limit) — try again in a minute.' : 'Nexora AI could not answer (' + r.status + '): ' + scrub(r.body && r.body.error && r.body.error.message) } };
+    return { fail: { httpStatus: busy ? 429 : 502, body: { error: busy ? 'AI_BUSY' : 'AI_FAILED', retryAfter: busy ? 60 : undefined,
+      message: busy ? 'Nexora AI is busy (Google’s limit) — try again in a minute.' : 'Nexora AI could not answer (' + r.status + '): ' + scrub(r.body && r.body.error && r.body.error.message) } } };
   }
-  const ans = readAnswer(r.body);
+  const parts = (((r.body && r.body.candidates) || [])[0] || {}).content;
+  const text = ((parts && parts.parts) || []).map((x) => x.text || '').join('').trim()
+    .replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '');
+  let json = null;
+  try { json = text ? JSON.parse(text) : null; } catch (e) { json = null; }
+  if (!json) return { fail: { httpStatus: 502, body: { error: 'AI_UNREADABLE', message: 'Nexora AI answered in a form Nexora could not read. Try again.' } } };
+  return { json: json, model: name, left: t.left };
+}
+
+/** POST /v1/ai/check-bom — phase 1 */
+export async function checkBom(companyId, payload, lang, fetchImpl) {
+  if (!aiConfigured()) return { httpStatus: 503, body: { error: 'AI_OFF', message: 'Nexora AI is not switched on at the service yet.' } };
+  const p = clean(payload);
+  if (!p.stages.length) return { httpStatus: 400, body: { error: 'NOTHING', message: 'There is no route on this BOM to check yet.' } };
+  const a = await ask(companyId, SYSTEM, promptFor(p, lang), fetchImpl);
+  if (a.fail) return a.fail;
+  const ans = readAnswer({ candidates: [{ content: { parts: [{ text: JSON.stringify(a.json) }] } }] });
   if (!ans) return { httpStatus: 502, body: { error: 'AI_UNREADABLE', message: 'Nexora AI answered in a form Nexora could not read. Try again.' } };
-  return { httpStatus: 200, body: Object.assign({ ok: true, model: name, left: t.left }, ans) };
+  return { httpStatus: 200, body: Object.assign({ ok: true, model: a.model, left: a.left }, ans) };
+}
+
+/* ---- phase 2: a route (or a saved workflow) from plain words --------------
+   "pahela phase 2 par jaiye". The user says what the bag is; Nexora AI picks
+   the stages from THIS plant's own process master — nothing else is
+   accepted — or points at a route or workflow the plant already has.
+   Nothing is created here: the application shows the proposal and the user
+   presses Create or Use. The recipes of a new route's stages are then filled
+   by Nexora's own learning, marked as suggestions. */
+export function cleanPlan(p) {
+  const x = p && typeof p === 'object' ? p : {};
+  const bag = x.bag && typeof x.bag === 'object' ? x.bag : {};
+  return {
+    text: str(x.text, 600),
+    bag: {
+      construction: str(bag.construction, 60), bagGrams: nr(bag.bagGrams), laminated: !!bag.laminated, lined: !!bag.lined,
+      parts: list(bag.parts, 12).map((q) => ({ label: str(q && q.label, 40), grams: nr(q && q.grams) })),
+      specs: list(bag.specs, 30).map((q) => ({ name: str(q && q.name, 30), value: str(q && q.value, 20) }))
+    },
+    processes: list(x.processes, 60).map((q) => ({ code: str(q && q.code, 30), name: str(q && q.name, 60),
+      consumes: list(q && q.consumes, 8).map((c) => str(c, 30)), produces: str(q && q.produces, 40) })).filter((q) => q.code),
+    routes: list(x.routes, 40).map((q) => ({ id: str(q && q.id, 60), name: str(q && q.name, 80), steps: list(q && q.steps, 30).map((c) => str(c, 30)), forThis: !!(q && q.forThis) })).filter((q) => q.id),
+    workflows: list(x.workflows, 40).map((q) => ({ id: str(q && q.id, 60), name: str(q && q.name, 80), mode: q && q.mode === 'SPLIT' ? 'SPLIT' : 'WHOLE',
+      routes: list(q && q.routes, 8).map((c) => str(c, 80)) })).filter((q) => q.id)
+  };
+}
+
+const PLAN_SYSTEM = [
+  'You are Nexora AI, inside Nexora, software that plans PP/PE woven sack production.',
+  'Given a bag (its construction, parts and specification), what the user says about it, this plant’s PROCESS MASTER (code, name, what each consumes and produces), the plant’s saved ROUTES and saved WORKFLOWS, propose how to make the bag.',
+  'Prefer, in this order: a saved workflow that fits (choice "workflow"); a saved route that fits (choice "route"); otherwise a new route (choice "new").',
+  'A new route is an ordered list of process CODES taken ONLY from the process master, each code at most twice. Follow the material: each step should consume what an earlier step produces, or raw material (RM). A bag has BOPP printing and slitting stages only if it is BOPP laminated; the fabric (tape, weaving) and the film (BOPP printing, slitting) meet at lamination. Put lamination after both lines, then backseam or bottom forming, finishing and packing as the bag needs. Do not invent processes; if one is missing, say so in notes.',
+  'You do not choose materials, quantities, prices or costs.',
+  'Answer ONLY with JSON: {"summary": string, "choice": "workflow" | "route" | "new", "workflowId": string or null, "routeId": string or null, "route": {"name": string, "steps": [{"code": string, "why": string}]} or null, "notes": [string]}.'
+].join(' ');
+
+/** POST /v1/ai/plan-route — phase 2 */
+export async function planRoute(companyId, payload, lang, fetchImpl) {
+  if (!aiConfigured()) return { httpStatus: 503, body: { error: 'AI_OFF', message: 'Nexora AI is not switched on at the service yet.' } };
+  const p = cleanPlan(payload);
+  if (!p.processes.length) return { httpStatus: 400, body: { error: 'NOTHING', message: 'The process master is empty.' } };
+  if (!p.text && !p.bag.construction) return { httpStatus: 400, body: { error: 'NOTHING', message: 'Say what the bag is first.' } };
+  const prompt = (lang === 'gu'
+    ? 'Write summary, why and notes in Gujarati (Gujarati script); keep codes, process names and Nexora terms in English.\n'
+    : 'Write in plain English.\n') + 'INPUT:\n' + JSON.stringify(p);
+  const a = await ask(companyId, PLAN_SYSTEM, prompt, fetchImpl);
+  if (a.fail) return a.fail;
+  const j = a.json || {};
+  const codes = {};
+  p.processes.forEach((q) => { codes[q.code] = true; });
+  const wfIds = {}; p.workflows.forEach((w) => { wfIds[w.id] = true; });
+  const rtIds = {}; p.routes.forEach((r) => { rtIds[r.id] = true; });
+  /* what the model says is checked against what was sent: an unknown code
+     or id never reaches the application */
+  const dropped = [];
+  const seen = {};
+  const steps = list(j.route && j.route.steps, 30).map((s) => ({ code: str(s && s.code, 30).toUpperCase(), why: str(s && s.why, 300) }))
+    .filter((s) => {
+      if (!codes[s.code]) { if (s.code) dropped.push(s.code); return false; }
+      seen[s.code] = (seen[s.code] || 0) + 1;
+      return seen[s.code] <= 2;
+    });
+  let choice = ['workflow', 'route', 'new'].indexOf(j.choice) > -1 ? j.choice : 'new';
+  const workflowId = choice === 'workflow' && wfIds[j.workflowId] ? j.workflowId : null;
+  const routeId = choice === 'route' && rtIds[j.routeId] ? j.routeId : null;
+  if (choice === 'workflow' && !workflowId) choice = steps.length ? 'new' : 'none';
+  if (choice === 'route' && !routeId) choice = steps.length ? 'new' : 'none';
+  if (choice === 'new' && !steps.length) choice = 'none';
+  return { httpStatus: 200, body: {
+    ok: true, model: a.model, left: a.left, summary: str(j.summary, 600), choice: choice,
+    workflowId: workflowId, routeId: routeId,
+    route: choice === 'new' ? { name: str(j.route && j.route.name, 80) || 'Nexora AI route', steps: steps } : null,
+    notes: list(j.notes, 6).map((n) => str(n, 300)).filter(Boolean)
+      .concat(dropped.length ? ['Left out, not in the process master: ' + dropped.join(', ')] : [])
+  } };
+}
+
+/* ---- phase 3: the bag's specification, spoken or typed --------------------
+   "aapde ai ne voice thi bag structure size and length ane bija
+    specificatin aapisu ane khutta ae jate pusile che athava dropdown ma
+    pusse aevu rakhvanu che".
+   The person speaks (or types) the bag; Gemini hears it and places it on
+   THIS plant's constructions and fields — nothing else is accepted: an
+   unknown construction, field or option is dropped, a number must be a
+   number. What a required field still lacks is listed, so the application
+   asks for it (a dropdown where the field has options). Nothing is saved
+   and nothing is weighed here: the application fills the form, the engine
+   weighs, the person saves. */
+const AUDIO_TYPES = { 'audio/wav': 1, 'audio/x-wav': 1, 'audio/mp3': 1, 'audio/mpeg': 1, 'audio/ogg': 1, 'audio/flac': 1, 'audio/aac': 1, 'audio/webm': 1 };
+const MAX_AUDIO_B64 = 3 * 1024 * 1024;
+
+export function cleanFill(p) {
+  const x = p && typeof p === 'object' ? p : {};
+  const fields = list(x.fields, 80).map((f) => ({
+    key: str(f && f.key, 30), label: str(f && f.label, 60), unit: str(f && f.unit, 12),
+    type: f && f.type === 'enum' ? 'enum' : 'number', options: list(f && f.options, 12).map((o) => str(o, 20)), required: !!(f && f.required)
+  })).filter((f) => f.key);
+  const known = {}; fields.forEach((f) => { known[f.key] = true; });
+  return {
+    text: str(x.text, 800),
+    constructions: list(x.constructions, 80).map((c) => ({ name: str(c && c.name, 60), description: str(c && c.description, 120),
+      fields: list(c && c.fields, 80).map((k) => str(k, 30)).filter((k) => known[k]) })).filter((c) => c.name),
+    fields: fields,
+    current: { structure: str(x.current && x.current.structure, 60),
+      inputs: Object.keys((x.current && x.current.inputs) || {}).filter((k) => known[k]).slice(0, 80)
+        .reduce((o, k) => { const v = x.current.inputs[k]; if (v !== undefined && v !== null && v !== '') o[k] = typeof v === 'number' ? nr(v) : str(v, 20); return o; }, {}) }
+  };
+}
+
+const FILL_SYSTEM = [
+  'You are Nexora AI, inside Nexora, software that weighs PP/PE woven sacks.',
+  'A person describes one bag, by voice or in writing, in English, Gujarati or Hindi (often mixed). Place what they say on the CONSTRUCTIONS and FIELDS given — nothing else.',
+  'Units: dimensions in millimetres (convert inches ×25.4 and centimetres ×10), GSM in g/m², micron in µm, mesh as threads per inch (e.g. "10 by 10" → M.WARP 10, M.WEFT 10). Width and length are the bag’s flat width and length. Bag quantity is "bagQuantity".',
+  'Choose the construction from the list by what they say (layers, laminated or not, block bottom, stitched, valve, liner, pinch). An enum field takes one of its options exactly.',
+  'Put in "inputs" only what was actually said, never a guess. List in "missing" each field of the chosen construction that is required but not said, with a short question to ask.',
+  'Answer ONLY with JSON: {"transcript": string, "construction": string or null, "inputs": {"FIELD KEY": number or string}, "bagQuantity": number or null, "missing": [{"key": string, "question": string}], "summary": string}.'
+].join(' ');
+
+export async function fillCalc(companyId, payload, lang, fetchImpl) {
+  if (!aiConfigured()) return { httpStatus: 503, body: { error: 'AI_OFF', message: 'Nexora AI is not switched on at the service yet.' } };
+  const p = cleanFill(payload);
+  const audio = payload && payload.audio && typeof payload.audio === 'object' ? payload.audio : null;
+  const mime = audio ? String(audio.mime || '').toLowerCase().split(';')[0] : '';
+  const data = audio ? String(audio.data || '') : '';
+  if (audio && (!AUDIO_TYPES[mime] || !data)) return { httpStatus: 400, body: { error: 'AUDIO', message: 'That recording could not be read.' } };
+  if (data.length > MAX_AUDIO_B64) return { httpStatus: 413, body: { error: 'AUDIO_LONG', message: 'That recording is too long — keep it under a minute.' } };
+  if (!audio && !p.text) return { httpStatus: 400, body: { error: 'NOTHING', message: 'Say or type what the bag is first.' } };
+  if (!p.constructions.length || !p.fields.length) return { httpStatus: 400, body: { error: 'NOTHING', message: 'This plant has no constructions to choose from.' } };
+  const intro = (lang === 'gu'
+    ? 'Write summary and questions in Gujarati (Gujarati script); keep field names and units in English.\n'
+    : 'Write summary and questions in plain English.\n') +
+    (audio ? 'The bag is described in the attached recording.' + (p.text ? ' The person also typed: ' + p.text : '') + '\n' : 'The person typed: ' + p.text + '\n') +
+    'CONTEXT:\n' + JSON.stringify({ constructions: p.constructions, fields: p.fields, current: p.current });
+  const a = await ask(companyId, FILL_SYSTEM, audio ? [{ inlineData: { mimeType: mime, data: data } }, { text: intro }] : intro, fetchImpl);
+  if (a.fail) return a.fail;
+  const j = a.json || {};
+  /* checked against what was sent */
+  const byName = {}; p.constructions.forEach((c) => { byName[c.name.toUpperCase()] = c; });
+  const con = j.construction && byName[String(j.construction).trim().toUpperCase()] ? byName[String(j.construction).trim().toUpperCase()] : null;
+  const fieldOf = {}; p.fields.forEach((f) => { fieldOf[f.key] = f; });
+  const allowed = con ? con.fields : Object.keys(fieldOf);
+  const inputs = {}; const dropped = [];
+  Object.keys((j.inputs && typeof j.inputs === 'object') ? j.inputs : {}).forEach((k) => {
+    const f = fieldOf[k];
+    const v = j.inputs[k];
+    if (!f || allowed.indexOf(k) < 0) { dropped.push(k); return; }
+    if (f.type === 'enum') {
+      const hit = f.options.filter((o) => o.toUpperCase() === String(v).trim().toUpperCase())[0];
+      if (hit) inputs[k] = hit; else dropped.push(k);
+    } else {
+      const n = Number(String(v).replace(/,/g, ''));
+      if (isFinite(n) && n >= 0) inputs[k] = Math.round(n * 1000) / 1000; else dropped.push(k);
+    }
+  });
+  const asked = {};
+  list(j.missing, 20).forEach((m) => { if (m && fieldOf[m.key]) asked[m.key] = str(m.question, 200); });
+  const missing = [];
+  if (!con) missing.push({ key: '__construction', question: lang === 'gu' ? 'કયું construction?' : 'Which construction is it?', type: 'enum', options: p.constructions.map((c) => c.name) });
+  (con ? con.fields : []).forEach((k) => {
+    const f = fieldOf[k];
+    if (!f || inputs[k] !== undefined || (p.current.inputs[k] !== undefined && p.current.structure === (con && con.name))) return;
+    if (f.required || asked[k]) missing.push({ key: k, label: f.label, unit: f.unit, type: f.type, options: f.options, question: asked[k] || f.label + (f.unit ? ' (' + f.unit + ')' : '') + '?' });
+  });
+  const qty = Number(j.bagQuantity);
+  return { httpStatus: 200, body: {
+    ok: true, model: a.model, left: a.left, transcript: str(j.transcript, 800), summary: str(j.summary, 400),
+    construction: con ? con.name : null, inputs: inputs, bagQuantity: isFinite(qty) && qty > 0 ? Math.round(qty) : null,
+    missing: missing, dropped: dropped
+  } };
 }
