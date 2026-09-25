@@ -163,6 +163,8 @@ export default {
         await ensureSchema();
         const a = await authorise(request);
         if (!a.ok) return json(a.error, a.httpStatus);
+        /* 4.66.3 — and says nothing new in the room: the conversation can be read */
+        if (!a.licence.canCalculate) return json({ error: 'LICENCE_REQUIRED', licence: a.licence, message: a.licence.message || 'This licence has ended — the conversation can be read, not written to.' }, 402);
         const out = await chatSend(a.companyId, a.user, await readJson(request));
         return json(out.body, out.httpStatus);
       }
@@ -234,6 +236,9 @@ export default {
         const a = await authorise(request);
         if (!a.ok) return json(a.error, a.httpStatus);
         if (!a.user) return json({ error: 'SIGN_IN', message: 'Sign in to synchronise.' }, 401);
+        /* 4.66.3 — a read-only company cannot push. A demo or licence that has ended is read-only on the service
+           too: saved work still comes down (pull), nothing new goes up. */
+        if (!a.licence.canCalculate) return json({ error: 'LICENCE_REQUIRED', licence: a.licence, message: a.licence.message || 'This licence has ended — saved work can be opened and printed, but nothing new is saved to the company.' }, 402);
         const body = await readJson(request);
         return json(await push(a.companyId, a.user, body.records));
       }

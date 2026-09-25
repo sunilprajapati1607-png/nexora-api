@@ -339,6 +339,9 @@ export async function userAction(companyId, actor, body) {
               bom: scope OWN sees its own, scope ALL (every admin) sees
               everyone's, and another person's arrives as a STUB.
    Every write takes a fresh seq, so "everything since seq N" is exact. */
+/* 4.66.3 — masters only an administrator may write (see push) */
+const ADMIN_ONLY_MASTERS = { 'nexora.rm.price.v1': 1, 'nexora.constants.v1': 1, 'nexora.constants.custom.v1': 1,
+  'nexora.constants.links.v1': 1, 'nexora.org.v1': 1 };
 const KINDS = { master: true, calc: true, bom: true, quote: true };
 const PAGE = 200;
 const MAX_BODY = 4 * 1024 * 1024;   // one record; a calculation with its trace is ~50 KB
@@ -421,6 +424,11 @@ export async function push(companyId, user, records) {
     const cur = (await q(`SELECT seq, body, owner_id, deleted FROM sync_records WHERE company_id = $1 AND kind = $2 AND id = $3`,
       [companyId, kind, id]))[0] || null;
 
+    /* 4.66.3 — prices, constants and the company details are changed by an
+       ADMINISTRATOR; anybody else asks through an approval. The application
+       has always held these back from other people's pushes — the service
+       now refuses them too, so the rule does not rest on the client. */
+    if (kind === 'master' && ADMIN_ONLY_MASTERS[id] && user.role !== 'ADMIN') { refused.push({ id, kind, reason: 'ADMIN_ONLY' }); continue; }
     if (kind === 'master') {
       /* A stale push — the client last saw seq N, the server is past it,
          and the bodies differ — comes back as a conflict carrying the
