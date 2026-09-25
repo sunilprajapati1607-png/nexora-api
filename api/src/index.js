@@ -18,6 +18,7 @@ import { runBom } from './engine.js';
 import { adminAuthorised, listLicences, licenceAction, companyAction, saveSettings, recentEvents, ADMIN_HTML } from './admin.js';
 import { login, listUsers, userAction, pull, push, describeUser, userCap, setCompanyPasscode, releaseSession, maxSeq } from './sync.js';
 import { waitFor, wakeCompany, endSessionOn, WAIT_MS } from './waiters.js';
+import { checkBom as aiCheckBom, aiStatus } from './ai.js';
 import { send as chatSend, since as chatSince, remove as chatRemove, clearBy as chatClearBy, listBroadcasts, broadcastAction } from './chat.js';
 import { ensureInkSchema, getModel, listModels, train as inkTrain, estimate as inkEstimate, reset as inkReset } from './inkstore.js';
 import { register, gstAction, remoteIp } from './register.js';
@@ -72,7 +73,8 @@ export default {
       }
       if (path === '/health' || path === '/') {
         await ensureSchema();
-        return json({ ok: true, service: 'nexora-api', version: '1.0.0', time: new Date().toISOString() });
+        /* ai: whether Nexora AI is switched on and which model — never the key */
+        return json({ ok: true, service: 'nexora-api', version: '1.0.0', time: new Date().toISOString(), ai: aiStatus() });
       }
 
       /* 4.42.0 — the website's contact and demo forms. Open by necessity:
@@ -252,6 +254,18 @@ export default {
         /* 4.66.6 — every other machine of the company pulls now */
         if (pushed && pushed.applied && pushed.applied.length) wakeCompany(a.companyId, a.row.device_id);
         return json(pushed);
+      }
+      /* Nexora AI, phase 1 — the shape of a BOM checked in plain words.
+         Signed-in people only; ai.js keeps only the technical fields and
+         counts each company's checks. */
+      if (path === '/v1/ai/check-bom' && method === 'POST') {
+        await ensureSchema();
+        const a = await authorise(request);
+        if (!a.ok) return json(a.error, a.httpStatus);
+        if (!a.user) return json({ error: 'SIGN_IN', message: 'Sign in to use Nexora AI.' }, 401);
+        const body = await readJson(request);
+        const out = await aiCheckBom(a.companyId || a.row.device_id, body.bom, body.lang === 'gu' ? 'gu' : 'en');
+        return json(out.body, out.httpStatus);
       }
       /* 4.66.6 — "within 5 second ma sync thai javu joiye". A signed-in
          machine keeps this one request open; it is answered the moment
