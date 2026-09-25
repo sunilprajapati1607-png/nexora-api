@@ -119,6 +119,20 @@ export async function register(body, request) {
     await logEvent(deviceId, 'REGISTER_REFUSED', { reason: 'EMAIL', email, ip: remoteIp(request) });
     return refuse(409, 'ALREADY_REGISTERED', 'This email address is already registered with Nexora. ' + SUPPORT_LINE, { field: 'email' });
   }
+  /* 4.66.3 — "ek j gst number, ek j pc par, ek j number thi be var demo na lai sake": the
+     mobile number too. Compared on its last ten digits, so +91 and 0-prefixed
+     spellings of one number are the same number. */
+  const dupMobile = await q(`SELECT id FROM companies WHERE length(regexp_replace(coalesce(phone, ''), '[^0-9]', '', 'g')) >= 10
+       AND right(regexp_replace(phone, '[^0-9]', '', 'g'), 10) = right($1, 10) LIMIT 1`, [mobile]);
+  if (dupMobile.length) {
+    await logEvent(deviceId, 'REGISTER_REFUSED', { reason: 'MOBILE', mobile, ip: remoteIp(request) });
+    return refuse(409, 'ALREADY_REGISTERED', 'This mobile number is already registered with Nexora. ' + SUPPORT_LINE, { field: 'mobile' });
+  }
+  const dupSeat = await q(`SELECT id FROM companies WHERE registered_device = $1 LIMIT 1`, [deviceId]);
+  if (dupSeat.length) {
+    await logEvent(deviceId, 'REGISTER_REFUSED', { reason: 'DEVICE', ip: remoteIp(request) });
+    return refuse(409, 'ALREADY_REGISTERED', 'This computer has already taken a demo with Nexora. Activate it with your company id and passcode, or with your licence key. ' + SUPPORT_LINE, { field: 'device' });
+  }
   const dupDevice = await q(`SELECT device_id FROM licences WHERE device_id = $1 LIMIT 1`, [deviceId]);
   if (dupDevice.length) {
     await logEvent(deviceId, 'REGISTER_REFUSED', { reason: 'DEVICE', ip: remoteIp(request) });
