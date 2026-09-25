@@ -160,10 +160,7 @@ const SYSTEM = [
 ].join(' ');
 
 function promptFor(p, lang) {
-  const gu = lang === 'gu';
-  return (gu
-    ? 'Reply in Gujarati (Gujarati script). Keep process names, material kinds and Nexora button names in English.\n'
-    : 'Reply in plain English.\n') + 'BOM:\n' + JSON.stringify(p);
+  return langLine(lang, 'your reply') + 'BOM:\n' + JSON.stringify(p);
 }
 
 function readAnswer(body) {
@@ -273,10 +270,11 @@ export async function planRoute(companyId, payload, lang, fetchImpl) {
   const p = cleanPlan(payload);
   if (!p.processes.length) return { httpStatus: 400, body: { error: 'NOTHING', message: 'The process master is empty.' } };
   if (!p.text && !p.bag.construction) return { httpStatus: 400, body: { error: 'NOTHING', message: 'Say what the bag is first.' } };
-  const prompt = (lang === 'gu'
-    ? 'Write summary, why and notes in Gujarati (Gujarati script); keep codes, process names and Nexora terms in English.\n'
-    : 'Write in plain English.\n') + 'INPUT:\n' + JSON.stringify(p);
-  const a = await ask(companyId, PLAN_SYSTEM, prompt, fetchImpl);
+  const m = mediaParts(payload);
+  if (m.error) return m.error;
+  const prompt = langLine(lang, 'summary, why and notes') +
+    (m.audio ? 'The person describes the bag in the attached recording.\n' : '') + 'INPUT:\n' + JSON.stringify(p);
+  const a = await ask(companyId, PLAN_SYSTEM, m.parts.concat([{ text: prompt }]), fetchImpl);
   if (a.fail) return a.fail;
   const j = a.json || {};
   const codes = {};
@@ -319,8 +317,6 @@ export async function planRoute(companyId, payload, lang, fetchImpl) {
    asks for it (a dropdown where the field has options). Nothing is saved
    and nothing is weighed here: the application fills the form, the engine
    weighs, the person saves. */
-const AUDIO_TYPES = { 'audio/wav': 1, 'audio/x-wav': 1, 'audio/mp3': 1, 'audio/mpeg': 1, 'audio/ogg': 1, 'audio/flac': 1, 'audio/aac': 1, 'audio/webm': 1 };
-const MAX_AUDIO_B64 = 3 * 1024 * 1024;
 
 export function cleanFill(p) {
   const x = p && typeof p === 'object' ? p : {};
@@ -352,19 +348,17 @@ const FILL_SYSTEM = [
 export async function fillCalc(companyId, payload, lang, fetchImpl) {
   if (!aiConfigured()) return { httpStatus: 503, body: { error: 'AI_OFF', message: 'Nexora AI is not switched on at the service yet.' } };
   const p = cleanFill(payload);
-  const audio = payload && payload.audio && typeof payload.audio === 'object' ? payload.audio : null;
-  const mime = audio ? String(audio.mime || '').toLowerCase().split(';')[0] : '';
-  const data = audio ? String(audio.data || '') : '';
-  if (audio && (!AUDIO_TYPES[mime] || !data)) return { httpStatus: 400, body: { error: 'AUDIO', message: 'That recording could not be read.' } };
-  if (data.length > MAX_AUDIO_B64) return { httpStatus: 413, body: { error: 'AUDIO_LONG', message: 'That recording is too long — keep it under a minute.' } };
-  if (!audio && !p.text) return { httpStatus: 400, body: { error: 'NOTHING', message: 'Say or type what the bag is first.' } };
+  /* the voice, and — 4.67.0 — a photo, a drawing or a PDF of the bag */
+  const m = mediaParts(payload);
+  if (m.error) return m.error;
+  if (!m.parts.length && !p.text) return { httpStatus: 400, body: { error: 'NOTHING', message: 'Say, type or show the bag first.' } };
   if (!p.constructions.length || !p.fields.length) return { httpStatus: 400, body: { error: 'NOTHING', message: 'This plant has no constructions to choose from.' } };
-  const intro = (lang === 'gu'
-    ? 'Write summary and questions in Gujarati (Gujarati script); keep field names and units in English.\n'
-    : 'Write summary and questions in plain English.\n') +
-    (audio ? 'The bag is described in the attached recording.' + (p.text ? ' The person also typed: ' + p.text : '') + '\n' : 'The person typed: ' + p.text + '\n') +
+  const intro = langLine(lang, 'summary and questions') +
+    (m.audio ? 'The bag is described in the attached recording.\n' : '') +
+    (m.files ? 'The bag is also shown in the attached ' + m.files + ' photo(s) or document(s) — a drawing, a specification sheet or a sample bag: read its sizes and specification carefully; a size printed on a drawing is in the unit written beside it.\n' : '') +
+    (p.text ? 'The person typed: ' + p.text + '\n' : '') +
     'CONTEXT:\n' + JSON.stringify({ constructions: p.constructions, fields: p.fields, current: p.current });
-  const a = await ask(companyId, FILL_SYSTEM, audio ? [{ inlineData: { mimeType: mime, data: data } }, { text: intro }] : intro, fetchImpl);
+  const a = await ask(companyId, FILL_SYSTEM, m.parts.concat([{ text: intro }]), fetchImpl);
   if (a.fail) return a.fail;
   const j = a.json || {};
   /* checked against what was sent */
@@ -388,7 +382,7 @@ export async function fillCalc(companyId, payload, lang, fetchImpl) {
   const asked = {};
   list(j.missing, 20).forEach((m) => { if (m && fieldOf[m.key]) asked[m.key] = str(m.question, 200); });
   const missing = [];
-  if (!con) missing.push({ key: '__construction', question: lang === 'gu' ? 'કયું construction?' : 'Which construction is it?', type: 'enum', options: p.constructions.map((c) => c.name) });
+  if (!con) missing.push({ key: '__construction', question: lang === 'gu' ? 'કયું construction?' : lang === 'hi' ? 'कौन सा construction?' : 'Which construction is it?', type: 'enum', options: p.constructions.map((c) => c.name) });
   (con ? con.fields : []).forEach((k) => {
     const f = fieldOf[k];
     if (!f || inputs[k] !== undefined || (p.current.inputs[k] !== undefined && p.current.structure === (con && con.name))) return;
@@ -400,4 +394,172 @@ export async function fillCalc(companyId, payload, lang, fetchImpl) {
     construction: con ? con.name : null, inputs: inputs, bagQuantity: isFinite(qty) && qty > 0 ? Math.round(qty) : null,
     missing: missing, dropped: dropped
   } };
+}
+
+/* ==========================================================================
+   4.67.0 — MORE NEXORA AI: photos and documents, BOM changes by voice,
+   the quotation letter, and the helper. Owner 2026-09-26: "all"; "speak ane
+   type banne thavu joiye"; "gujrati hindi englsh".
+   ========================================================================== */
+
+/** The answer language, said the same way to every question. */
+export function langLine(lang, what) {
+  const w = what || 'your answer';
+  if (lang === 'gu') return 'Write ' + w + ' in Gujarati (Gujarati script). Keep codes, material names, process names, field names and Nexora button names in English.\n';
+  if (lang === 'hi') return 'Write ' + w + ' in Hindi (Devanagari script). Keep codes, material names, process names, field names and Nexora button names in English.\n';
+  return 'Write ' + w + ' in plain English.\n';
+}
+export function pickLang(v) { return v === 'gu' || v === 'hi' ? v : 'en'; }
+
+/* ---- what a person may attach: their voice, a photo, a drawing, a PDF ---- */
+const MEDIA_TYPES = {
+  'audio/wav': 1, 'audio/x-wav': 1, 'audio/mp3': 1, 'audio/mpeg': 1, 'audio/ogg': 1, 'audio/flac': 1, 'audio/aac': 1, 'audio/webm': 1,
+  'image/jpeg': 1, 'image/png': 1, 'image/webp': 1, 'image/heic': 1, 'application/pdf': 1
+};
+const MAX_MEDIA_B64 = 8 * 1024 * 1024;
+/** The recording and the attachments of a request, checked, as Gemini parts. */
+export function mediaParts(payload) {
+  const x = payload && typeof payload === 'object' ? payload : {};
+  const all = [].concat(x.audio && typeof x.audio === 'object' ? [x.audio] : [], Array.isArray(x.attachments) ? x.attachments.slice(0, 4) : []);
+  let total = 0;
+  const parts = [];
+  for (const m of all) {
+    const mime = String((m && m.mime) || '').toLowerCase().split(';')[0];
+    const data = String((m && m.data) || '');
+    if (!MEDIA_TYPES[mime] || !data) return { error: { httpStatus: 400, body: { error: 'MEDIA', message: 'That recording or file could not be read (use a photo, a PDF or the microphone).' } } };
+    total += data.length;
+    if (total > MAX_MEDIA_B64) return { error: { httpStatus: 413, body: { error: 'MEDIA_BIG', message: 'That is too much to send at once — a minute of speech, or a few photos.' } } };
+    parts.push({ inlineData: { mimeType: mime, data: data } });
+  }
+  return { parts: parts, audio: all.some((m) => /^audio\//.test(String(m && m.mime))), files: all.filter((m) => !/^audio\//.test(String(m && m.mime))).length };
+}
+
+/* ---- BOM changes, said or typed -------------------------------------------
+   "Lamination ma LD 10 taka umero", "slitting waste 4 karo". Nexora AI turns
+   it into a list of changes on THIS BOM's stages and THIS plant's materials;
+   the application shows them and the person accepts. It sees material codes,
+   names and groups — never a price. */
+export function cleanEdit(p) {
+  const x = p && typeof p === 'object' ? p : {};
+  return {
+    text: str(x.text, 600),
+    stages: list(x.stages, 30).map((s) => ({ n: nr(s && s.n), process: str(s && s.process, 60), code: str(s && s.code, 30), wastePct: nr(s && s.wastePct),
+      lines: list(s && s.lines, 25).map((l, i) => ({ line: i + 1, kind: l && l.kind === 'SFG' ? 'SFG' : 'RM', material: str(l && l.material, 40), name: str(l && l.name, 60),
+        basis: str(l && l.basis, 10), value: nr(l && l.value) })) })).filter((s) => s.n),
+    materials: list(x.materials, 300).map((m) => ({ code: str(m && m.code, 40), name: str(m && m.name, 60), group: str(m && m.group, 30) })).filter((m) => m.code)
+  };
+}
+const EDIT_SYSTEM = [
+  'You are Nexora AI, inside Nexora, software that plans PP/PE woven sack production.',
+  'A person tells you, by voice or in writing (English, Gujarati or Hindi), how to change the bill of materials whose STAGES are given (each with its recipe lines and waste). Turn it into changes.',
+  'Changes you may make: {"op":"waste","stage":n,"value":percent}; {"op":"add","stage":n,"material":CODE,"basis":"PCT"|"PERBAG_G"|"PER1000"|"ABS","value":number}; {"op":"set","stage":n,"line":k,"value":number}; {"op":"remove","stage":n,"line":k}.',
+  'Use only material CODES from the MATERIALS list (match by name or code, e.g. "LD" or "LD granule"), only stages and lines that exist. "percent" of a material is basis PCT (percent of the stage gross). Do not change anything that was not asked. Never invent a price.',
+  'Answer ONLY with JSON: {"summary": string, "transcript": string, "changes": [ ... ], "notes": [string]}.'
+].join(' ');
+export async function editBom(companyId, payload, lang, fetchImpl) {
+  if (!aiConfigured()) return { httpStatus: 503, body: { error: 'AI_OFF', message: 'Nexora AI is not switched on at the service yet.' } };
+  const p = cleanEdit(payload);
+  const m = mediaParts(payload);
+  if (m.error) return m.error;
+  if (!p.stages.length) return { httpStatus: 400, body: { error: 'NOTHING', message: 'There is no route on this BOM to change.' } };
+  if (!p.text && !m.parts.length) return { httpStatus: 400, body: { error: 'NOTHING', message: 'Say or type the change first.' } };
+  const intro = langLine(lang, 'summary and notes') + (m.audio ? 'The change is said in the attached recording.' + (p.text ? ' Also typed: ' + p.text : '') : 'The change, typed: ' + p.text) +
+    '\nBOM:\n' + JSON.stringify({ stages: p.stages, materials: p.materials });
+  const a = await ask(companyId, EDIT_SYSTEM, m.parts.concat([{ text: intro }]), fetchImpl);
+  if (a.fail) return a.fail;
+  const j = a.json || {};
+  const stageOf = {}; p.stages.forEach((s) => { stageOf[s.n] = s; });
+  const matOf = {}; p.materials.forEach((x) => { matOf[x.code.toUpperCase()] = x; });
+  const BASES = { PCT: 1, PERBAG_G: 1, PER1000: 1, ABS: 1, PART_G: 1 };
+  const changes = [], refused = [];
+  list(j.changes, 20).forEach((c) => {
+    const st = stageOf[Number(c && c.stage)];
+    const v = Number(c && c.value);
+    if (!c || !st) { refused.push('stage ' + (c && c.stage)); return; }
+    if (c.op === 'waste') { if (isFinite(v) && v >= 0 && v < 100) changes.push({ op: 'waste', stage: st.n, value: Math.round(v * 1000) / 1000 }); else refused.push('waste ' + c.value); return; }
+    if (c.op === 'add') {
+      const mat = matOf[String(c.material || '').toUpperCase()];
+      if (!mat || !isFinite(v) || v < 0) { refused.push('add ' + c.material); return; }
+      changes.push({ op: 'add', stage: st.n, material: mat.code, name: mat.name, basis: BASES[c.basis] ? c.basis : 'PCT', value: Math.round(v * 1000) / 1000 });
+      return;
+    }
+    const line = Number(c.line);
+    if ((c.op === 'set' || c.op === 'remove') && line >= 1 && line <= st.lines.length) {
+      if (c.op === 'remove') { changes.push({ op: 'remove', stage: st.n, line: line }); return; }
+      if (isFinite(v) && v >= 0) { changes.push({ op: 'set', stage: st.n, line: line, value: Math.round(v * 1000) / 1000 }); return; }
+    }
+    refused.push(String(c.op) + ' ' + (c.line || ''));
+  });
+  return { httpStatus: 200, body: { ok: true, model: a.model, left: a.left, summary: str(j.summary, 400), transcript: str(j.transcript, 600),
+    changes: changes, notes: list(j.notes, 6).map((n) => str(n, 300)).filter(Boolean).concat(refused.length ? ['Not understood or not allowed: ' + refused.join(', ')] : []) } };
+}
+
+/* ---- the quotation, as a letter and a WhatsApp message --------------------
+   Selling figures go (they are on the quotation the buyer receives); cost
+   never; the buyer's name never — the letter says {{CUSTOMER}} and the
+   application puts the name in. */
+export function cleanQuote(p) {
+  const x = p && typeof p === 'object' ? p : {};
+  const q = x.quote && typeof x.quote === 'object' ? x.quote : {};
+  return {
+    text: str(x.text, 400),
+    quote: {
+      number: str(q.number, 40), date: str(q.date, 20), validDays: nr(q.validDays), currency: str(q.currency, 6) || 'INR',
+      seller: str(q.seller, 80), sellerCity: str(q.sellerCity, 40),
+      items: list(q.items, 30).map((i) => ({ description: str(i && i.description, 120), size: str(i && i.size, 60), quantity: nr(i && i.quantity), unit: str(i && i.unit, 12),
+        rate: nr(i && i.rate), amount: nr(i && i.amount) })),
+      terms: list(q.terms, 12).map((t) => ({ name: str(t && t.name, 40), value: str(t && t.value, 160) })),
+      total: nr(q.total)
+    }
+  };
+}
+const QUOTE_SYSTEM = [
+  'You are Nexora AI, inside Nexora, writing for a PP/PE woven sack manufacturer to its buyer.',
+  'From the QUOTATION given, write a short, courteous covering letter (with a subject line) and a WhatsApp message. Use the figures exactly as given; do not add, round or invent any figure, term or promise.',
+  'Address the buyer as {{CUSTOMER}} (the application puts the name in); sign as the seller given, or {{SELLER}} if none.',
+  'Answer ONLY with JSON: {"subject": string, "letter": string, "whatsapp": string}.'
+].join(' ');
+export async function quoteLetter(companyId, payload, lang, fetchImpl) {
+  if (!aiConfigured()) return { httpStatus: 503, body: { error: 'AI_OFF', message: 'Nexora AI is not switched on at the service yet.' } };
+  const p = cleanQuote(payload);
+  const m = mediaParts(payload);
+  if (m.error) return m.error;
+  if (!p.quote.items.length) return { httpStatus: 400, body: { error: 'NOTHING', message: 'This quotation has no items yet.' } };
+  const intro = langLine(lang, 'the letter and the message') + (m.audio ? 'The person also said what to stress, in the attached recording.' : '') +
+    (p.text ? ' The person asks: ' + p.text : '') + '\nQUOTATION:\n' + JSON.stringify(p.quote);
+  const a = await ask(companyId, QUOTE_SYSTEM, m.parts.concat([{ text: intro }]), fetchImpl);
+  if (a.fail) return a.fail;
+  const j = a.json || {};
+  return { httpStatus: 200, body: { ok: true, model: a.model, left: a.left, subject: str(j.subject, 200), letter: str(j.letter, 4000), whatsapp: str(j.whatsapp, 1500) } };
+}
+
+/* ---- the helper: how do I…, what is… — from Nexora's own help ------------ */
+export function cleanHelp(p) {
+  const x = p && typeof p === 'object' ? p : {};
+  return {
+    text: str(x.text, 600), screen: str(x.screen, 40),
+    topics: list(x.topics, 60).map((t) => ({ title: str(t && t.title, 160), where: str(t && t.where, 160), body: str(t && t.body, 4000) })).filter((t) => t.title),
+    glossary: list(x.glossary, 200).map((g) => ({ term: str(g && g.term, 60), meaning: str(g && g.meaning, 400) })).filter((g) => g.term)
+  };
+}
+const HELP_SYSTEM = [
+  'You are Nexora AI, the helper inside Nexora (bag weight, BOM, costing and quotation software for PP/PE woven sacks).',
+  'Answer the person’s question ONLY from the HELP TOPICS and GLOSSARY given. Say where in Nexora to go (menu, window, button). Keep it short, in steps when it is a how-to.',
+  'If the answer is not in what is given, say so plainly and suggest the nearest topic — never invent a feature.',
+  'Answer ONLY with JSON: {"transcript": string, "answer": string, "topics": [string]}.'
+].join(' ');
+export async function help(companyId, payload, lang, fetchImpl) {
+  if (!aiConfigured()) return { httpStatus: 503, body: { error: 'AI_OFF', message: 'Nexora AI is not switched on at the service yet.' } };
+  const p = cleanHelp(payload);
+  const m = mediaParts(payload);
+  if (m.error) return m.error;
+  if (!p.text && !m.parts.length) return { httpStatus: 400, body: { error: 'NOTHING', message: 'Say or type the question first.' } };
+  const intro = langLine(lang, 'the answer') + (m.audio ? 'The question is in the attached recording.' + (p.text ? ' Also typed: ' + p.text : '') : 'The question: ' + p.text) +
+    (p.screen ? '\nThe person is on the ' + p.screen + ' window.' : '') + '\nHELP:\n' + JSON.stringify({ topics: p.topics, glossary: p.glossary });
+  const a = await ask(companyId, HELP_SYSTEM, m.parts.concat([{ text: intro }]), fetchImpl);
+  if (a.fail) return a.fail;
+  const j = a.json || {};
+  const titles = {}; p.topics.forEach((t) => { titles[t.title] = true; });
+  return { httpStatus: 200, body: { ok: true, model: a.model, left: a.left, transcript: str(j.transcript, 600), answer: str(j.answer, 3000),
+    topics: list(j.topics, 5).map((t) => str(t, 160)).filter((t) => titles[t]) } };
 }
