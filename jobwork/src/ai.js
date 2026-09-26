@@ -276,7 +276,7 @@ const SYSTEM = [
   'You know job work well. INWARD job work (direction IN): a customer (the principal) sends its own material; the plant receives it (material receipt, their challan), makes a production order, issues material to production, receives what was made (production receipt, batches), tests it (QC), releases it to finished goods, sends it back to the party with a challan, and raises a job-work invoice for the processing. OUTWARD job work (OUT): the plant sends its own material to a job worker on a delivery challan and gets it back processed; under GST the goods must come back within 1 year (capital goods 3 years) and are reported on ITC-04. The plan pipeline is PLAN → RECEIPT → [PO → ISSUE → PRODUCTION] → QC → RELEASE → DISPATCH → INVOICE → CLOSED. Stock is kept by plan, stage, warehouse and batch; a batch is issued FIFO (oldest first) or FEFO (first to expire); the balance of a plan is what came in minus what went out, used and wasted.',
   'You see the window the person is on (SCREEN, NOW) and a summary of THIS plant: parties as tokens P1, P2… with their type, items as tokens I1, I2… with their material group, class (RM raw material, SFG semi-finished, FG finished) and units, open PLANS, production ORDERS, STOCK in kg, PENDING work, processes, routes and warehouses. Write P and I tokens exactly as given (Nexora shows the real names on the person’s screen). You NEVER see — and must never ask for, guess or invent — a party’s name, an item’s name, a rate, a price, an amount or a cost. When the person asks about money (invoice amounts, totals, tax), return an "invoices" table — Nexora works the amounts out on their screen and you never see them; for rates, bills or profit open that window.',
   'BE OPEN. Answer ANYTHING the person asks, as fully as they want it: this plant\u2019s work, job work and GST (job-work challans, ITC-04, section 143, e-way bills), processes and quality (extrusion, weaving, lamination, printing, stitching, yields, waste, QC), planning, how to do something in Nexora, or any general question. The only things you cannot give are a party\u2019s name, an item\u2019s name and money figures — and even those the person gets, because a table is worked out on their screen.',
-  'TABLES. Whenever the answer is a list, a comparison or figures from the plant\u2019s data — stock, movements, plans, orders, batches, challans, invoices, QC, "which", "how much", "list", "total", "party wise", "month wise" — return a "table" step (more than one if useful). Nexora works it out EXACTLY from its own book, with the real names and a total row; you do NOT add up or copy figures into "answer" — say in one line what the table shows and what to notice. A table step runs by itself; the person does not press Run. For knowledge that is naturally a table (a comparison, a checklist, a schedule), put it in "tables": [{"title": string, "columns": [string, …], "rows": [[cell, …], …], "total": true|false}] — "total": true only when a column is a quantity to add.',
+  'TABLES. Whenever the answer is a list, a comparison or figures from the plant\u2019s data — stock, movements, plans, orders, batches, challans, invoices, QC, "which", "how much", "list", "total", "party wise", "month wise" — return a "table" step (more than one if useful). Nexora works it out EXACTLY from its own book, with the real names and a total row; you do NOT add up or copy figures into "answer" — say in one line what the table shows and what to notice. A table step runs by itself; the person does not press Run. For knowledge that is naturally a table (a comparison, a checklist, a schedule), put it in "tables": [{"title": string, "columns": [string, …], "rows": [[cell, …], …], "total": true|false}] — "total": true only when a column is a quantity to add. NEVER copy the plant2019s own figures (stock, kg, plans, orders, invoices) into "tables" — the plant2019s data always goes as a table step, and never both.
   'The summary you are given (PLANS, ORDERS, STOCK, PENDING) is for understanding what the person means; when you are not sure it holds everything, ask for a table.',
   'Never mention tokens to the person: write P3 or I7 where the name goes (Nexora puts the name there), but never words like "token", "P token" or "code P1" — in "answer" and in "tables" alike.',
   'When the person asks for work to be done, return STEPS. Steps allowed: ' + STEP_LIST.join(' '),
@@ -403,12 +403,34 @@ export function _noThinking() { return noThinking; }
 async function ask(device, system, prompt, fetchImpl) {
   const t0 = Date.now();
   const done = (out, what) => { console.log('ai ' + what + ' ' + (Date.now() - t0) + ' ms' + (out && out.model ? ' ' + out.model : '')); return out; };
-  const r0 = await askOnce(device, system, prompt, fetchImpl);
+  let r0 = await askOnce(device, system, prompt, fetchImpl);
+  /* an answer that could not be read is asked for once more (not counted
+     again) — the person should not press Send twice for Google's slip */
+  if (r0.fail && r0.fail.body && r0.fail.body.error === 'AI_UNREADABLE') {
+    console.log('ai AI_UNREADABLE, asking again');
+    r0 = await askOnce(device, system, prompt, fetchImpl, true);
+  }
   return done(r0, r0.fail ? (r0.fail.body && r0.fail.body.error) : 'ok');
 }
-async function askOnce(device, system, prompt, fetchImpl) {
+
+/* 2.0.1 — measured: AI_UNREADABLE in 2 s, twice in ten. A model that
+   thinks may send its thought summary as a part of its own ("thought":
+   true) beside the answer; joined, they are not JSON. Only the answer's
+   parts are read, and if need be only from the first { to the last }. */
+export function readJsonAnswer(body) {
+  const c = (((body && body.candidates) || [])[0] || {}).content;
+  const text = ((c && c.parts) || []).filter((x) => x && !x.thought).map((x) => x.text || '').join('').trim()
+    .replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '');
+  if (!text) return null;
+  try { return JSON.parse(text); } catch (e) { /* cut it out below */ }
+  const a = text.indexOf('{'), b = text.lastIndexOf('}');
+  if (a < 0 || b <= a) return null;
+  try { return JSON.parse(text.slice(a, b + 1)); } catch (e) { return null; }
+}
+
+async function askOnce(device, system, prompt, fetchImpl, again) {
   if (!aiConfigured()) return { fail: { httpStatus: 503, body: { error: 'AI_OFF', message: 'Nexora AI is not switched on at the service yet.' } } };
-  const t = take(device);
+  const t = again ? { left: undefined } : take(device);
   if (t.busy) return { fail: { httpStatus: 429, body: { error: 'AI_BUSY', retryAfter: t.busy, message: 'Nexora AI is busy — try again in ' + t.busy + ' seconds.' } } };
   if (t.spent) return { fail: { httpStatus: 429, body: { error: 'AI_DAILY', message: 'This computer has used today’s ' + daily() + ' Nexora AI questions. They come back tomorrow.' } } };
   let name = await resolveModel(false, fetchImpl);
@@ -443,11 +465,7 @@ async function askOnce(device, system, prompt, fetchImpl) {
     return { fail: { httpStatus: busy ? 429 : 502, body: { error: busy ? 'AI_BUSY' : 'AI_FAILED', retryAfter: busy ? 60 : undefined,
       message: busy ? 'Nexora AI is busy (Google’s limit) — try again in a minute.' : 'Nexora AI could not answer (' + r.status + '): ' + scrub(r.body && r.body.error && r.body.error.message) } } };
   }
-  const parts = (((r.body && r.body.candidates) || [])[0] || {}).content;
-  const text = ((parts && parts.parts) || []).map((x) => x.text || '').join('').trim()
-    .replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '');
-  let json = null;
-  try { json = text ? JSON.parse(text) : null; } catch (e) { json = null; }
+  const json = readJsonAnswer(r.body);
   if (!json) return { fail: { httpStatus: 502, body: { error: 'AI_UNREADABLE', message: 'Nexora AI answered in a form Nexora could not read. Try again.' } } };
   return { json: json, model: name, left: t.left };
 }

@@ -3,7 +3,7 @@
    party's name, an item's name and money never leave this service. */
 import assert from 'node:assert/strict';
 import { handle } from './server.js';
-import { cleanAssist, checkSteps, cleanTables, _resetLimits, resolveModel, thinkingFor, _noThinking } from './src/ai.js';
+import { cleanAssist, checkSteps, cleanTables, _resetLimits, resolveModel, thinkingFor, _noThinking, readJsonAnswer } from './src/ai.js';
 
 let pass = 0;
 const t = async (name, fn) => { try { await fn(); pass++; console.log('ok   ' + name); } catch (e) { console.error('FAIL ' + name + '\n', e); process.exitCode = 1; } };
@@ -187,6 +187,25 @@ await t('least thinking is asked for; a model that refuses it is asked again wit
   assert.equal(n, 1); assert.ok(/thinkingConfig/.test(g[0].body) && !/thinkingConfig/.test(g[g.length - 1].body));
   assert.equal(thinkingFor(r.json.model), null);
   _noThinking().clear();
+});
+
+await t('the answer is read without the thought parts, and cut from { to }', async () => {
+  const j = readJsonAnswer({ candidates: [{ content: { parts: [{ thought: true, text: 'Thinking about stock...' }, { text: '{\"answer\":\"ok\",\"steps\":[]}' }] } }] });
+  assert.deepEqual(j, { answer: 'ok', steps: [] });
+  assert.deepEqual(readJsonAnswer({ candidates: [{ content: { parts: [{ text: 'Here: {\"a\":1} done' }] } }] }), { a: 1 });
+  assert.equal(readJsonAnswer({ candidates: [{ content: { parts: [{ text: 'no json' }] } }] }), null);
+});
+
+await t('an unreadable answer is asked for once more, counted once', async () => {
+  _resetLimits(); sent.length = 0;
+  await resolveModel(true, fakeGoogle({}));
+  let calls = 0;
+  const flaky = async (url, init) => {
+    if (/generateContent/.test(url) && ++calls === 1) return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: 'not json at all' }] } }] }), { status: 200 });
+    return fakeGoogle({ lang: 'en', answer: 'second time', steps: [] })(url, init);
+  };
+  const r = await call('POST', '/v1/ai/assist', { device: 'dev-flaky001', assist: { text: 'hi' } }, flaky);
+  assert.equal(r.status, 200); assert.equal(r.json.answer, 'second time'); assert.equal(calls, 2);
 });
 
 console.log(pass + ' passed');
