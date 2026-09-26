@@ -3,7 +3,7 @@
    party's name, an item's name and money never leave this service. */
 import assert from 'node:assert/strict';
 import { handle } from './server.js';
-import { cleanAssist, checkSteps, cleanTables, _resetLimits, resolveModel } from './src/ai.js';
+import { cleanAssist, checkSteps, cleanTables, _resetLimits, resolveModel, thinkingFor, _noThinking } from './src/ai.js';
 
 let pass = 0;
 const t = async (name, fn) => { try { await fn(); pass++; console.log('ok   ' + name); } catch (e) { console.error('FAIL ' + name + '\n', e); process.exitCode = 1; } };
@@ -168,6 +168,25 @@ await t('knowledge tables are cut to size and hold only text and numbers', async
   const t2 = cleanTables([{ title: 'ITC-04', columns: ['What', 'When'], rows: [['Goods sent', 'Quarterly'], [{ x: 1 }, 5, 'extra']], total: false }, { columns: [] }]);
   assert.equal(t2.length, 1);
   assert.deepEqual(t2[0].rows[1], ['[object Object]', 5]);
+});
+
+await t('least thinking is asked for; a model that refuses it is asked again without', async () => {
+  assert.deepEqual(thinkingFor('gemini-3.5-flash-lite'), { thinkingLevel: 'low' });
+  assert.deepEqual(thinkingFor('gemini-2.5-flash-lite'), { thinkingBudget: 0 });
+  _resetLimits(); _noThinking().clear(); sent.length = 0;
+  await resolveModel(true, fakeGoogle({}));
+  let n = 0;
+  const refuse = async (url, init) => {
+    sent.push({ url: String(url), body: String((init && init.body) || '') });
+    if (/generateContent/.test(url) && /thinkingConfig/.test(String(init.body)) && ++n) return new Response(JSON.stringify({ error: { message: 'Unknown name thinkingLevel: Cannot find field.' } }), { status: 400 });
+    return fakeGoogle({ lang: 'en', answer: 'ok', steps: [] })(url, init);
+  };
+  const r = await call('POST', '/v1/ai/assist', { device: 'dev-12345678', assist: { text: 'hi' } }, refuse);
+  assert.equal(r.status, 200, JSON.stringify(r.json));
+  const g = sent.filter((s) => /generateContent/.test(s.url));
+  assert.equal(n, 1); assert.ok(/thinkingConfig/.test(g[0].body) && !/thinkingConfig/.test(g[g.length - 1].body));
+  assert.equal(thinkingFor('gemini-3.5-flash-lite'), null);
+  _noThinking().clear();
 });
 
 console.log(pass + ' passed');

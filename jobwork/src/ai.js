@@ -41,7 +41,7 @@ function bestOf(names) {
   return names.filter((n) => !blocked.has(n) && rankOf(n) !== null).sort((a, b) => rankOf(b) - rankOf(a))[0] || null;
 }
 const MODEL_TTL_MS = 6 * 60 * 60 * 1000;
-const TIMEOUT_MS = 40000;
+const TIMEOUT_MS = 80000;
 
 /* GEMINI_API_KEY — or the name the dashboard was given (the owner's is
    NEXORA_JOBOWRK): a variable whose name says GEMINI, NEXORA or JOBWORK and
@@ -377,27 +377,53 @@ export function checkSteps(p, raw) {
   return { steps: out, dropped: dropped };
 }
 
+/* ---- how long it may think ----------------------------------------------------
+   2.0.1 — measured: the same small question took 8 s, then 42 s an hour
+   later. The newer Flash-Lite models THINK before they answer, and a longer
+   prompt makes them think longer; an assistant on a plant floor wants the
+   answer. So the least thinking is asked for (Gemini 3: thinkingLevel low;
+   2.5: a budget of 0). A model that does not take the setting says so with
+   a 400 and is asked again without it, and remembered. GEMINI_THINKING=off
+   leaves the model to itself. */
+const noThinking = new Set();
+export function thinkingFor(name) {
+  if (String(process.env.GEMINI_THINKING || '').toLowerCase() === 'off' || noThinking.has(name)) return null;
+  if (/^gemini-[3-9]/.test(name)) return { thinkingLevel: 'low' };
+  if (/^gemini-2\.5/.test(name)) return { thinkingBudget: 0 };
+  return null;
+}
+export function _noThinking() { return noThinking; }
+
 /* ---- one call to Gemini --------------------------------------------------- */
 async function ask(device, system, prompt, fetchImpl) {
+  const t0 = Date.now();
+  const done = (out, what) => { console.log('ai ' + what + ' ' + (Date.now() - t0) + ' ms' + (out && out.model ? ' ' + out.model : '')); return out; };
+  const r0 = await askOnce(device, system, prompt, fetchImpl);
+  return done(r0, r0.fail ? (r0.fail.body && r0.fail.body.error) : 'ok');
+}
+async function askOnce(device, system, prompt, fetchImpl) {
   if (!aiConfigured()) return { fail: { httpStatus: 503, body: { error: 'AI_OFF', message: 'Nexora AI is not switched on at the service yet.' } } };
   const t = take(device);
   if (t.busy) return { fail: { httpStatus: 429, body: { error: 'AI_BUSY', retryAfter: t.busy, message: 'Nexora AI is busy — try again in ' + t.busy + ' seconds.' } } };
   if (t.spent) return { fail: { httpStatus: 429, body: { error: 'AI_DAILY', message: 'This computer has used today’s ' + daily() + ' Nexora AI questions. They come back tomorrow.' } } };
   let name = await resolveModel(false, fetchImpl);
   if (!name) return { fail: { httpStatus: 503, body: { error: 'AI_MODEL', message: 'Nexora AI has no model it can use right now.' } } };
-  const payload = JSON.stringify({
-    systemInstruction: { parts: [{ text: system }] },
-    contents: prompt.contents,
-    generationConfig: { temperature: 0.2, responseMimeType: 'application/json', maxOutputTokens: 4096 }
-  });
+  const payloadFor = (n) => {
+    const gc = { temperature: 0.2, responseMimeType: 'application/json', maxOutputTokens: 4096 };
+    const th = thinkingFor(n);
+    if (th) gc.thinkingConfig = th;
+    return JSON.stringify({ systemInstruction: { parts: [{ text: system }] }, contents: prompt.contents, generationConfig: gc });
+  };
   let r;
   for (let attempt = 0; ; attempt++) {
     try {
-      r = await gfetch(API + '/models/' + encodeURIComponent(name) + ':generateContent', { method: 'POST', body: payload }, fetchImpl);
+      r = await gfetch(API + '/models/' + encodeURIComponent(name) + ':generateContent', { method: 'POST', body: payloadFor(name) }, fetchImpl);
     } catch (e) {
       return { fail: { httpStatus: 504, body: { error: 'AI_TIMEOUT', message: 'Nexora AI did not answer in time. Try again.' } } };
     }
     const msg = String((r.body && r.body.error && r.body.error.message) || '');
+    /* a model that does not take the thinking setting: ask again without it */
+    if (r.status === 400 && /think/i.test(msg) && thinkingFor(name) && attempt < 3) { noThinking.add(name); continue; }
     const gone = !r.ok && (r.status === 404 || /no longer available|not found|is not supported|deprecated/i.test(msg));
     if (!gone || attempt >= 2) break;
     blocked.add(name);
