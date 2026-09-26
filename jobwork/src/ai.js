@@ -541,7 +541,7 @@ export async function transcribe(device, payload, fetchImpl) {
     contents: [{ role: 'user', parts: m.parts.concat([{ text: said + (hints.length ? ' Words used in this plant: ' + hints.join(', ') + '.' : '') }]) }],
     generationConfig: Object.assign({ temperature: 0, responseMimeType: 'application/json', maxOutputTokens: 1024 }, thinkingFor(earModel()) ? { thinkingConfig: thinkingFor(earModel()) } : {}) });
   const t0 = Date.now();
-  let name = earModel();
+  let name = (payload && payload.model && (model.available || []).indexOf(String(payload.model)) > -1) ? String(payload.model) : earModel();
   let r;
   for (let attempt = 0; attempt < 3; attempt++) {
     try { r = await gfetch(API + '/models/' + encodeURIComponent(name) + ':generateContent', { method: 'POST', body: attempt && !thinkingFor(name) ? body.replace(/,"thinkingConfig":\{[^}]*\}/, '') : body }, fetchImpl); }
