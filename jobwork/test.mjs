@@ -239,7 +239,7 @@ await t('transcribe: the recording goes to the ear, with the language said; the 
   assert.equal(r.status, 200, JSON.stringify(r.json));
   assert.equal(r.json.text, 'JW-2026-A-000002 પર 1200 kg receipt કરો'); assert.equal(r.json.lang, 'gu');
   const g = sent.filter((x) => /generateContent/.test(x.url)).pop();
-  assert.ok(/gemini-3\.5-flash:generateContent/.test(g.url));
+  assert.ok(/gemini-3\.5-flash-lite:generateContent/.test(g.url));
   assert.ok(/speaks GUJARATI/.test(g.body) && /LAMINATION/.test(g.body) && /audio\/wav/.test(g.body));
   /* the question after it is still allowed: listening did not use the day's one */
   const a = await call('POST', '/v1/ai/assist', { device: 'dev-ear00001', assist: { text: 'hi' } }, fakeGoogle({ lang: 'en', answer: 'ok', steps: [] }));
@@ -282,7 +282,7 @@ await t('the ear: a busy Flash (503) hands the recording to Lite', async () => {
     if (/gemini-3\.5-flash:generateContent/.test(url)) { sent.push({ url: String(url), body: '' }); return new Response(JSON.stringify({ error: { message: 'overloaded' } }), { status: 503 }); }
     return fakeGoogle({ text: 'stock ketlo che', lang: 'gu' })(url, init);
   };
-  const r = await call('POST', '/v1/ai/transcribe', { device: 'dev-ear00002', lang: 'gu', audio: { mime: 'audio/wav', data: 'AAAA' } }, busy);
+  const r = await call('POST', '/v1/ai/transcribe', { device: 'dev-ear00002', lang: 'gu', careful: true, audio: { mime: 'audio/wav', data: 'AAAA' } }, busy);
   assert.equal(r.status, 200, JSON.stringify(r.json)); assert.equal(r.json.model, 'gemini-3.5-flash-lite'); assert.equal(r.json.text, 'stock ketlo che');
 });
 

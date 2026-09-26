@@ -541,7 +541,10 @@ export async function transcribe(device, payload, fetchImpl) {
     contents: [{ role: 'user', parts: m.parts.concat([{ text: said + (hints.length ? ' Words used in this plant: ' + hints.join(', ') + '.' : '') }]) }],
     generationConfig: Object.assign({ temperature: 0, responseMimeType: 'application/json', maxOutputTokens: 1024 }, thinkingFor(earModel()) ? { thinkingConfig: thinkingFor(earModel()) } : {}) });
   const t0 = Date.now();
-  let name = (payload && payload.model && (model.available || []).indexOf(String(payload.model)) > -1) ? String(payload.model) : earModel();
+  /* 2.0.3 — measured on the same sentence: Flash-Lite heard it exactly in 2.5-3 s, Flash in 20 s.
+     The dedicated prompt is what hears better; Lite is the ear, Flash the careful ear when asked for. */
+  let name = (payload && payload.model && (model.available || []).indexOf(String(payload.model)) > -1) ? String(payload.model)
+    : (payload && payload.careful ? earModel() : (model.name || earModel()));
   let r;
   for (let attempt = 0; attempt < 3; attempt++) {
     try { r = await gfetch(API + '/models/' + encodeURIComponent(name) + ':generateContent', { method: 'POST', body: attempt && !thinkingFor(name) ? body.replace(/,"thinkingConfig":\{[^}]*\}/, '') : body }, fetchImpl); }
@@ -551,6 +554,7 @@ export async function transcribe(device, payload, fetchImpl) {
     if (!r.ok && (r.status === 404 || /no longer available|not found|not supported/i.test(msg)) && name !== model.name) { name = model.name; continue; }
     /* 2.0.3 — measured: the Flash models answered 503 (Google overloaded) for minutes at a time; Lite still hears */
     if (!r.ok && (r.status === 503 || r.status === 500 || r.status === 429) && name !== model.name) { name = model.name; continue; }
+    if (!r.ok && (r.status === 503 || r.status === 500) && name === model.name && earModel() !== name && attempt === 0) { name = earModel(); continue; }
     break;
   }
   console.log('ai ear ' + (r && r.ok ? 'ok' : r && r.status) + ' ' + (Date.now() - t0) + ' ms ' + name);
