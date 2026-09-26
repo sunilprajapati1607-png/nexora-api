@@ -208,4 +208,11 @@ await t('an unreadable answer is asked for once more, counted once', async () =>
   assert.equal(r.status, 200); assert.equal(r.json.answer, 'second time'); assert.equal(calls, 2);
 });
 
+await t('a window step is checked like a table and keeps its kind', async () => {
+  const p = cleanAssist(PAYLOAD);
+  const c = checkSteps(p, [{ do: 'window', title: 'Stock by group', from: 'stock', where: { party: 'P1', cost: 5 }, by: ['group'], show: ['kg'] }]);
+  assert.deepEqual(c.steps, [{ do: 'window', title: 'Stock by group', from: 'stock', where: { party: 'P1' }, by: ['group'], show: ['kg'], sort: '', limit: 200 }]);
+  assert.ok(c.dropped.indexOf('filter cost') > -1);
+});
+
 console.log(pass + ' passed');

@@ -255,6 +255,7 @@ const TABLE_STEP = '{"do":"table","title":short title,"from":' + Object.keys(TAB
 /* ---- the steps ----------------------------------------------------------- */
 const STEP_LIST = [
   TABLE_STEP,
+  '{"do":"window", …the same fields as a table…} — "window ma aapo", "show it in the window", "open it", "give me that in window": Nexora opens its OWN window for that data (Stock, Jobwork Plans, Production Orders, Challans, Invoices, the customer material ledger…) with the same grouping and filters. Runs by itself. Use it when the person asks for a window; a table in the chat otherwise.',
   '{"do":"open","view":VIEW} — go to a window (VIEW one of ' + VIEWS.filter((v) => v !== 'plan' && v !== 'porder').join('|') + ').',
   '{"do":"find","view":VIEW,"text":words} — open a register and put words in its search (a plan number, a batch, P3, I7…).',
   '{"do":"plan","no":PLAN NO} — open one plan (from PLANS).',
@@ -282,7 +283,7 @@ const SYSTEM = [
   'When the person asks for work to be done, return STEPS. Steps allowed: ' + STEP_LIST.join(' '),
   'Steps that make a document (newplan, receipt, porder, issue, production) only FILL the form — the person reads it and presses Post; Nexora checks it then. Use only plan and order numbers from PLANS and ORDERS, and only P and I tokens from PARTIES and ITEMS. Quantities are kg unless the person says the second unit (bags, pieces, rolls → qty2). "1.2 ton" is 1200 kg. Leave out a step the screen shows is already done. When the person corrects you ("no, 900 kg"), return the whole corrected list of steps again.',
   'If something needed is missing (which plan, which item, how much), still return the steps you can and ask for the rest in "answer".',
-  'FOLLOW-UPS ON A TABLE stay IN THE CHAT: "group it by material group", "party wise", "only I3", "sort by kg", "add batches", "this month only" about a table already shown means a NEW "table" step (the same "from", with the change) — never an "open" or "stock" step. Open a window only when the person asks to open, go to or show a window.',
+  'FOLLOW-UPS ON A TABLE stay IN THE CHAT: "group it by material group", "party wise", "only I3", "sort by kg", "add batches", "this month only" about a table already shown means a NEW "table" step (the same "from", with the change) — never an "open" or "stock" step. Open a window only when the person asks to open, go to or show a window — and for data (a table shown, or asked for "in the window") that is a "window" step with the table\u2019s fields, so Nexora opens its own register filtered and grouped the same way.',
   'HOW TO WRITE "answer" (Markdown, it is drawn on the screen): for a figure or a yes/no, one or two lines. For an explanation, a process, a procedure, a rule or a "how do I", write it ELABORATED and STRUCTURED, never one paragraph: "## " headings; numbered steps ("1. ") for anything done in order, each step saying what is done, by whom or at which stage, and where in Nexora (window and button in **bold**); "- " bullets for points; **bold** for key terms and figures; a short "## Checks" or "## Common mistakes" and a "## Tip" where they help. For a plant process (extrusion, weaving, lamination, printing, stitching…) cover: purpose, input and output, the steps, settings/parameters usually watched, typical waste %, quality checks, and how it is recorded in Nexora (which document at which stage). Use a Markdown table (| a | b |) inside "answer" for a small comparison; a big one goes in "tables".',
   'Reply in the SAME language the person used: English → English; Gujarati (in Gujarati script or in English letters) → Gujarati in Gujarati script; Hindi → Hindi in Devanagari. Keep document numbers, tokens, codes and Nexora button names in English; write numbers with the digits 0-9 (1200 kg, never ૧૨૦૦). Set "lang" to en, gu or hi accordingly.',
   'Answer ONLY with JSON: {"transcript": string (what the person said, when it came as a recording), "lang": "en"|"gu"|"hi", "answer": string, "steps": [ ... ], "tables": [ ... ]}.'
@@ -318,7 +319,7 @@ export function checkSteps(p, raw) {
   }).filter(Boolean);
   list(raw, 14).forEach((s) => {
     const d = s && String(s.do || '').toLowerCase();
-    if (d === 'table') {
+    if (d === 'table' || d === 'window') {
       const FROM_ALIAS = { ledger: 'movements', movement: 'movements', receipts: 'movements', issues: 'movements', transactions: 'movements',
         stock_ledger: 'movements', document: 'documents', docs: 'documents', plan: 'plans', order: 'orders', workorders: 'orders', production_orders: 'orders',
         batch: 'batches', challan: 'challans', invoice: 'invoices', bills: 'invoices', qc_tests: 'qc', tests: 'qc', inventory: 'stock', balances: 'stock' };
@@ -345,7 +346,7 @@ export function checkSteps(p, raw) {
       const sortKey = String(s.sort || '').replace(/^-/, '');
       const sort = (T.show.indexOf(sortKey) > -1 || T.by.indexOf(sortKey) > -1) ? String(s.sort) : '';
       const lim = Math.round(num(s.limit) || 0);
-      out.push({ do: 'table', title: str(s.title, 80) || from, from: from, where: where, by: by, show: show, sort: sort, limit: lim > 0 && lim <= 500 ? lim : 200 });
+      out.push({ do: d, title: str(s.title, 80) || from, from: from, where: where, by: by, show: show, sort: sort, limit: lim > 0 && lim <= 500 ? lim : 200 });
       return;
     }
     if (d === 'open') { const v = oneOf(s.view, VIEWS, null); if (v && v !== 'plan' && v !== 'porder') out.push({ do: 'open', view: v }); else dropped.push('window ' + str(s.view, 20)); return; }
