@@ -18,7 +18,7 @@ import { runBom } from './engine.js';
 import { adminAuthorised, listLicences, licenceAction, companyAction, saveSettings, recentEvents, ADMIN_HTML } from './admin.js';
 import { login, listUsers, userAction, pull, push, describeUser, userCap, setCompanyPasscode, releaseSession, maxSeq } from './sync.js';
 import { waitFor, wakeCompany, endSessionOn, WAIT_MS } from './waiters.js';
-import { checkBom as aiCheckBom, planRoute as aiPlanRoute, fillCalc as aiFillCalc, editBom as aiEditBom, quoteLetter as aiQuoteLetter, help as aiHelp, pickLang, aiStatus } from './ai.js';
+import { checkBom as aiCheckBom, planRoute as aiPlanRoute, fillCalc as aiFillCalc, editBom as aiEditBom, quoteLetter as aiQuoteLetter, help as aiHelp, chat as aiChat, pickLang, aiStatus } from './ai.js';
 import { send as chatSend, since as chatSince, remove as chatRemove, clearBy as chatClearBy, listBroadcasts, broadcastAction } from './chat.js';
 import { ensureInkSchema, getModel, listModels, train as inkTrain, estimate as inkEstimate, reset as inkReset } from './inkstore.js';
 import { register, gstAction, remoteIp } from './register.js';
@@ -284,6 +284,15 @@ export default {
         if (!a.user) return json({ error: 'SIGN_IN', message: 'Sign in to use Nexora AI.' }, 401);
         const body = await readJson(request);
         const out = await aiQuoteLetter(a.companyId || a.row.device_id, body.quote, pickLang(body.lang));
+        return json(out.body, out.httpStatus);
+      }
+      if (path === '/v1/ai/chat' && method === 'POST') {
+        await ensureSchema();
+        const a = await authorise(request);
+        if (!a.ok) return json(a.error, a.httpStatus);
+        if (!a.user) return json({ error: 'SIGN_IN', message: 'Sign in to use Nexora AI.' }, 401);
+        const body = await readJson(request);
+        const out = await aiChat(a.companyId || a.row.device_id, body.chat, pickLang(body.lang));
         return json(out.body, out.httpStatus);
       }
       if (path === '/v1/ai/help' && method === 'POST') {

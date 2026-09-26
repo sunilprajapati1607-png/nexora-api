@@ -206,7 +206,7 @@ async function ask(companyId, system, prompt, fetchImpl) {
   if (!name) return { fail: { httpStatus: 503, body: { error: 'AI_MODEL', message: 'Nexora AI has no model it can use right now.' } } };
   const payload = JSON.stringify({
     systemInstruction: { parts: [{ text: system }] },
-    contents: [{ role: 'user', parts: Array.isArray(prompt) ? prompt : [{ text: prompt }] }],   /* text, or parts (a recording + text) */
+    contents: (prompt && prompt.contents) ? prompt.contents : [{ role: 'user', parts: Array.isArray(prompt) ? prompt : [{ text: prompt }] }],   /* text, parts (a recording + text), or a whole conversation */   /* text, or parts (a recording + text) */
     generationConfig: { temperature: 0.2, responseMimeType: 'application/json', maxOutputTokens: 2048 }
   });
   let r;
@@ -587,4 +587,59 @@ export async function help(companyId, payload, lang, fetchImpl) {
   const titles = {}; p.topics.forEach((t) => { titles[t.title] = true; });
   return { httpStatus: 200, body: { ok: true, model: a.model, left: a.left, transcript: str(j.transcript, 600), answer: str(j.answer, 3000),
     topics: list(j.topics, 5).map((t) => str(t, 160)).filter((t) => titles[t]) } };
+}
+
+/* ---- the conversation: follow-up questions in the same window --------------
+   "chat with ai should be continues mode like user can ask other relevant
+    question in current session". After a first answer, the window keeps
+   talking: the person asks again (spoken or typed) and Nexora AI answers
+   with the whole conversation so far and the same CONTEXT the window
+   started from — cleaned by the same functions, so a follow-up can never
+   carry a price, a rate, a cost or a name the first question could not. */
+const CHAT_KINDS = {
+  bom: (d) => clean(d),
+  plan: (d) => cleanPlan(d),
+  calc: (d) => cleanFill(d),
+  edit: (d) => cleanEdit(d),
+  quote: (d) => cleanQuote(d).quote,
+  help: (d) => { const h = cleanHelp(d); return { topics: h.topics, glossary: h.glossary, screen: h.screen }; }
+};
+const CHAT_WHAT = {
+  bom: 'the bill of materials (its stages, sources, recipes and waste)',
+  plan: 'this bag and the plant’s process master, routes and workflows',
+  calc: 'this bag, the plant’s constructions and their fields',
+  edit: 'the bill of materials being changed',
+  quote: 'this quotation (selling figures only) and its letter',
+  help: 'Nexora’s own help topics and glossary'
+};
+const CHAT_SYSTEM = [
+  'You are Nexora AI, inside Nexora, software for PP/PE woven sack plants (bag weight, BOM, costing, quotation).',
+  'You are in a conversation that began in one Nexora window. Answer the person’s latest question using the CONTEXT and the conversation so far. Be short and practical; say where in Nexora to go when it helps.',
+  'You never see prices, rates or costs and must not guess any. Never recompute weights or costs — Nexora’s engines do that. If the question needs something not in the CONTEXT, say so plainly.',
+  'Answer ONLY with JSON: {"transcript": string, "answer": string}.'
+].join(' ');
+export function cleanChat(p) {
+  const x = p && typeof p === 'object' ? p : {};
+  const kind = CHAT_KINDS[x.kind] ? x.kind : 'help';
+  return {
+    kind: kind,
+    text: str(x.text, 800),
+    context: CHAT_KINDS[kind](x.context || {}),
+    history: list(x.history, 16).map((h) => ({ role: h && h.role === 'model' ? 'model' : 'user', text: str(h && h.text, 1500) })).filter((h) => h.text)
+  };
+}
+export async function chat(companyId, payload, lang, fetchImpl) {
+  if (!aiConfigured()) return { httpStatus: 503, body: { error: 'AI_OFF', message: 'Nexora AI is not switched on at the service yet.' } };
+  const p = cleanChat(payload);
+  const m = mediaParts(payload);
+  if (m.error) return m.error;
+  if (!p.text && !m.parts.length) return { httpStatus: 400, body: { error: 'NOTHING', message: 'Say or type the question first.' } };
+  const contents = [{ role: 'user', parts: [{ text: 'CONTEXT — ' + CHAT_WHAT[p.kind] + ':\n' + JSON.stringify(p.context) }] },
+    { role: 'model', parts: [{ text: '{"transcript":"","answer":"Understood. Ask me."}' }] }];
+  p.history.forEach((h) => contents.push({ role: h.role, parts: [{ text: h.role === 'model' ? JSON.stringify({ transcript: '', answer: h.text }) : h.text }] }));
+  contents.push({ role: 'user', parts: m.parts.concat([{ text: langLine(lang, 'the answer') + (m.audio ? 'The question is in the attached recording.' + (p.text ? ' Also typed: ' + p.text : '') : p.text) }]) });
+  const a = await ask(companyId, CHAT_SYSTEM, { contents: contents }, fetchImpl);
+  if (a.fail) return a.fail;
+  const j = a.json || {};
+  return { httpStatus: 200, body: { ok: true, model: a.model, left: a.left, transcript: str(j.transcript, 800), answer: str(j.answer, 3000) } };
 }
