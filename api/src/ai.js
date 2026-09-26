@@ -697,6 +697,20 @@ export function cleanAssist(p) {
           reasons: list(w && w.reasons, 4).map((t) => str(t, 160)), blockers: list(w && w.blockers, 3).map((t) => str(t, 160)) })).filter((w) => w.name),
         stages: list(l.stages, 40).map((s) => ({ process: str(s && s.process, 30), sections: nr(s && s.sections), usualWastePct: nr(s && s.usualWastePct),
           usualMaterials: list(s && s.usualMaterials, 6).map((m) => ({ material: str(m && m.material, 40), basis: str(m && m.basis, 10), usualValue: nr(m && m.usualValue), seen: nr(m && m.seen) })) })).filter((s) => s.process),
+        boms: list(l.boms, 40).map((b) => ({ construction: str(b && b.construction, 60), boms: nr(b && b.boms),
+          routes: list(b && b.routes, 10).map((r) => ({ name: str(r && r.name, 80), n: nr(r && r.n) })).filter((r) => r.name),
+          modes: { WHOLE: nr(b && b.modes && b.modes.WHOLE) || 0, SPLIT: nr(b && b.modes && b.modes.SPLIT) || 0 },
+          materials: list(b && b.materials, 30).map((m) => ({ code: str(m && m.code, 40), group: str(m && m.group, 30), stages: list(m && m.stages, 6).map((x) => str(x, 40)),
+            per1000: nr(m && m.per1000), min: nr(m && m.min), max: nr(m && m.max), inBoms: nr(m && m.inBoms) })).filter((m) => m.code) })).filter((b) => b.construction),
+        typical: list(l.typical, 40).map((t) => { const o = {}; const inp = (t && t.inputs && typeof t.inputs === 'object') ? t.inputs : {};
+          Object.keys(inp).slice(0, 80).forEach((k) => { const v = inp[k]; if (typeof v === 'number' && isFinite(v)) o[str(k, 30)] = nr(v); else if (typeof v === 'string' && v.length <= 20) o[str(k, 30)] = str(v, 20); });
+          const vals = {}; const vin = (t && t.values && typeof t.values === 'object') ? t.values : {};
+          Object.keys(vin).slice(0, 80).forEach((k) => { vals[str(k, 30)] = list(vin[k], 8).map((v) => (typeof v === 'number' ? nr(v) : str(v, 20))); });
+          const rng = {}; const rin = (t && t.range && typeof t.range === 'object') ? t.range : {};
+          Object.keys(rin).slice(0, 80).forEach((k) => { const a = list(rin[k], 2).map(nr); if (a.length === 2) rng[str(k, 30)] = a; });
+          const sn = {}; const sin = (t && t.seen && typeof t.seen === 'object') ? t.seen : {};
+          Object.keys(sin).slice(0, 80).forEach((k) => { sn[str(k, 30)] = nr(sin[k]); });
+          return { construction: str(t && t.construction, 60), from: str(t && t.from, 30), count: nr(t && t.count), inputs: o, values: vals, range: rng, seen: sn }; }).filter((t) => t.construction),
         lessons: list(l.lessons, 20).map((q) => ({ what: ['recipe', 'calculation', 'route'].indexOf(q && q.what) > -1 ? q.what : 'recipe', construction: str(q && q.construction, 60),
           route: str(q && q.route, 80), process: str(q && q.process, 30), field: str(q && q.field, 30), ai: str(q && q.ai, 300), person: str(q && q.person, 300) })),
         workflowRecipes: list(l.workflowRecipes, 5).map((w) => ({ name: str(w && w.name, 80), construction: str(w && w.construction, 60),
@@ -750,6 +764,8 @@ const ASSIST_SYSTEM = [
   'NO PROCESS THE BAG DOES NOT NEED: never add printing (flexo or BOPP printing), lamination, coating, BOPP, backseam, liner or valve steps unless the person said so, the construction has it (e.g. BOPP / laminated in its name or fields), or this plant\u2019s own route for the construction has it. When unsure, leave it out and ask in "answer".',
   'ADD OR REPLACE: "add weaving in lamination", "LD 5 % umero", "take in the valve" ADD to what the stage already holds — set "add": true (the section keeps its lines; a line of the same stage, material or part is replaced). Without "add" the stage\u2019s materials are replaced by yours. "Weaving in lamination as per calculation weight" = {"do":"recipe","add":true,"stage":"LAMINATION","lines":[{"earlier":true,"stage":"WEAVING","figure":"BODY.FAB"}]} — the woven fabric by the calculation\u2019s own weight (FIGURES: BODY.FAB base fabric, BODY.TOTAL whole body).',
   'ADD, CHANGE, REMOVE — ANYTHING: to change a line\u2019s value use "add" with the new value (the same material/stage/part is replaced); to take lines out use "remove": true with those lines; "from the calculation" / "calculation par thi" / "suggest" for a stage = a "suggest" step.',
+  'LEARN FROM ALL THE SAVED BOMs: LEARNED.boms gathers EVERY saved BOM of this plant per construction — the routes used and how often, whole bag or by parts, and each material\u2019s kg per 1000 kg of finished bags (average, min–max, in how many BOMs) at the stages it was used. For a similar bag use the route used most and the materials in their usual proportions at the same stages, unless the person says otherwise.',
+  'LEARN FROM ALL THE SAVED BAGS: LEARNED.typical gathers EVERY saved bag of this plant per construction — for each field the figure used most (inputs), how often (seen), its range and the other figures used (values) — patch sizes, valve, mesh, coating, BOPP, fold…. For a new bag of that construction take every figure it needs from there unless the person says otherwise, and say "the rest from your saved <construction> bag <from>". Ask only for what belongs to this bag alone: width and length when not said, and the body fabric GSM OR the target weight — ONE of the two, never both (a GSM gives the weight, a weight gives the GSM).',
   'ASK, NEVER GUESS: put in the calculation ONLY figures the person said (or that are on the screen when changing it). A required field not said is left out and asked in "answer" — never filled with a typical value.',
   'NEVER SAY IT IS DONE. You change nothing yourself: every change is a STEP the person runs with Run. Never write "added", "done", "updated", "saved" or "કર્યું"/"ઉમેર્યું"/"कर दिया" — write what the steps WILL do ("press Run to add …"). If you cannot make a step for what was asked, say so plainly and ask what is missing; never pretend.',
   'YOU DO THE WORK. When you pick or create a route, you also decide EVERY stage\u2019s recipe and waste yourself and return them as "recipe" (with its wastePct) or "waste" steps — do not leave stages for Nexora to fill. Learn what to put from this plant\u2019s own saved data: the route\u2019s own saved sections (ROUTES[].stages), the recipes of its saved workflows (LEARNED.workflowRecipes), and what the learning finds usual per process (LEARNED.stages). Skip a stage only when its saved section already fits and the person did not ask to change it. A stage fed only by the earlier stage (weaving, finishing, packing) needs only its "waste" step. When nothing is learned, use woven-sack practice and say in the answer that those figures are your estimate.',
@@ -806,9 +822,13 @@ export function checkSteps(p, raw) {
       const said = saidNumbers(p);
       const saidWords = (p.text + ' ' + p.history.filter((h) => h.role === 'user').map((h) => h.text).join(' ') + ' ' + (p.transcript || '')).toLowerCase();
       const onBag = fresh ? {} : (p.now.calc.inputs || {});
+      /* what the plant's own saved bags of this construction say (patch, valve, mesh, coating…) */
+      const typ = con ? (p.learned.typical || []).filter((t) => t.construction.toUpperCase() === con.name.toUpperCase())[0] : null;
+      const fromSaved = [];
       Object.keys(inputs).forEach((k) => {
         const v = inputs[k], f = fieldOf[k];
         if (onBag[k] !== undefined && String(onBag[k]) === String(v)) return;
+        if (typ && ((typ.inputs[k] !== undefined && String(typ.inputs[k]) === String(v)) || (typ.values[k] || []).some((x) => String(x) === String(v)))) { fromSaved.push(k); return; }
         if (f && f.type === 'enum') { if (saidWords.indexOf(String(v).toLowerCase()) < 0) { guessed[k] = v; delete inputs[k]; } return; }
         /* a size may have been said in another unit (19 inch in a mm plant); any other figure must be the very number said */
         const lu = String(p.units.length || 'mm').toLowerCase();
@@ -816,8 +836,15 @@ export function checkSteps(p, raw) {
         const conv = !isLen ? [1] : lu === 'mm' ? [1, 10, 25.4] : lu === 'cm' ? [1, 0.1, 2.54] : [1, 1 / 25.4, 1 / 2.54];
         if (!said.some((n) => conv.some((c) => Math.abs(n * c - v) < Math.max(0.051, Math.abs(v) * 0.002)))) { guessed[k] = v; delete inputs[k]; }
       });
-      out.push({ do: 'calc', construction: con ? con.name : null, inputs: inputs, targetWeight: target, bagQuantity: q && q > 0 ? Math.round(q) : null, fresh: !!fresh });
+      /* a figure this construction needs that Nexora AI left out, the saved bags give it (a new bag only) */
+      if (typ && fresh) Object.keys(typ.inputs).forEach((k) => {
+        if (inputs[k] !== undefined || guessed[k] !== undefined || !fieldOf[k] || (con && con.fields.indexOf(k) < 0)) return;
+        inputs[k] = typ.inputs[k]; fromSaved.push(k);
+      });
+      out.push(Object.assign({ do: 'calc', construction: con ? con.name : null, inputs: inputs, targetWeight: target, bagQuantity: q && q > 0 ? Math.round(q) : null, fresh: !!fresh },
+        fromSaved.length ? { fromSaved: fromSaved, savedFrom: typ.from } : {}));
       Object.keys(guessed).forEach((k) => { const f = fieldOf[k] || {};
+        if (k === 'BD FAB GSM' && !target) { missing.push({ key: '__gsm_or_weight', label: 'Body fabric GSM or target weight', required: true, guess: guessed[k] }); return; }
         missing.push({ key: k, label: f.label || k, unit: f.unit, type: f.type, options: f.options, required: !!f.required, guess: guessed[k] }); });
       const have = Object.assign({}, fresh ? {} : p.now.calc.inputs, inputs);
       if (!con) missing.push({ key: '__construction', label: 'Construction', type: 'enum', options: p.constructions.map((x) => x.name) });
@@ -825,6 +852,9 @@ export function checkSteps(p, raw) {
         const f = fieldOf[k];
         if (!f || !f.required || have[k] !== undefined || guessed[k] !== undefined) return;
         if (k === 'BD FAB GSM' && (target || (!fresh && p.now.calc.targetWeight))) return;
+        /* "either weight or gsm anyone is required": ONE question, not two */
+        if (k === 'BD FAB GSM') { missing.push({ key: '__gsm_or_weight', label: 'Body fabric GSM or target weight', required: true }); return; }
+        if (typ && typ.inputs[k] !== undefined) return;
         missing.push({ key: k, label: f.label, unit: f.unit, type: f.type, options: f.options, required: true });
       });
       return;
