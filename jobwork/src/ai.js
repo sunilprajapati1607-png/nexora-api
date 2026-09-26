@@ -147,7 +147,7 @@ export function langLine(lang, what) {
   if (lang === 'gu') return 'Write ' + w + ' in Gujarati (Gujarati script). Keep document numbers, codes, tokens (P1, I1), field names and Nexora button names in English.\n';
   if (lang === 'hi') return 'Write ' + w + ' in Hindi (Devanagari script). Keep document numbers, codes, tokens (P1, I1), field names and Nexora button names in English.\n';
   /* no language switch: the language the person used — said with every question, or Gujarati typed in English letters comes back in English */
-  return 'Write ' + w + ' in the language the person used — English → English; Gujarati, even typed in English letters ("karo", "che", "mate", "no", "par") → Gujarati in Gujarati script; Hindi → Hindi in Devanagari. Keep document numbers, codes, tokens (P1, I1) and Nexora button names in English.\n';
+  return 'Write ' + w + ' in the language the person used — English → English; Gujarati, even typed in English letters ("mane", "aapo", "karo", "che", "chhe", "mate", "no", "ni", "par", "batavo", "samjavo", "ketlo", "kya", "shu", "ma", "thi" — these are GUJARATI, not Hindi) → Gujarati in Gujarati script; Hindi → Hindi in Devanagari. Keep document numbers, codes, tokens (P1, I1) and Nexora button names in English.\n';
 }
 export function pickLang(v) { return v === 'gu' || v === 'hi' || v === 'en' ? v : 'auto'; }
 
