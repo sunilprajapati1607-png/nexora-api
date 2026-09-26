@@ -3,9 +3,10 @@
    party's name, an item's name and money never leave this service. */
 import assert from 'node:assert/strict';
 import { handle } from './server.js';
-import { cleanAssist, checkSteps, cleanTables, _resetLimits, resolveModel, thinkingFor, _noThinking, readJsonAnswer } from './src/ai.js';
+import { _blocked as _blockedSet, cleanAssist, checkSteps, cleanTables, _resetLimits, resolveModel, thinkingFor, _noThinking, readJsonAnswer, earModel, voiceModel } from './src/ai.js';
 
 let pass = 0;
+const _blockedReset = () => { try { _blockedSet().clear(); } catch (e) {} };
 const t = async (name, fn) => { try { await fn(); pass++; console.log('ok   ' + name); } catch (e) { console.error('FAIL ' + name + '\n', e); process.exitCode = 1; } };
 
 const sent = [];
@@ -16,7 +17,8 @@ function fakeGoogle(answer, opts) {
     if (/\/models\?/.test(url)) return new Response(JSON.stringify({ models: [
       { name: 'models/gemini-2.5-flash-lite', supportedGenerationMethods: ['generateContent'] },
       { name: 'models/gemini-3.5-flash-lite', supportedGenerationMethods: ['generateContent'] },
-      { name: 'models/gemini-3.5-flash', supportedGenerationMethods: ['generateContent'] }] }), { status: 200 });
+      { name: 'models/gemini-3.5-flash', supportedGenerationMethods: ['generateContent'] },
+      { name: 'models/gemini-2.5-flash-preview-tts', supportedGenerationMethods: ['generateContent'] }] }), { status: 200 });
     if (opts.retire && /gemini-3\.5-flash-lite:/.test(url)) return new Response(JSON.stringify({ error: { message: 'models/gemini-3.5-flash-lite is no longer available, use models/gemini-3.5-flash' } }), { status: 404 });
     return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: JSON.stringify(answer) }] } }] }), { status: 200 });
   };
@@ -220,6 +222,57 @@ await t('an answer keeps its lines (headings, steps, bullets)', async () => {
   const r = await call('POST', '/v1/ai/assist', { device: 'dev-lines0001', assist: { text: 'explain' } },
     fakeGoogle({ lang: 'en', answer: '## Lamination\n\n1. Unwind\n2. Coat\n\n- **GSM** checked\u0007', steps: [] }));
   assert.equal(r.json.answer, '## Lamination\n\n1. Unwind\n2. Coat\n\n- **GSM** checked ');
+});
+
+await t('the ear is the better Flash, the voice the speech model the key has', async () => {
+  _blockedReset();
+  await resolveModel(true, fakeGoogle({}));
+  assert.equal(earModel(), 'gemini-3.5-flash');
+  assert.equal(voiceModel(), 'gemini-2.5-flash-preview-tts');
+});
+
+await t('transcribe: the recording goes to the ear, with the language said; the day is not counted', async () => {
+  _resetLimits(); sent.length = 0;
+  process.env.AI_DAILY_PER_DEVICE = '1';
+  const f = fakeGoogle({ text: 'JW-2026-A-000002 પર 1200 kg receipt કરો', lang: 'gu' });
+  const r = await call('POST', '/v1/ai/transcribe', { device: 'dev-ear00001', lang: 'gu', hints: ['LAMINATION'], audio: { mime: 'audio/wav', data: 'AAAA' } }, f);
+  assert.equal(r.status, 200, JSON.stringify(r.json));
+  assert.equal(r.json.text, 'JW-2026-A-000002 પર 1200 kg receipt કરો'); assert.equal(r.json.lang, 'gu');
+  const g = sent.filter((x) => /generateContent/.test(x.url)).pop();
+  assert.ok(/gemini-3\.5-flash:generateContent/.test(g.url));
+  assert.ok(/speaks GUJARATI/.test(g.body) && /LAMINATION/.test(g.body) && /audio\/wav/.test(g.body));
+  /* the question after it is still allowed: listening did not use the day's one */
+  const a = await call('POST', '/v1/ai/assist', { device: 'dev-ear00001', assist: { text: 'hi' } }, fakeGoogle({ lang: 'en', answer: 'ok', steps: [] }));
+  assert.equal(a.status, 200);
+  delete process.env.AI_DAILY_PER_DEVICE;
+});
+
+await t('speak: a WAV from the speech model', async () => {
+  _resetLimits();
+  const tts = async (url, init) => {
+    if (/tts:generateContent/.test(url)) return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ inlineData: { mimeType: 'audio/L16;codec=pcm;rate=24000', data: Buffer.from([0, 0, 1, 0]).toString('base64') } }] } }] }), { status: 200 });
+    return fakeGoogle({})(url, init);
+  };
+  const r = await call('POST', '/v1/ai/speak', { device: 'dev-voice001', text: 'Stock is 3904 kg.', lang: 'en' }, tts);
+  assert.equal(r.status, 200, JSON.stringify(r.json));
+  const wav = Buffer.from(r.json.data, 'base64');
+  assert.equal(wav.slice(0, 4).toString(), 'RIFF'); assert.equal(wav.readUInt32LE(24), 24000); assert.equal(wav.length, 48);
+});
+
+await t('a spoken answer comes when the person talks', async () => {
+  _resetLimits(); sent.length = 0;
+  const r = await call('POST', '/v1/ai/assist', { device: 'dev-voice002', assist: { text: 'stock ketlo che', voice: true } },
+    fakeGoogle({ lang: 'gu', answer: '## Stock\n- 3904 kg', speech: 'કુલ સ્ટોક 3904 kg છે.', steps: [] }));
+  assert.equal(r.json.speech, 'કુલ સ્ટોક 3904 kg છે.');
+  assert.ok(sent.some((x) => { try { return JSON.parse(x.body).contents[0].parts[0].text.indexOf('"VOICE":true') > -1; } catch (e) { return false; } }));
+});
+
+await t('what needs somebody: the attention list and the screen go, cleaned', async () => {
+  const p = cleanAssist({ attention: [{ level: 'problem', what: 'Challan past the limit', plan: 'JW-1', party: 'P1', detail: 'sent 400 kg, 12 days over', kg: 400, days: -12, who: 'office', amount: 9999 },
+    { level: 'odd', what: 'QC waiting', party: 'Shakti Polymers' }], screenText: 'Open plans 5\nWaiting for QC 2' });
+  assert.deepEqual(p.attention[0], { level: 'problem', what: 'Challan past the limit', plan: 'JW-1', order: '', party: 'P1', item: null, detail: 'sent 400 kg, 12 days over', kg: 400, days: -12, who: 'office' });
+  assert.equal(p.attention[1].level, 'todo'); assert.equal(p.attention[1].party, null);
+  assert.equal(p.screenText, 'Open plans 5\nWaiting for QC 2');
 });
 
 console.log(pass + ' passed');

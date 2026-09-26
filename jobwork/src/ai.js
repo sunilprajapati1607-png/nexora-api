@@ -31,6 +31,7 @@
 const API = 'https://generativelanguage.googleapis.com/v1beta';
 export const DEFAULT_MODEL = 'gemini-3.5-flash-lite';
 const blocked = new Set();                       // models Google has refused this run
+export function _blocked() { return blocked; }
 /** 'gemini-3.5-flash-lite' → a sort key: flash-lite before flash, newer first */
 function rankOf(n) {
   const m = /^gemini-(\d+)(?:\.(\d+))?-(flash-lite|flash)(?:-(\d{3}))?$/.exec(n);
@@ -105,7 +106,7 @@ export async function resolveModel(force, fetchImpl) {
         .filter((m) => (m.supportedGenerationMethods || []).indexOf('generateContent') > -1)
         .map((m) => String(m.name || '').replace(/^models\//, ''));
       const pick = (names.indexOf(wanted) > -1 && !blocked.has(wanted)) ? wanted : bestOf(names);
-      model = { name: pick, at: Date.now(), error: pick ? (pick === wanted ? null : 'asked for ' + wanted + ', using ' + pick) : 'no usable model on this key' };
+      model = { name: pick, at: Date.now(), error: pick ? (pick === wanted ? null : 'asked for ' + wanted + ', using ' + pick) : 'no usable model on this key', available: names };
     } catch (e) {
       model = { name: wanted, at: Date.now() - MODEL_TTL_MS + 5 * 60 * 1000, error: scrub(e && e.message) };
     } finally { resolving = null; }
@@ -117,13 +118,48 @@ export async function resolveModel(force, fetchImpl) {
 /** For /health — cached, never waits on Google. */
 export function aiStatus() {
   if (aiConfigured() && (!model.at || Date.now() - model.at > MODEL_TTL_MS)) resolveModel(false).catch(() => {});
-  return { configured: aiConfigured(), keyFrom: keySource(), model: model.name, note: model.error || null };
+  return { configured: aiConfigured(), keyFrom: keySource(), model: model.name, ear: earModel(), voice: voiceModel(), note: model.error || null };
+}
+
+/* ---- the ear and the voice (2.0.3) ------------------------------------------
+   "voice input is not working perfectly, it's not following local language
+   properly." Listening was Flash-Lite hearing and answering in one breath.
+   Now listening is a call of its own, to the better Flash (not Lite) the key
+   has, told the language and asked for nothing but a faithful transcript.
+   The voice — the answer read aloud in a conversation — is Gemini's speech
+   model when the key has one. GEMINI_AUDIO_MODEL / GEMINI_TTS_MODEL name
+   others. */
+function flashRank(n) {
+  const m = /^gemini-(\d+)(?:\.(\d+))?-flash(?:-(\d{3}))?$/.exec(n);
+  return m ? Number(m[1]) * 1000 + Number(m[2] || 0) * 10 + (m[3] ? 0 : 1) : null;
+}
+export function earModel() {
+  const env = String(process.env.GEMINI_AUDIO_MODEL || '').trim();
+  if (env) return env;
+  const names = (model.available || []).filter((n) => !blocked.has(n) && flashRank(n) !== null);
+  names.sort((a, b) => flashRank(b) - flashRank(a));
+  return names[0] || model.name;
+}
+export function voiceModel() {
+  const env = String(process.env.GEMINI_TTS_MODEL || '').trim();
+  if (env) return env;
+  const names = (model.available || []).filter((n) => /tts/i.test(n) && !blocked.has(n));
+  names.sort((a, b) => (/flash/.test(b) ? 1 : 0) - (/flash/.test(a) ? 1 : 0) || (b > a ? 1 : -1));
+  return names[0] || null;
+}
+/* listening and speaking count against the minute, not against the day's questions */
+function takeMinute() {
+  const now = Date.now();
+  recent = recent.filter((t) => now - t < 60000);
+  if (recent.length >= perMinute() * 2) return { busy: Math.ceil((60000 - (now - recent[0])) / 1000) };
+  recent.push(now);
+  return {};
 }
 
 /* ---- limits ------------------------------------------------------------- */
 const perDevice = new Map();         // device -> { day, n }
 let recent = [];
-const daily = () => Math.max(1, parseInt(process.env.AI_DAILY_PER_DEVICE, 10) || 60);
+const daily = () => Math.max(1, parseInt(process.env.AI_DAILY_PER_DEVICE, 10) || 150);
 const perMinute = () => Math.max(1, parseInt(process.env.AI_PER_MINUTE, 10) || 10);
 function today() { return new Date().toISOString().slice(0, 10); }
 function take(device) {
@@ -224,6 +260,12 @@ export function cleanAssist(p) {
       return o;
     })(x.pending),
     topics: list(x.topics, 120).map((t) => str(t, 80)).filter(Boolean),
+    /* 2.0.3 — "what needs somebody" on the dashboard: what the application itself knows is waiting */
+    attention: list(x.attention, 80).map((a) => ({ level: oneOf(a && a.level, ['problem', 'warning', 'todo'], 'todo'), what: str(a && a.what, 50),
+      plan: docNo(a && a.plan), order: docNo(a && a.order), party: ptok(a && a.party), item: itok(a && a.item), detail: str(a && a.detail, 220),
+      kg: nr(a && a.kg), days: nr(a && a.days), who: str(a && a.who, 30) })).filter((a) => a.what),
+    /* what the window shows — names as tokens, money taken out, by the application */
+    screenText: text(x.screenText, 3500),
     /* what is open on the screen — numbers and tokens only */
     now: { plan: docNo(n.plan), order: docNo(n.order), doc: docNo(n.doc), batch: docNo(n.batch), form: str(n.form, 40), note: str(n.note, 300) }
   };
@@ -282,6 +324,7 @@ const SYSTEM = [
   'BE OPEN. Answer ANYTHING the person asks, as fully as they want it: this plant\u2019s work, job work and GST (job-work challans, ITC-04, section 143, e-way bills), processes and quality (extrusion, weaving, lamination, printing, stitching, yields, waste, QC), planning, how to do something in Nexora, or any general question. The only things you cannot give are a party\u2019s name, an item\u2019s name and money figures — and even those the person gets, because a table is worked out on their screen.',
   'TABLES. Whenever the answer is a list, a comparison or figures from the plant\u2019s data — stock, movements, plans, orders, batches, challans, invoices, QC, "which", "how much", "list", "total", "party wise", "month wise" — return a "table" step (more than one if useful). Nexora works it out EXACTLY from its own book, with the real names and a total row; you do NOT add up or copy figures into "answer" — say in one line what the table shows and what to notice. A table step runs by itself; the person does not press Run. For knowledge that is naturally a table (a comparison, a checklist, a schedule), put it in "tables": [{"title": string, "columns": [string, …], "rows": [[cell, …], …], "total": true|false}] — "total": true only when a column is a quantity to add. NEVER copy the plant\u2019s own figures (stock, kg, plans, orders, invoices) into "tables" — the plant\u2019s data always goes as a table step, and never both.',
   'The summary you are given (PLANS, ORDERS, STOCK, PENDING) is for understanding what the person means; when you are not sure it holds everything, ask for a table.',
+  'ATTENTION is what needs somebody NOW, worked out by Nexora from the book: each open plan\u2019s next step, problems and exceptions, challans near or past the GST limit, QC waiting, batches near expiry, material still to issue on open orders — with level (problem, warning, todo) and who usually does it (stores, production, QC, office). For "what needs attention", "what is pending", "what should I do today", "kone shu karvanu che", "shu baki che", "kya pending hai" answer FROM ATTENTION: problems first, then warnings, then the to-dos, grouped by who does them, each with the plan or order number, what to do and where in Nexora (window and button in bold); offer to fill the first one. If ATTENTION is empty, say nothing is waiting. SCREEN_TEXT is what the person\u2019s window shows (names as tokens, money taken out): use it for questions about "this", "here", "this screen" or "the dashboard".',
   'Never mention tokens to the person: write P3 or I7 where the name goes (Nexora puts the name there), but never words like "token", "P token" or "code P1" — in "answer" and in "tables" alike.',
   'When the person asks for work to be done, return STEPS. Steps allowed: ' + STEP_LIST.join(' '),
   'Steps that make a document (newplan, receipt, porder, issue, production) only FILL the form — the person reads it and presses Post; Nexora checks it then. Use only plan and order numbers from PLANS and ORDERS, and only P and I tokens from PARTIES and ITEMS. Quantities are kg unless the person says the second unit (bags, pieces, rolls → qty2). "1.2 ton" is 1200 kg. Leave out a step the screen shows is already done. When the person corrects you ("no, 900 kg"), return the whole corrected list of steps again.',
@@ -289,7 +332,8 @@ const SYSTEM = [
   'FOLLOW-UPS ON A TABLE stay IN THE CHAT: "group it by material group", "party wise", "only I3", "sort by kg", "add batches", "this month only" about a table already shown means a NEW "table" step (the same "from", with the change) — never an "open" or "stock" step. Open a window only when the person asks to open, go to or show a window — and for data (a table shown, or asked for "in the window") that is a "window" step with the table\u2019s fields, so Nexora opens its own register filtered and grouped the same way.',
   'HOW TO WRITE "answer" (Markdown, it is drawn on the screen): for a figure or a yes/no, one or two lines. For an explanation, a process, a procedure, a rule or a "how do I", write it ELABORATED and STRUCTURED, never one paragraph: "## " headings; numbered steps ("1. ") for anything done in order, each step saying what is done, by whom or at which stage, and where in Nexora (window and button in **bold**); "- " bullets for points; **bold** for key terms and figures; a short "## Checks" or "## Common mistakes" and a "## Tip" where they help. For a plant process (extrusion, weaving, lamination, printing, stitching…) cover: purpose, input and output, the steps, settings/parameters usually watched, typical waste %, quality checks, and how it is recorded in Nexora (which document at which stage). Use a Markdown table (| a | b |) inside "answer" for a small comparison; a big one goes in "tables".',
   'Reply in the SAME language the person used: English → English; Gujarati (in Gujarati script or in English letters) → Gujarati in Gujarati script; Hindi → Hindi in Devanagari. Keep document numbers, tokens, codes and Nexora button names in English; write numbers with the digits 0-9 (1200 kg, never ૧૨૦૦). Set "lang" to en, gu or hi accordingly.',
-  'Answer ONLY with JSON: {"transcript": string (what the person said, when it came as a recording), "lang": "en"|"gu"|"hi", "answer": string, "steps": [ ... ], "tables": [ ... ]}.'
+  'When VOICE is true the person is TALKING with you and will HEAR "speech": put in "speech" what to say aloud — two to four short spoken sentences in the person\u2019s language, no Markdown, no symbols, numbers said plainly, a table only summed up ("the table is on your screen"); "answer" still carries the full written answer. End "speech" with a short follow-up question only when one is natural.',
+  'Answer ONLY with JSON: {"transcript": string (what the person said, when it came as a recording), "lang": "en"|"gu"|"hi", "answer": string, "speech": string (only when VOICE), "steps": [ ... ], "tables": [ ... ]}.'
 ].join('\n');
 
 /** A knowledge table in the answer: at most 4, 12 columns, 80 rows; text or numbers only. */
@@ -476,6 +520,81 @@ async function askOnce(device, system, prompt, fetchImpl, again) {
   return { json: json, model: name, left: t.left };
 }
 
+/* ---- POST /v1/ai/transcribe — what the person said, faithfully ---------------- */
+const EAR_SYSTEM = 'You are the ear of Nexora Jobwork, software for job work in plastic packaging plants (woven sacks, BOPP, lamination, printing, stitching). ' +
+  'Write down EXACTLY what the person says in the recording — do not answer it, do not shorten it, do not translate it. ' +
+  'Gujarati speech in Gujarati script, Hindi in Devanagari, English in English. People here mix English trade words into Gujarati and Hindi: keep those in English letters as they are spoken — stock, plan, receipt, issue, production order, batch, challan, invoice, QC, release, kg, ton, FIFO, FEFO, lamination, extrusion, weaving, printing, stitching, BOPP, GSM, and plan or order numbers (JW-2026-A-000002). ' +
+  'Numbers with the digits 0-9 ("બારસો" → 1200). Names of companies and materials as heard. If nothing is said, text is "". ' +
+  'Answer ONLY with JSON: {"text": string, "lang": "gu"|"hi"|"en"}.';
+export async function transcribe(device, payload, fetchImpl) {
+  if (!aiConfigured()) return { httpStatus: 503, body: { error: 'AI_OFF', message: 'Nexora AI is not switched on at the service yet.' } };
+  const m = mediaParts(payload);
+  if (m.error) return m.error;
+  if (!m.audio) return { httpStatus: 400, body: { error: 'NOTHING', message: 'No recording came.' } };
+  const t = takeMinute();
+  if (t.busy) return { httpStatus: 429, body: { error: 'AI_BUSY', retryAfter: t.busy, message: 'Nexora AI is busy \u2014 try again in ' + t.busy + ' seconds.' } };
+  await resolveModel(false, fetchImpl);
+  const lang = payload && ['gu', 'hi', 'en'].indexOf(payload.lang) > -1 ? payload.lang : 'auto';
+  const said = { gu: 'The person speaks GUJARATI (with English trade words).', hi: 'The person speaks HINDI (with English trade words).', en: 'The person speaks ENGLISH (Indian accent).', auto: 'The person may speak Gujarati, Hindi or English, often mixed.' }[lang];
+  const hints = list(payload && payload.hints, 60).map((h) => str(h, 40)).filter(Boolean);
+  const body = JSON.stringify({ systemInstruction: { parts: [{ text: EAR_SYSTEM }] },
+    contents: [{ role: 'user', parts: m.parts.concat([{ text: said + (hints.length ? ' Words used in this plant: ' + hints.join(', ') + '.' : '') }]) }],
+    generationConfig: Object.assign({ temperature: 0, responseMimeType: 'application/json', maxOutputTokens: 1024 }, thinkingFor(earModel()) ? { thinkingConfig: thinkingFor(earModel()) } : {}) });
+  const t0 = Date.now();
+  let name = earModel();
+  let r;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try { r = await gfetch(API + '/models/' + encodeURIComponent(name) + ':generateContent', { method: 'POST', body: attempt && !thinkingFor(name) ? body.replace(/,"thinkingConfig":\{[^}]*\}/, '') : body }, fetchImpl); }
+    catch (e) { return { httpStatus: 504, body: { error: 'AI_TIMEOUT', message: 'Nexora AI did not hear it in time. Try again.' } }; }
+    const msg = String((r.body && r.body.error && r.body.error.message) || '');
+    if (r.status === 400 && /think/i.test(msg)) { noThinking.add(name); continue; }
+    if (!r.ok && (r.status === 404 || /no longer available|not found|not supported/i.test(msg)) && name !== model.name) { name = model.name; continue; }
+    break;
+  }
+  console.log('ai ear ' + (r && r.ok ? 'ok' : r && r.status) + ' ' + (Date.now() - t0) + ' ms ' + name);
+  if (!r.ok) return { httpStatus: r.status === 429 ? 429 : 502, body: { error: r.status === 429 ? 'AI_BUSY' : 'AI_FAILED', message: r.status === 429 ? 'Nexora AI is busy (Google\u2019s limit) \u2014 try again in a minute.' : 'Nexora AI could not hear it (' + r.status + ').' } };
+  const j = readJsonAnswer(r.body) || {};
+  const l = String(j.lang || '').toLowerCase();
+  return { httpStatus: 200, body: { ok: true, model: name, text: text(j.text, 1500).trim(), lang: l === 'gu' || l === 'hi' ? l : 'en' } };
+}
+
+/* ---- POST /v1/ai/speak — the answer read aloud (a WAV) -------------------------- */
+function wavOf(pcmB64, rate) {
+  const pcm = Buffer.from(pcmB64, 'base64');
+  const h = Buffer.alloc(44);
+  h.write('RIFF', 0); h.writeUInt32LE(36 + pcm.length, 4); h.write('WAVE', 8); h.write('fmt ', 12);
+  h.writeUInt32LE(16, 16); h.writeUInt16LE(1, 20); h.writeUInt16LE(1, 22); h.writeUInt32LE(rate, 24);
+  h.writeUInt32LE(rate * 2, 28); h.writeUInt16LE(2, 32); h.writeUInt16LE(16, 34); h.write('data', 36); h.writeUInt32LE(pcm.length, 40);
+  return Buffer.concat([h, pcm]).toString('base64');
+}
+export async function speak(device, payload, fetchImpl) {
+  if (!aiConfigured()) return { httpStatus: 503, body: { error: 'AI_OFF', message: 'Nexora AI is not switched on at the service yet.' } };
+  const words = str(payload && payload.text, 900).trim();
+  if (!words) return { httpStatus: 400, body: { error: 'NOTHING', message: 'Nothing to say.' } };
+  await resolveModel(false, fetchImpl);
+  const name = voiceModel();
+  if (!name) return { httpStatus: 501, body: { error: 'NO_VOICE', message: 'This Gemini key has no speech model.' } };
+  const t = takeMinute();
+  if (t.busy) return { httpStatus: 429, body: { error: 'AI_BUSY', retryAfter: t.busy, message: 'Nexora AI is busy.' } };
+  const lang = payload && ['gu', 'hi', 'en'].indexOf(payload.lang) > -1 ? payload.lang : 'en';
+  const how = { gu: 'Say this in Gujarati, warmly and clearly, at an easy pace: ', hi: 'Say this in Hindi, warmly and clearly, at an easy pace: ', en: 'Say this in Indian English, warmly and clearly: ' }[lang];
+  const t0 = Date.now();
+  let r;
+  try {
+    r = await gfetch(API + '/models/' + encodeURIComponent(name) + ':generateContent', { method: 'POST', body: JSON.stringify({
+      contents: [{ role: 'user', parts: [{ text: how + words }] }],
+      generationConfig: { responseModalities: ['AUDIO'], speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: String(process.env.GEMINI_VOICE || 'Kore') } } } } }) }, fetchImpl);
+  } catch (e) { return { httpStatus: 504, body: { error: 'AI_TIMEOUT', message: 'The voice did not come in time.' } }; }
+  console.log('ai voice ' + (r.ok ? 'ok' : r.status) + ' ' + (Date.now() - t0) + ' ms ' + name);
+  if (!r.ok) return { httpStatus: 502, body: { error: 'AI_FAILED', message: 'The voice could not be made (' + r.status + ').' } };
+  const part = ((((r.body && r.body.candidates) || [])[0] || {}).content || {}).parts;
+  const data = ((part || []).filter((p) => p && p.inlineData)[0] || {}).inlineData;
+  if (!data || !data.data) return { httpStatus: 502, body: { error: 'AI_FAILED', message: 'The voice came back empty.' } };
+  const rate = Number((/rate=(\d+)/.exec(String(data.mimeType || '')) || [])[1]) || 24000;
+  const wav = /wav/i.test(String(data.mimeType)) ? data.data : wavOf(data.data, rate);
+  return { httpStatus: 200, body: { ok: true, mime: 'audio/wav', data: wav } };
+}
+
 /** POST /v1/ai/assist */
 export async function assist(device, payload, lang, fetchImpl) {
   if (!aiConfigured()) return { httpStatus: 503, body: { error: 'AI_OFF', message: 'Nexora AI is not switched on at the service yet.' } };
@@ -483,7 +602,7 @@ export async function assist(device, payload, lang, fetchImpl) {
   const m = mediaParts(payload);
   if (m.error) return m.error;
   if (!p.text && !m.parts.length) return { httpStatus: 400, body: { error: 'NOTHING', message: 'Say or type something first.' } };
-  const ctx = { SCREEN: p.screen, TODAY: p.today, NOW: p.now, PARTIES: p.parties, ITEMS: p.items, GROUPS: p.groups, WAREHOUSES: p.warehouses,
+  const ctx = { SCREEN: p.screen, SCREEN_TEXT: p.screenText, ATTENTION: p.attention, TODAY: p.today, VOICE: !!(payload && payload.voice), NOW: p.now, PARTIES: p.parties, ITEMS: p.items, GROUPS: p.groups, WAREHOUSES: p.warehouses,
     PROCESSES: p.processes, ROUTES: p.routes, PLANS: p.plans, ORDERS: p.orders, STOCK: p.stock, PENDING: p.pending, HELP_TOPICS: p.topics };
   const contents = [{ role: 'user', parts: [{ text: 'CONTEXT:\n' + JSON.stringify(ctx) }] },
     { role: 'model', parts: [{ text: '{"transcript":"","lang":"en","answer":"Ready.","steps":[]}' }] }];
@@ -497,5 +616,5 @@ export async function assist(device, payload, lang, fetchImpl) {
   const tables = cleanTables(j.tables);
   const l = String(j.lang || '').toLowerCase();
   return { httpStatus: 200, body: { ok: true, model: a.model, left: a.left, transcript: str(j.transcript, 1200),
-    lang: l === 'gu' || l === 'hi' ? l : 'en', answer: text(j.answer, 9000), steps: checked.steps, dropped: checked.dropped, tables: tables } };
+    lang: l === 'gu' || l === 'hi' ? l : 'en', answer: text(j.answer, 9000), speech: str(j.speech, 1200), steps: checked.steps, dropped: checked.dropped, tables: tables } };
 }

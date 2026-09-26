@@ -17,7 +17,7 @@
  * per installation (the random device id the application keeps), see ai.js.
  */
 import { createServer } from 'node:http';
-import { assist, aiStatus, pickLang, keySource, keyHint } from './src/ai.js';
+import { assist, transcribe, speak, aiStatus, pickLang, keySource, keyHint } from './src/ai.js';
 
 const PORT = process.env.PORT || 3000;
 const MAX_BODY = 12 * 1024 * 1024;           /* a minute of speech or a few photos, as base64 */
@@ -56,6 +56,16 @@ export async function handle(req, res, fetchImpl) {
   if (method === 'OPTIONS') { res.writeHead(204, CORS); return res.end(); }
   if ((path === '/' || path === '/health') && (method === 'GET' || method === 'HEAD')) {
     return send(res, 200, { ok: true, service: 'nexora-jobwork-api', version: VERSION, ai: aiStatus() });
+  }
+  /* 2.0.3 — the ear and the voice */
+  if ((path === '/v1/ai/transcribe' || path === '/v1/ai/speak') && method === 'POST') {
+    const body = await readJson(req);
+    if (body.__big) return send(res, 413, { error: 'MEDIA_BIG', message: 'That recording is too long \u2014 a minute at most.' });
+    if (body.__bad) return send(res, 400, { error: 'BAD_JSON', message: 'Nexora AI could not read that request.' });
+    const device = String(body.device || req.headers['x-nexora-device'] || '').replace(/[^\w\-]/g, '').slice(0, 64);
+    if (device.length < 8) return send(res, 400, { error: 'DEVICE', message: 'This installation has no id yet.' });
+    const out = path === '/v1/ai/transcribe' ? await transcribe(device, body, fetchImpl) : await speak(device, body, fetchImpl);
+    return send(res, out.httpStatus, out.body);
   }
   if (path === '/v1/ai/assist' && method === 'POST') {
     const body = await readJson(req);
