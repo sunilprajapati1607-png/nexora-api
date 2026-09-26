@@ -582,7 +582,7 @@ export async function speak(device, payload, fetchImpl) {
   let r;
   try {
     r = await gfetch(API + '/models/' + encodeURIComponent(name) + ':generateContent', { method: 'POST', body: JSON.stringify({
-      contents: [{ role: 'user', parts: [{ text: how + words }] }],
+      contents: [{ role: 'user', parts: [{ text: (payload && payload.plain) || process.env.GEMINI_VOICE_PLAIN ? words : how + words }] }],
       generationConfig: { responseModalities: ['AUDIO'], speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: String(process.env.GEMINI_VOICE || 'Kore') } } } } }) }, fetchImpl);
   } catch (e) { return { httpStatus: 504, body: { error: 'AI_TIMEOUT', message: 'The voice did not come in time.' } }; }
   console.log('ai voice ' + (r.ok ? 'ok' : r.status) + ' ' + (Date.now() - t0) + ' ms ' + name);
