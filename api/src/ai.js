@@ -47,7 +47,7 @@ function bestOf(names) {
 }
 export function _blocked() { return blocked; }
 const MODEL_TTL_MS = 6 * 60 * 60 * 1000;
-const TIMEOUT_MS = 30000;
+const TIMEOUT_MS = 60000;              /* 4.67.6 — a question with the plant's whole memory takes longer */
 
 const key = () => String(process.env.GEMINI_API_KEY || '').trim();
 export function aiConfigured() { return !!key(); }
@@ -347,7 +347,7 @@ export function cleanFill(p) {
   const x = p && typeof p === 'object' ? p : {};
   const fields = list(x.fields, 80).map((f) => ({
     key: str(f && f.key, 30), label: str(f && f.label, 60), unit: str(f && f.unit, 12),
-    type: f && f.type === 'enum' ? 'enum' : 'number', options: list(f && f.options, 12).map((o) => str(o, 20)), required: !!(f && f.required)
+    type: f && f.type === 'enum' ? 'enum' : 'number', options: list(f && f.options, 12).map((o) => str(o, 20)), required: !!(f && f.required), optional: !!(f && f.optional)
   })).filter((f) => f.key);
   const known = {}; fields.forEach((f) => { known[f.key] = true; });
   return {
@@ -680,12 +680,13 @@ export function cleanAssist(p) {
     text: str(x.text, 1200),
     history: list(x.history, 20).map((h) => ({ role: h && h.role === 'model' ? 'model' : 'user', text: str(h && h.text, 2500) })).filter((h) => h.text),
     units: fill.units,
-    constructions: fill.constructions,
+    constructions: fill.constructions.map((c) => Object.assign({}, c, { needs: needsOf(c) })),
     fields: fill.fields,
     processes: list(x.processes, 80).map((q) => ({ code: str(q && q.code, 30), name: str(q && q.name, 60) })).filter((q) => q.code),
     routes: list(x.routes, 80).map((r) => ({ name: str(r && r.name, 80), steps: list(r && r.steps, 30).map((s) => str(s, 30)),
       constructions: list(r && r.constructions, 30).map((s) => str(s, 60)), stages: cleanSecs(r && r.stages) })).filter((r) => r.name),
-    materials: list(x.materials, 300).map((m) => ({ code: str(m && m.code, 40), name: str(m && m.name, 60), group: str(m && m.group, 30) })).filter((m) => m.code),
+    materials: list(x.materials, 300).map((m) => ({ code: str(m && m.code, 40), name: str(m && m.name, 60), group: str(m && m.group, 30), rate: nr(m && m.rate) })).filter((m) => m.code),
+    rules: list(x.rules, 30).map((r) => str(r, 300)).filter(Boolean),
     topics: list(x.topics, 120).map((t) => str(t, 80)).filter(Boolean),
     figures: list(x.figures, 80).map((f) => ({ key: str(f && f.key, 30).toUpperCase(), label: str(f && f.label, 60) })).filter((f) => f.key),
     /* what Nexora has learned from this plant's own saved work (routes used, workflows matched, usual recipes) */
@@ -746,14 +747,17 @@ const STEP_LIST = [
   '{"do":"accept"} — save the stages Nexora suggested on this BOM into its route (they are then the plant\u2019s own).',
   '{"do":"savebom"} — save the BOM as a record (with its version).',
   '{"do":"saveworkflow","name":NAME} — save this bag\u2019s whole set-up (routes, tabs, every recipe) as a workflow, loaded on the next bag of this construction.',
-  '{"do":"price","material":MATERIAL CODE,"change":number or null,"pct":number or null,"set":number or null,"from":"YYYY-MM-DD" or null} — a new price version for a material: "+5" is change 5, "3 % up" is pct 3, "210 karo" is set 210. Nexora works it out from the price in force on the person\u2019s own computer — you never see a price.',
+  '{"do":"price","material":MATERIAL CODE,"change":number or null,"pct":number or null,"set":number or null,"from":"YYYY-MM-DD" or null} — a new price version for a material: "+5" is change 5, "3 % up" is pct 3, "210 karo" is set 210.',
+  '{"do":"quote","quantity":number,"rate":number or null,"margin":percent or null} — a quotation for the bag on screen (or the one just made): its quantity, and the selling rate the person said, or a margin over the bag\u2019s cost that Nexora works out on the person\u2019s computer. The buyer is typed by the person.',
   '{"do":"cost"} — show the cost per bag (worked out on the person’s screen; you never see it).',
   '{"do":"open","view":one of ' + ASSIST_VIEWS.join('|') + '} — go to a window.'
 ];
 const ASSIST_SYSTEM = [
   'You are Nexora AI, the assistant inside Nexora — software for PP/PE woven sack plants: bag weight (calculation), bill of materials (BOM) by route and stage, recipes, costing, quotation.',
   'You are an expert in woven sacks: tape extrusion (PP with filler/CaCO3 and masterbatch, usually 2–8 % waste), circular weaving, BOPP printing and slitting, lamination/coating (PP/LD granule), backseam, block bottom, pinch, stitching, liners, valves, finishing and packing.',
-  'You see the screen the person is on (NOW), the plant’s constructions and their fields, processes, routes and materials (codes, names and groups). You NEVER see, and must never ask for or guess, an item name, a customer name, a price, a rate or a cost.',
+  'You see the screen the person is on (NOW), the plant\u2019s constructions (their fields and what they NEED), processes, routes, materials with their current rates, and what the plant has saved. You NEVER see — and must never ask for or guess — an item name, a customer name or the cost of a bag.',
+  'THINK FOR YOURSELF, LIKE THE PLANT\u2019S TECHNICAL MANAGER. Do the job the person MEANS, not only the words: a calculation needs every open field of its construction; a route has every process the construction\u2019s layers and parts need (CONSTRUCTIONS[].needs — a coated/laminated (2L) bag has lamination; a BOPP bag BOPP printing and lamination; a backseamed bag backseam; patches or a valve block bottom; a pinch bag pinch bottom); "make a quotation" is a "quote" step, after the bag is saved; "how do I…" is answered in steps the person can follow, with an "open" step to take them there. Facts: the mesh is needed for the denier and the GPM; the coating GSM for any coated or laminated bag. When a thing is truly unclear, ask — but never leave out what the job obviously needs.',
+  'STANDING INSTRUCTIONS: when the person says how things should ALWAYS be done ("from next time…", "always…", "hamesha…", "have thi…"), put it in "remember" as one short sentence. RULES are the instructions already given — follow every one of them, every time. When the person asks to drop one ("forget …", "no longer …"), put its exact text from RULES in "forget" (a list).',
   'Talk with the person about anything on this screen or in Nexora (HELP_TOPICS name its windows). When they ask for work to be done, return STEPS. Steps allowed: ' + STEP_LIST.join(' '),
   'Rules for the calculation: UNITS says how THIS plant types sizes (UNITS.length) and counts mesh (UNITS.mesh); FIELDS carry those units and NOW shows the bag in them. Put every size and mesh EXACTLY as the person says it, in those units — "32x32" is M.WARP 32 and M.WEFT 32, "490x550" is width 490 and length 550 — and never convert on your own. Convert only when the person names a different unit (e.g. "19 inch" in a mm plant → 482.6), and say so. "490x550" is width x length. A bag WEIGHT said in grams ("70 gram", "70 g bag", "target 70") is the TARGET WEIGHT — put it in "targetWeight"; Nexora then finds the body fabric GSM itself (weight → GSM), so never ask for the GSM then and never invent one. A number is a GSM only when the person says gsm or g/m². Choose the construction by name and meaning ("1L" = one layer, "stitch", "block bottom", "laminated"). An enum field takes one of its options exactly.',
   'Rules for a recipe: "80+20" for a stage means two materials by percent — choose them from MATERIALS by what this plant usually uses on that stage (LEARNED.stages usualMaterials), else by what is usual in the trade (for tape: the PP granule and the filler), unless the person names them; say which you chose. When a stage’s waste is not said, LEARNED.stages usualWastePct is this plant’s own. Use only codes from MATERIALS and PROCESSES and names from ROUTES.',
@@ -774,9 +778,38 @@ const ASSIST_SYSTEM = [
   'Order steps as the work goes: calc → save → route (only if needed) → bom → recipe/waste → cost. Leave out what NOW shows is already done. When the person corrects something ("no, width 520", "make it 75 gram"), return the WHOLE corrected list of steps again with the change, with "fresh":false on the calc step when NOW.calc.madeByAi is true.',
   'If something needed is missing, still return the steps you can and ask for the rest in "answer". Keep "answer" short and practical: what you understood, what the steps will do, any assumption.',
   'Reply in the SAME language the person used: English → English; Gujarati (in Gujarati script or in English letters) → Gujarati in Gujarati script; Hindi → Hindi in Devanagari. Keep codes, field names, material and process names and Nexora button names in English. Set "lang" to en, gu or hi accordingly.',
-  'Answer ONLY with JSON: {"transcript": string, "lang": "en"|"gu"|"hi", "answer": string, "steps": [ ... ]}.'
+  'Answer ONLY with JSON: {"transcript": string, "lang": "en"|"gu"|"hi", "answer": string, "steps": [ ... ], "remember": string or null, "forget": [string]}.'
 ].join('\n');
 
+/** What a construction needs, read from its own fields and its name: the processes its layers and parts call for. */
+export function needsOf(con) {
+  const f = (con && con.fields) || [], n = String((con && con.name) || '').toUpperCase();
+  const has = (re) => f.some((k) => re.test(k));
+  const layers = Number((/^(\d)L\b/.exec(n) || [])[1]) || null;
+  return {
+    layers: layers,
+    coating: has(/CT GSM/) || (layers !== null && layers >= 2),
+    bopp: has(/BOP MIC|BOPP/) || /BOPP/.test(n),
+    metallised: has(/MT MIC/),
+    backseam: has(/BACKSEAM|BKSM/) || /BKSM|BACKSEAM/.test(n),
+    blockBottom: /BLOCK BOTTOM/.test(n) || has(/^PATCH$|PTC/),
+    valve: has(/^VALVE$/),
+    pinch: /PINCH/.test(n),
+    liner: has(/LNR|LINER/) || /LNR|LINER/.test(n),
+    stitch: /STITCH/.test(n)
+  };
+}
+/** The processes a new route must have for a construction's needs; the codes this plant has. */
+function routeNeeds(needs, procCodes) {
+  const want = [];
+  const pick = (codes) => codes.filter((c) => procCodes.indexOf(c) > -1)[0];
+  if (needs.bopp) { const bp = pick(['BOPP_PRINTING']); if (bp) want.push({ code: bp, why: 'a BOPP bag is printed on its film', after: 'WEAVING' }); }
+  if (needs.coating || needs.bopp) { const l = pick(['LAMINATION', 'COATING']); if (l) want.push({ code: l, why: needs.bopp ? 'the film is laminated to the fabric' : 'this construction has a coating layer', after: 'WEAVING' }); }
+  if (needs.backseam) { const b = pick(['BACKSEAM']); if (b) want.push({ code: b, why: 'the construction is backseamed', after: 'LAMINATION' }); }
+  if (needs.blockBottom) { const b = pick(['BLOCK_BOTTOM']); if (b) want.push({ code: b, why: 'patches and a valve make a block bottom', after: 'FINISHING' }); }
+  if (needs.pinch) { const b = pick(['PINCH_BOTTOM']); if (b) want.push({ code: b, why: 'a pinch bottom bag', after: 'FINISHING' }); }
+  return want;
+}
 /** Every number the person said — in this request, earlier in the conversation, in a recording\u2019s transcript. */
 function saidNumbers(p) {
   const txt = [p.text, p.transcript || ''].concat(p.history.filter((h) => h.role === 'user').map((h) => h.text)).join(' ');
@@ -784,7 +817,7 @@ function saidNumbers(p) {
 }
 /** The steps Nexora AI proposed, checked against what was sent. */
 export function checkSteps(p, raw) {
-  const out = [], dropped = [], missing = [];
+  const out = [], dropped = [], missing = [], notes = [];
   const conOf = {}; p.constructions.forEach((c) => { conOf[c.name.toUpperCase()] = c; });
   const fieldOf = {}; p.fields.forEach((f) => { fieldOf[f.key] = f; });
   const procOf = {}; p.processes.forEach((q) => { procOf[q.code.toUpperCase()] = q; });
@@ -834,7 +867,9 @@ export function checkSteps(p, raw) {
         /* a size may have been said in another unit (19 inch in a mm plant); any other figure must be the very number said */
         const lu = String(p.units.length || 'mm').toLowerCase();
         const isLen = f && String(f.unit || '').toLowerCase() === lu && /^(mm|cm|in)$/.test(lu);
-        const conv = !isLen ? [1] : lu === 'mm' ? [1, 10, 25.4] : lu === 'cm' ? [1, 0.1, 2.54] : [1, 1 / 25.4, 1 / 2.54];
+        /* mesh said per 10 cm, per cm or per inch, in a plant that counts it another way (40 x 40 per 10 cm = 10.2 per inch) */
+        const isMeshF = k === 'M.WARP' || k === 'M.WEFT';
+        const conv = isMeshF ? [1, 0.254, 2.54, 1 / 2.54, 10 / 2.54, 10, 0.1] : !isLen ? [1] : lu === 'mm' ? [1, 10, 25.4] : lu === 'cm' ? [1, 0.1, 2.54] : [1, 1 / 25.4, 1 / 2.54];
         if (!said.some((n) => conv.some((c) => Math.abs(n * c - v) < Math.max(0.051, Math.abs(v) * 0.002)))) { guessed[k] = v; delete inputs[k]; }
       });
       /* a figure this construction needs that Nexora AI left out, the saved bags give it (a new bag only) */
@@ -858,10 +893,25 @@ export function checkSteps(p, raw) {
         if (typ && typ.inputs[k] !== undefined) return;
         missing.push({ key: k, label: f.label, unit: f.unit, type: f.type, options: f.options, required: true });
       });
+      /* "not asking perameter which are marked in structured": every OTHER open field of this
+         construction is asked too, unless it was said, is on the bag, or the saved bags give it */
+      if (con) con.fields.forEach((k) => {
+        const f = fieldOf[k];
+        if (!f || f.required || f.optional || k === 'BD FAB GSM' || have[k] !== undefined || guessed[k] !== undefined) return;
+        if (typ && typ.inputs[k] !== undefined) return;
+        if (missing.some((m) => m.key === k)) return;
+        missing.push({ key: k, label: f.label, unit: f.unit, type: f.type, options: f.options, required: true });
+      });
       return;
     }
     if (d === 'save' || d === 'bom' || d === 'cost') { out.push({ do: d }); return; }
     if (d === 'check' || d === 'accept' || d === 'savebom') { out.push({ do: d }); return; }
+    if (d === 'quote') {
+      const qn = num(s.quantity), rt = num(s.rate), mg = num(s.margin);
+      if (!(qn > 0)) { dropped.push('quote without a quantity'); return; }
+      out.push({ do: 'quote', quantity: Math.round(qn), rate: rt !== null && rt > 0 ? rt : null, margin: mg !== null && mg > -100 && mg < 1000 ? mg : null });
+      return;
+    }
     if (d === 'price') {
       const m = matFind(s.material);
       const ch = num(s.change), pc = num(s.pct), st = num(s.set);
@@ -900,7 +950,24 @@ export function checkSteps(p, raw) {
       const asked = list(s.steps, 30);
       if (hit && !asked.length) { out.push({ do: 'route', name: hit.name }); return; }
       const steps = asked.map(procFind);
-      if (steps.length && steps.every(Boolean)) { out.push({ do: 'route', name: str(s.name, 60) || 'Nexora AI route', steps: steps.map((q) => q.code) }); return; }
+      if (steps.length && steps.every(Boolean)) {
+        /* "according to structure ai is not making route": what the construction's layers and parts need is put in */
+        const codes = steps.map((q) => q.code);
+        const calcStep = out.filter((x) => x.do === 'calc')[0];
+        const conName = (calcStep && calcStep.construction) || p.now.calc.structure;
+        const con = conOf[String(conName || '').toUpperCase()];
+        if (con) routeNeeds(needsOf(con), p.processes.map((q) => q.code)).forEach((w) => {
+          if (codes.indexOf(w.code) > -1) return;
+          let at = codes.indexOf(w.after);
+          if (at < 0) at = codes.indexOf('WEAVING');
+          if (at < 0) at = Math.max(0, codes.length - 2);
+          const packing = codes.indexOf('PACKING');
+          codes.splice(Math.min(at + 1, packing > -1 ? packing : codes.length), 0, w.code);
+          notes.push('Added ' + (procOf[w.code] ? procOf[w.code].name : w.code) + ' to the route — ' + w.why + '.');
+        });
+        out.push({ do: 'route', name: str(s.name, 60) || 'Nexora AI route', steps: codes });
+        return;
+      }
       if (hit) { out.push({ do: 'route', name: hit.name }); return; }
       dropped.push('route ' + str(s.name, 40)); return;
     }
@@ -934,7 +1001,7 @@ export function checkSteps(p, raw) {
     if (d === 'open') { if (ASSIST_VIEWS.indexOf(s.view) > -1) out.push({ do: 'open', view: s.view }); else dropped.push('window ' + str(s.view, 20)); return; }
     if (d) dropped.push(str(d, 20));
   });
-  return { steps: out, dropped: dropped, missing: missing };
+  return { steps: out, dropped: dropped, missing: missing, notes: notes };
 }
 
 /** POST /v1/ai/assist */
@@ -944,7 +1011,7 @@ export async function assist(companyId, payload, lang, fetchImpl) {
   const m = mediaParts(payload);
   if (m.error) return m.error;
   if (!p.text && !m.parts.length) return { httpStatus: 400, body: { error: 'NOTHING', message: 'Say or type something first.' } };
-  const ctx = { SCREEN: p.screen, UNITS: p.units, NOW: p.now, CONSTRUCTIONS: p.constructions, FIELDS: p.fields, PROCESSES: p.processes,
+  const ctx = { SCREEN: p.screen, UNITS: p.units, RULES: p.rules, NOW: p.now, CONSTRUCTIONS: p.constructions, FIELDS: p.fields, PROCESSES: p.processes,
     ROUTES: p.routes, MATERIALS: p.materials, FIGURES: p.figures, LEARNED: p.learned, HELP_TOPICS: p.topics };
   const contents = [{ role: 'user', parts: [{ text: 'CONTEXT:\n' + JSON.stringify(ctx) }] },
     { role: 'model', parts: [{ text: '{"transcript":"","lang":"en","answer":"Ready.","steps":[]}' }] }];
@@ -969,5 +1036,6 @@ export async function assist(companyId, payload, lang, fetchImpl) {
   }
   return { httpStatus: 200, body: { ok: true, model: a.model, left: a.left, transcript: str(j.transcript, 1200),
     lang: l === 'gu' || l === 'hi' ? l : 'en', answer: answer,
-    steps: checked.steps, missing: checked.missing, dropped: checked.dropped } };
+    steps: checked.steps, missing: checked.missing, dropped: checked.dropped, notes: checked.notes, remember: j.remember ? str(j.remember, 300) : null,
+    forget: list(j.forget, 10).map((x) => str(x, 300)).filter((x) => p.rules.indexOf(x) > -1) } };
 }
