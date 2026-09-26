@@ -332,8 +332,8 @@ const SYSTEM = [
   'FOLLOW-UPS ON A TABLE stay IN THE CHAT: "group it by material group", "party wise", "only I3", "sort by kg", "add batches", "this month only" about a table already shown means a NEW "table" step (the same "from", with the change) — never an "open" or "stock" step. Open a window only when the person asks to open, go to or show a window — and for data (a table shown, or asked for "in the window") that is a "window" step with the table\u2019s fields, so Nexora opens its own register filtered and grouped the same way.',
   'HOW TO WRITE "answer" (Markdown, it is drawn on the screen): for a figure or a yes/no, one or two lines. For an explanation, a process, a procedure, a rule or a "how do I", write it ELABORATED and STRUCTURED, never one paragraph: "## " headings; numbered steps ("1. ") for anything done in order, each step saying what is done, by whom or at which stage, and where in Nexora (window and button in **bold**); "- " bullets for points; **bold** for key terms and figures; a short "## Checks" or "## Common mistakes" and a "## Tip" where they help. For a plant process (extrusion, weaving, lamination, printing, stitching…) cover: purpose, input and output, the steps, settings/parameters usually watched, typical waste %, quality checks, and how it is recorded in Nexora (which document at which stage). Use a Markdown table (| a | b |) inside "answer" for a small comparison; a big one goes in "tables".',
   'Reply in the SAME language the person used: English → English; Gujarati (in Gujarati script or in English letters) → Gujarati in Gujarati script; Hindi → Hindi in Devanagari. Keep document numbers, tokens, codes and Nexora button names in English; write numbers with the digits 0-9 (1200 kg, never ૧૨૦૦). Set "lang" to en, gu or hi accordingly.',
-  'When VOICE is true the person is TALKING with you and will HEAR "speech": put in "speech" what to say aloud — two to four short spoken sentences in the person\u2019s language, no Markdown, no symbols, numbers said plainly, a table only summed up ("the table is on your screen"); "answer" still carries the full written answer. End "speech" with a short follow-up question only when one is natural.',
-  'Answer ONLY with JSON: {"transcript": string (what the person said, when it came as a recording), "lang": "en"|"gu"|"hi", "answer": string, "speech": string (only when VOICE), "steps": [ ... ], "tables": [ ... ]}.'
+  'When VOICE is true the person is TALKING with you and will HEAR "speech": put in "speech" what to say aloud — two to four short spoken sentences in the person\u2019s language, no Markdown, no symbols, numbers said plainly, a table only summed up ("the table is on your screen"); and, when that language is not English, the same in simple English in "speechEn". "answer" still carries the full written answer. End "speech" with a short follow-up question only when one is natural.',
+  'Answer ONLY with JSON: {"transcript": string (what the person said, when it came as a recording), "lang": "en"|"gu"|"hi", "answer": string, "speech": string (only when VOICE), "speechEn": string (only when VOICE and not English), "steps": [ ... ], "tables": [ ... ]}.'
 ].join('\n');
 
 /** A knowledge table in the answer: at most 4, 12 columns, 80 rows; text or numbers only. */
@@ -549,6 +549,8 @@ export async function transcribe(device, payload, fetchImpl) {
     const msg = String((r.body && r.body.error && r.body.error.message) || '');
     if (r.status === 400 && /think/i.test(msg)) { noThinking.add(name); continue; }
     if (!r.ok && (r.status === 404 || /no longer available|not found|not supported/i.test(msg)) && name !== model.name) { name = model.name; continue; }
+    /* 2.0.3 — measured: the Flash models answered 503 (Google overloaded) for minutes at a time; Lite still hears */
+    if (!r.ok && (r.status === 503 || r.status === 500 || r.status === 429) && name !== model.name) { name = model.name; continue; }
     break;
   }
   console.log('ai ear ' + (r && r.ok ? 'ok' : r && r.status) + ' ' + (Date.now() - t0) + ' ms ' + name);
@@ -582,7 +584,7 @@ export async function speak(device, payload, fetchImpl) {
   let r;
   try {
     r = await gfetch(API + '/models/' + encodeURIComponent(name) + ':generateContent', { method: 'POST', body: JSON.stringify({
-      contents: [{ role: 'user', parts: [{ text: (payload && payload.plain) || process.env.GEMINI_VOICE_PLAIN ? words : how + words }] }],
+      contents: [{ role: 'user', parts: [{ text: (payload && payload.plain) || process.env.GEMINI_VOICE_PLAIN || lang !== 'en' ? words : how + words }] }],
       generationConfig: { responseModalities: ['AUDIO'], speechConfig: Object.assign({ voiceConfig: { prebuiltVoiceConfig: { voiceName: String(process.env.GEMINI_VOICE || 'Kore') } } }, payload && /^[a-z]{2}-[A-Z]{2}$/.test(String(payload.languageCode || '')) ? { languageCode: payload.languageCode } : {}) } }) }, fetchImpl);
   } catch (e) { return { httpStatus: 504, body: { error: 'AI_TIMEOUT', message: 'The voice did not come in time.' } }; }
   console.log('ai voice ' + (r.ok ? 'ok' : r.status) + ' ' + (Date.now() - t0) + ' ms ' + name);
@@ -616,5 +618,5 @@ export async function assist(device, payload, lang, fetchImpl) {
   const tables = cleanTables(j.tables);
   const l = String(j.lang || '').toLowerCase();
   return { httpStatus: 200, body: { ok: true, model: a.model, left: a.left, transcript: str(j.transcript, 1200),
-    lang: l === 'gu' || l === 'hi' ? l : 'en', answer: text(j.answer, 9000), speech: str(j.speech, 1200), steps: checked.steps, dropped: checked.dropped, tables: tables } };
+    lang: l === 'gu' || l === 'hi' ? l : 'en', answer: text(j.answer, 9000), speech: str(j.speech, 1200), speechEn: str(j.speechEn, 1200), steps: checked.steps, dropped: checked.dropped, tables: tables } };
 }

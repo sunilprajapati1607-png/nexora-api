@@ -275,4 +275,15 @@ await t('what needs somebody: the attention list and the screen go, cleaned', as
   assert.equal(p.screenText, 'Open plans 5\nWaiting for QC 2');
 });
 
+await t('the ear: a busy Flash (503) hands the recording to Lite', async () => {
+  _resetLimits(); _blockedReset(); sent.length = 0;
+  await resolveModel(true, fakeGoogle({}));
+  const busy = async (url, init) => {
+    if (/gemini-3\.5-flash:generateContent/.test(url)) { sent.push({ url: String(url), body: '' }); return new Response(JSON.stringify({ error: { message: 'overloaded' } }), { status: 503 }); }
+    return fakeGoogle({ text: 'stock ketlo che', lang: 'gu' })(url, init);
+  };
+  const r = await call('POST', '/v1/ai/transcribe', { device: 'dev-ear00002', lang: 'gu', audio: { mime: 'audio/wav', data: 'AAAA' } }, busy);
+  assert.equal(r.status, 200, JSON.stringify(r.json)); assert.equal(r.json.model, 'gemini-3.5-flash-lite'); assert.equal(r.json.text, 'stock ketlo che');
+});
+
 console.log(pass + ' passed');
