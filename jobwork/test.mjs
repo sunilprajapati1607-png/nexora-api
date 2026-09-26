@@ -185,7 +185,7 @@ await t('least thinking is asked for; a model that refuses it is asked again wit
   assert.equal(r.status, 200, JSON.stringify(r.json));
   const g = sent.filter((s) => /generateContent/.test(s.url));
   assert.equal(n, 1); assert.ok(/thinkingConfig/.test(g[0].body) && !/thinkingConfig/.test(g[g.length - 1].body));
-  assert.equal(thinkingFor('gemini-3.5-flash-lite'), null);
+  assert.equal(thinkingFor(r.json.model), null);
   _noThinking().clear();
 });
 
