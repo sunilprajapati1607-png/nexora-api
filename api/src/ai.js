@@ -29,8 +29,23 @@
  */
 
 const API = 'https://generativelanguage.googleapis.com/v1beta';
-export const DEFAULT_MODEL = 'gemini-2.5-flash-lite';
-const FALLBACKS = ['gemini-2.5-flash-lite', 'gemini-2.5-flash', 'gemini-2.0-flash-lite', 'gemini-2.0-flash'];
+/* 4.67.1 — live, Google answered: "gemini-2.5-flash-lite is no longer
+   available to new users … use gemini-3.5-flash-lite". So the default is
+   the newer one, and the choice below always prefers the NEWEST Flash-Lite
+   (then Flash) the key lists — a model Google refuses is set aside and
+   the one it names is tried in the same request. */
+export const DEFAULT_MODEL = 'gemini-3.5-flash-lite';
+const blocked = new Set();                       // models Google has refused this run
+/** 'gemini-3.5-flash-lite' → a sort key: flash-lite before flash, newer first */
+function rankOf(n) {
+  const m = /^gemini-(\d+)(?:\.(\d+))?-(flash-lite|flash)(?:-(\d{3}))?$/.exec(n);
+  if (!m) return null;
+  return (m[3] === 'flash-lite' ? 2e6 : 1e6) + Number(m[1]) * 1000 + Number(m[2] || 0) * 10 + (m[4] ? 0 : 1);
+}
+function bestOf(names) {
+  return names.filter((n) => !blocked.has(n) && rankOf(n) !== null).sort((a, b) => rankOf(b) - rankOf(a))[0] || null;
+}
+export function _blocked() { return blocked; }
 const MODEL_TTL_MS = 6 * 60 * 60 * 1000;
 const TIMEOUT_MS = 30000;
 
@@ -76,8 +91,7 @@ export async function resolveModel(force, fetchImpl) {
       const names = ((r.body && r.body.models) || [])
         .filter((m) => (m.supportedGenerationMethods || []).indexOf('generateContent') > -1)
         .map((m) => String(m.name || '').replace(/^models\//, ''));
-      const pick = names.indexOf(wanted) > -1 ? wanted
-        : (FALLBACKS.filter((f) => names.indexOf(f) > -1)[0] || names.filter((n) => /flash/.test(n) && !/preview|exp|tts|image|live|audio/.test(n))[0] || null);
+      const pick = (names.indexOf(wanted) > -1 && !blocked.has(wanted)) ? wanted : bestOf(names);
       model = { name: pick, at: Date.now(), error: pick ? (pick === wanted ? null : 'asked for ' + wanted + ', using ' + pick) : 'no usable model on this key', available: names.slice(0, 40) };
     } catch (e) {
       /* the list could not be read: try the model asked for anyway */
@@ -188,23 +202,34 @@ async function ask(companyId, system, prompt, fetchImpl) {
   const t = take(companyId);
   if (t.busy) return { fail: { httpStatus: 429, body: { error: 'AI_BUSY', retryAfter: t.busy, message: 'Nexora AI is busy — try again in ' + t.busy + ' seconds.' } } };
   if (t.spent) return { fail: { httpStatus: 429, body: { error: 'AI_DAILY', message: 'This company has used today’s ' + daily() + ' Nexora AI checks. They come back tomorrow.' } } };
-  const name = await resolveModel(false, fetchImpl);
+  let name = await resolveModel(false, fetchImpl);
   if (!name) return { fail: { httpStatus: 503, body: { error: 'AI_MODEL', message: 'Nexora AI has no model it can use right now.' } } };
+  const payload = JSON.stringify({
+    systemInstruction: { parts: [{ text: system }] },
+    contents: [{ role: 'user', parts: Array.isArray(prompt) ? prompt : [{ text: prompt }] }],   /* text, or parts (a recording + text) */
+    generationConfig: { temperature: 0.2, responseMimeType: 'application/json', maxOutputTokens: 2048 }
+  });
   let r;
-  try {
-    r = await gfetch(API + '/models/' + encodeURIComponent(name) + ':generateContent', {
-      method: 'POST',
-      body: JSON.stringify({
-        systemInstruction: { parts: [{ text: system }] },
-        contents: [{ role: 'user', parts: Array.isArray(prompt) ? prompt : [{ text: prompt }] }],   /* text, or parts (a recording + text) */
-        generationConfig: { temperature: 0.2, responseMimeType: 'application/json', maxOutputTokens: 2048 }
-      })
-    }, fetchImpl);
-  } catch (e) {
-    return { fail: { httpStatus: 504, body: { error: 'AI_TIMEOUT', message: 'Nexora AI did not answer in time. Try again.' } } };
+  /* 4.67.1 — a model Google has retired is set aside and the request is
+     asked again, of the model Google names (or the newest the key lists),
+     at most twice — the person never sees "no longer available" */
+  for (let attempt = 0; ; attempt++) {
+    try {
+      r = await gfetch(API + '/models/' + encodeURIComponent(name) + ':generateContent', { method: 'POST', body: payload }, fetchImpl);
+    } catch (e) {
+      return { fail: { httpStatus: 504, body: { error: 'AI_TIMEOUT', message: 'Nexora AI did not answer in time. Try again.' } } };
+    }
+    const msg = String((r.body && r.body.error && r.body.error.message) || '');
+    const gone = !r.ok && (r.status === 404 || /no longer available|not found|is not supported|deprecated/i.test(msg));
+    if (!gone || attempt >= 2) break;
+    blocked.add(name);
+    const named = (msg.match(/models\/(gemini-[\w.\-]+)/g) || []).map((x) => x.replace(/^models\//, '')).filter((n) => n !== name && !blocked.has(n))[0];
+    const next = named || await resolveModel(true, fetchImpl);
+    if (!next || blocked.has(next)) break;
+    name = next;
+    model = Object.assign({}, model, { name: next, at: Date.now(), error: 'switched to ' + next + ' (Google retired the one before)' });
   }
   if (!r.ok) {
-    if (r.status === 404) resolveModel(true, fetchImpl).catch(() => {});      // the model went away: look again
     const busy = r.status === 429;
     return { fail: { httpStatus: busy ? 429 : 502, body: { error: busy ? 'AI_BUSY' : 'AI_FAILED', retryAfter: busy ? 60 : undefined,
       message: busy ? 'Nexora AI is busy (Google’s limit) — try again in a minute.' : 'Nexora AI could not answer (' + r.status + '): ' + scrub(r.body && r.body.error && r.body.error.message) } } };
