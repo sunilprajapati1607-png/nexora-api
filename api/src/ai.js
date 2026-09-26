@@ -352,6 +352,7 @@ export function cleanFill(p) {
   const known = {}; fields.forEach((f) => { known[f.key] = true; });
   return {
     text: str(x.text, 800),
+    units: { length: str(x.units && x.units.length, 12) || 'mm', mesh: str(x.units && x.units.mesh, 24) || 'tapes per inch' },
     constructions: list(x.constructions, 80).map((c) => ({ name: str(c && c.name, 60), description: str(c && c.description, 120),
       fields: list(c && c.fields, 80).map((k) => str(k, 30)).filter((k) => known[k]) })).filter((c) => c.name),
     fields: fields,
@@ -364,7 +365,7 @@ export function cleanFill(p) {
 const FILL_SYSTEM = [
   'You are Nexora AI, inside Nexora, software that weighs PP/PE woven sacks.',
   'A person describes one bag, by voice or in writing, in English, Gujarati or Hindi (often mixed). Place what they say on the CONSTRUCTIONS and FIELDS given — nothing else.',
-  'Units: dimensions in millimetres (convert inches ×25.4 and centimetres ×10), GSM in g/m², micron in µm, mesh as threads per inch (e.g. "10 by 10" → M.WARP 10, M.WEFT 10). Width and length are the bag’s flat width and length. Bag quantity is "bagQuantity".',
+  'Units: every field is in the unit FIELDS gives it — this plant\u2019s own (UNITS: sizes and mesh as the plant types them). Put what the person says EXACTLY in those units ("32 by 32" mesh → M.WARP 32, M.WEFT 32; "490 by 550" → width 490, length 550); convert only when the person names a different unit, and say so. GSM in g/m², micron in µm. Width and length are the bag\u2019s flat width and length. Bag quantity is "bagQuantity".',
   'Choose the construction from the list by what they say (layers, laminated or not, block bottom, stitched, valve, liner, pinch). An enum field takes one of its options exactly.',
   'Put in "inputs" only what was actually said, never a guess. List in "missing" each field of the chosen construction that is required but not said, with a short question to ask.',
   'Answer ONLY with JSON: {"transcript": string, "construction": string or null, "inputs": {"FIELD KEY": number or string}, "bagQuantity": number or null, "missing": [{"key": string, "question": string}], "summary": string}.'
@@ -382,7 +383,7 @@ export async function fillCalc(companyId, payload, lang, fetchImpl) {
     (m.audio ? 'The bag is described in the attached recording.\n' : '') +
     (m.files ? 'The bag is also shown in the attached ' + m.files + ' photo(s) or document(s) — a drawing, a specification sheet or a sample bag: read its sizes and specification carefully; a size printed on a drawing is in the unit written beside it.\n' : '') +
     (p.text ? 'The person typed: ' + p.text + '\n' : '') +
-    'CONTEXT:\n' + JSON.stringify({ constructions: p.constructions, fields: p.fields, current: p.current });
+    'CONTEXT:\n' + JSON.stringify({ units: p.units, constructions: p.constructions, fields: p.fields, current: p.current });
   const a = await ask(companyId, FILL_SYSTEM, m.parts.concat([{ text: intro }]), fetchImpl);
   if (a.fail) return a.fail;
   const j = a.json || {};
@@ -668,16 +669,17 @@ export async function chat(companyId, payload, lang, fetchImpl) {
 export const ASSIST_VIEWS = ['dashboard', 'calculation', 'history', 'bom', 'bomrecords', 'routes', 'rm', 'structures', 'constants',
   'quotation', 'quoterecords', 'compare', 'targetcost', 'priceimpact', 'workflows', 'settings'];
 const cleanSecs = (a) => list(a, 20).map((s) => ({ process: str(s && s.process, 30), wastePct: nr(s && s.wastePct),
-      lines: list(s && s.lines, 12).map((l) => ({ material: str(l && l.material, 60), basis: str(l && l.basis, 10), value: nr(l && l.value) })) })).filter((s) => s.process);
+      lines: list(s && s.lines, 12).map((l) => ({ material: str(l && l.material, 60), basis: str(l && l.basis, 10), value: nr(l && l.value), figure: str(l && l.figure, 30) })) })).filter((s) => s.process);
 export function cleanAssist(p) {
   const x = p && typeof p === 'object' ? p : {};
   const n = x.now && typeof x.now === 'object' ? x.now : {};
   const c = n.calc && typeof n.calc === 'object' ? n.calc : {};
-  const fill = cleanFill({ constructions: x.constructions, fields: x.fields, current: c });
+  const fill = cleanFill({ constructions: x.constructions, fields: x.fields, current: c, units: x.units });
   return {
     screen: ASSIST_VIEWS.indexOf(x.screen) > -1 ? x.screen : 'dashboard',
     text: str(x.text, 1200),
     history: list(x.history, 20).map((h) => ({ role: h && h.role === 'model' ? 'model' : 'user', text: str(h && h.text, 2500) })).filter((h) => h.text),
+    units: fill.units,
     constructions: fill.constructions,
     fields: fill.fields,
     processes: list(x.processes, 80).map((q) => ({ code: str(q && q.code, 30), name: str(q && q.name, 60) })).filter((q) => q.code),
@@ -685,6 +687,7 @@ export function cleanAssist(p) {
       constructions: list(r && r.constructions, 30).map((s) => str(s, 60)), stages: cleanSecs(r && r.stages) })).filter((r) => r.name),
     materials: list(x.materials, 300).map((m) => ({ code: str(m && m.code, 40), name: str(m && m.name, 60), group: str(m && m.group, 30) })).filter((m) => m.code),
     topics: list(x.topics, 120).map((t) => str(t, 80)).filter(Boolean),
+    figures: list(x.figures, 80).map((f) => ({ key: str(f && f.key, 30).toUpperCase(), label: str(f && f.label, 60) })).filter((f) => f.key),
     /* what Nexora has learned from this plant's own saved work (routes used, workflows matched, usual recipes) */
     learned: (function (l) {
       l = l && typeof l === 'object' ? l : {};
@@ -706,6 +709,7 @@ export function cleanAssist(p) {
         structure: fill.current.structure, inputs: fill.current.inputs,
         targetWeight: nr(c.targetWeight), bagQuantity: nr(c.bagQuantity), byWeight: !!c.byWeight,
         netWeight: nr(c.netWeight), saved: !!c.saved, route: str(c.route, 80), madeByAi: !!c.madeByAi,
+        figures: list(c.figures, 40).map((f) => ({ key: str(f && f.key, 30).toUpperCase(), label: str(f && f.label, 60), grams: nr(f && f.grams) })).filter((f) => f.key),
         parts: list(c.parts, 16).map((q) => ({ key: str(q && q.key, 30).toUpperCase(), label: str(q && q.label, 40), grams: nr(q && q.grams), consumable: !!(q && q.consumable), within: str(q && q.within, 30) })).filter((q) => q.key)
       },
       bom: n.bom ? clean(n.bom) : null,
@@ -722,8 +726,13 @@ const STEP_LIST = [
   '{"do":"parts","mode":"WHOLE"|"SPLIT","tabs":{PART KEY: true|false},"routes":{PART KEY: ROUTE NAME}} — which parts of the bag are made on their own route (a tab, SPLIT) and which are costed inside a stage; PART KEYs from NOW.calc.parts (or, for a new bag, BODY, TOP PATCH, BOTTOM PATCH, VALVE, LINER, BOPP as its construction has them).',
   '{"do":"bom"} — open this bag’s BOM (it is costed there, on the person’s screen).',
   '{"do":"check"} — after the BOM is built, check it all (routes, parts taken in, recipes, waste): "is everything right?".',
-  '{"do":"recipe","part":PART KEY or null,"stage":PROCESS CODE,"lines":[{"material":MATERIAL CODE,"value":number,"basis":"PCT"} or {"part":PART KEY,"value":grams or null}],"wastePct":number or null} — set the materials of one stage (of the body, or of a part on its own tab); a {"part":KEY} line TAKES IN that part at this stage (e.g. the patches and the valve at the bottom/finishing stage, BOPP at lamination). Earlier-stage rows stay.',
+  '{"do":"suggest","stage":PROCESS CODE} — fill that stage from the calculation with Nexora\u2019s own Suggest (layer shares on a coating/lamination stage, grams per bag on a finishing, pasting, easy-open or stitching stage) and save it.',
+  '{"do":"recipe","add":true|false,"remove":true|false,"part":PART KEY or null,"stage":PROCESS CODE,"lines":[{"material":MATERIAL CODE,"value":number,"basis":"PCT"} or {"part":PART KEY,"value":grams or null} or {"earlier":true,"stage":PROCESS CODE or null,"basis":"PCT"|"PART_G","value":number or null,"figure":FIGURE KEY or null}],"wastePct":number or null} — set the materials of one stage (of the body, or of a part on its own tab); a {"part":KEY} line TAKES IN that part at this stage (e.g. the patches and the valve at the bottom/finishing stage, BOPP at lamination). Earlier-stage rows stay.',
   '{"do":"waste","part":PART KEY or null,"stage":PROCESS CODE,"pct":number} — the waste % of one stage.',
+  '{"do":"accept"} — save the stages Nexora suggested on this BOM into its route (they are then the plant\u2019s own).',
+  '{"do":"savebom"} — save the BOM as a record (with its version).',
+  '{"do":"saveworkflow","name":NAME} — save this bag\u2019s whole set-up (routes, tabs, every recipe) as a workflow, loaded on the next bag of this construction.',
+  '{"do":"price","material":MATERIAL CODE,"change":number or null,"pct":number or null,"set":number or null,"from":"YYYY-MM-DD" or null} — a new price version for a material: "+5" is change 5, "3 % up" is pct 3, "210 karo" is set 210. Nexora works it out from the price in force on the person\u2019s own computer — you never see a price.',
   '{"do":"cost"} — show the cost per bag (worked out on the person’s screen; you never see it).',
   '{"do":"open","view":one of ' + ASSIST_VIEWS.join('|') + '} — go to a window.'
 ];
@@ -732,18 +741,30 @@ const ASSIST_SYSTEM = [
   'You are an expert in woven sacks: tape extrusion (PP with filler/CaCO3 and masterbatch, usually 2–8 % waste), circular weaving, BOPP printing and slitting, lamination/coating (PP/LD granule), backseam, block bottom, pinch, stitching, liners, valves, finishing and packing.',
   'You see the screen the person is on (NOW), the plant’s constructions and their fields, processes, routes and materials (codes, names and groups). You NEVER see, and must never ask for or guess, an item name, a customer name, a price, a rate or a cost.',
   'Talk with the person about anything on this screen or in Nexora (HELP_TOPICS name its windows). When they ask for work to be done, return STEPS. Steps allowed: ' + STEP_LIST.join(' '),
-  'Rules for the calculation: dimensions in mm (inches ×25.4, cm ×10); "490x550" is width x length. A bag WEIGHT said in grams ("70 gram", "70 g bag", "target 70") is the TARGET WEIGHT — put it in "targetWeight"; Nexora then finds the body fabric GSM itself (weight → GSM), so never ask for the GSM then and never invent one. A number is a GSM only when the person says gsm or g/m². Mesh fields (M.WARP, M.WEFT) are threads per INCH (usually 8–16): "10x10" is 10 and 10; a mesh above 20 such as "40x40" is per 10 cm — divide by 3.94, round to 1 decimal, and say so in the answer. Choose the construction by name and meaning ("1L" = one layer, "stitch", "block bottom", "laminated"). An enum field takes one of its options exactly.',
+  'Rules for the calculation: UNITS says how THIS plant types sizes (UNITS.length) and counts mesh (UNITS.mesh); FIELDS carry those units and NOW shows the bag in them. Put every size and mesh EXACTLY as the person says it, in those units — "32x32" is M.WARP 32 and M.WEFT 32, "490x550" is width 490 and length 550 — and never convert on your own. Convert only when the person names a different unit (e.g. "19 inch" in a mm plant → 482.6), and say so. "490x550" is width x length. A bag WEIGHT said in grams ("70 gram", "70 g bag", "target 70") is the TARGET WEIGHT — put it in "targetWeight"; Nexora then finds the body fabric GSM itself (weight → GSM), so never ask for the GSM then and never invent one. A number is a GSM only when the person says gsm or g/m². Choose the construction by name and meaning ("1L" = one layer, "stitch", "block bottom", "laminated"). An enum field takes one of its options exactly.',
   'Rules for a recipe: "80+20" for a stage means two materials by percent — choose them from MATERIALS by what this plant usually uses on that stage (LEARNED.stages usualMaterials), else by what is usual in the trade (for tape: the PP granule and the filler), unless the person names them; say which you chose. When a stage’s waste is not said, LEARNED.stages usualWastePct is this plant’s own. Use only codes from MATERIALS and PROCESSES and names from ROUTES.',
   'Choosing or creating a ROUTE — understand the bag first (layers, laminated or BOPP printed, stitched or block bottom or pinch, valve, liner, backseam) and use what Nexora has LEARNED from this plant: (1) a saved workflow in LEARNED.workflows with fits:true and the best score → a "workflow" step (it brings routes and recipes) — say its reasons; (2) a route in ROUTES whose constructions include this construction; (3) the route this plant runs most for similar bags (LEARNED.routeUse: same layers, same laminated/unlaminated, same bottom) → a "route" step with that name, and say "used by N saved bags"; (4) otherwise a NEW route from PROCESSES in the woven-sack order — tape → weaving → (BOPP printing → lamination, when laminated) → (backseam, when backseamed) → cutting/stitching/bottom/finishing → packing — only processes this plant has; give it a clear name. Nexora fills a new route’s sections from what the plant usually does. When the person only asks which route or to suggest one, explain the choice and return the route step (with save first if the bag is not saved).',
   'THE WHOLE JOB FROM ONE SENTENCE: when the person says a bag and its specification and asks for the cost ("mare aa bag che ... cost aapo"), do all of it: calc → save → workflow or route (+ parts, if the bag has patches, a valve, a liner or BOPP) → bom → every stage\u2019s recipe/waste (and where each part is taken in) → check → cost. Ask only for what you truly cannot decide.',
   'LEARNED.lessons are the PERSON\u2019S OWN CORRECTIONS of what you did before (you put "ai", they changed it to "person"). They win over everything else: for the same construction/process/field, do it the person\u2019s way, and say you did.',
+  'THE STAGE BEFORE: a stage that takes the fabric or tube from an earlier stage says HOW with an "earlier" line. Where parts or other materials are ADDED at that stage (finishing, stitching, block bottom, pinch, bag making: patches, valve, liner, yarn, zipper) it takes the BODY AS A WHOLE PART by its own weight — {"earlier":true,"basis":"PART_G","figure":"BODY.TOTAL"} — never 100 % of everything before, which would count what is added twice. A stage that only converts what comes in (weaving, slitting, packing) takes {"earlier":true,"basis":"PCT","value":100} or needs no line. Always follow how THIS plant\u2019s saved sections do it (ROUTES[].stages and LEARNED.workflowRecipes lines "EARLIER STAGE …" with their basis and figure). FIGURES lists the part figures (NOW.calc.figures has this bag\u2019s grams).',
+  'NO PROCESS THE BAG DOES NOT NEED: never add printing (flexo or BOPP printing), lamination, coating, BOPP, backseam, liner or valve steps unless the person said so, the construction has it (e.g. BOPP / laminated in its name or fields), or this plant\u2019s own route for the construction has it. When unsure, leave it out and ask in "answer".',
+  'ADD OR REPLACE: "add weaving in lamination", "LD 5 % umero", "take in the valve" ADD to what the stage already holds — set "add": true (the section keeps its lines; a line of the same stage, material or part is replaced). Without "add" the stage\u2019s materials are replaced by yours. "Weaving in lamination as per calculation weight" = {"do":"recipe","add":true,"stage":"LAMINATION","lines":[{"earlier":true,"stage":"WEAVING","figure":"BODY.FAB"}]} — the woven fabric by the calculation\u2019s own weight (FIGURES: BODY.FAB base fabric, BODY.TOTAL whole body).',
+  'ADD, CHANGE, REMOVE — ANYTHING: to change a line\u2019s value use "add" with the new value (the same material/stage/part is replaced); to take lines out use "remove": true with those lines; "from the calculation" / "calculation par thi" / "suggest" for a stage = a "suggest" step.',
+  'ASK, NEVER GUESS: put in the calculation ONLY figures the person said (or that are on the screen when changing it). A required field not said is left out and asked in "answer" — never filled with a typical value.',
+  'NEVER SAY IT IS DONE. You change nothing yourself: every change is a STEP the person runs with Run. Never write "added", "done", "updated", "saved" or "કર્યું"/"ઉમેર્યું"/"कर दिया" — write what the steps WILL do ("press Run to add …"). If you cannot make a step for what was asked, say so plainly and ask what is missing; never pretend.',
   'YOU DO THE WORK. When you pick or create a route, you also decide EVERY stage\u2019s recipe and waste yourself and return them as "recipe" (with its wastePct) or "waste" steps — do not leave stages for Nexora to fill. Learn what to put from this plant\u2019s own saved data: the route\u2019s own saved sections (ROUTES[].stages), the recipes of its saved workflows (LEARNED.workflowRecipes), and what the learning finds usual per process (LEARNED.stages). Skip a stage only when its saved section already fits and the person did not ask to change it. A stage fed only by the earlier stage (weaving, finishing, packing) needs only its "waste" step. When nothing is learned, use woven-sack practice and say in the answer that those figures are your estimate.',
+  'SAVING: the recipe and waste steps already save what they write into the route. When the person asks to save or keep the route or the BOM, add "accept" (keeps any stages Nexora only suggested) and "savebom"; when they ask for a workflow ("save it as a workflow", "next time load it"), add "saveworkflow" with a clear name. Do not save unless asked.',
   'Order steps as the work goes: calc → save → route (only if needed) → bom → recipe/waste → cost. Leave out what NOW shows is already done. When the person corrects something ("no, width 520", "make it 75 gram"), return the WHOLE corrected list of steps again with the change, with "fresh":false on the calc step when NOW.calc.madeByAi is true.',
   'If something needed is missing, still return the steps you can and ask for the rest in "answer". Keep "answer" short and practical: what you understood, what the steps will do, any assumption.',
   'Reply in the SAME language the person used: English → English; Gujarati (in Gujarati script or in English letters) → Gujarati in Gujarati script; Hindi → Hindi in Devanagari. Keep codes, field names, material and process names and Nexora button names in English. Set "lang" to en, gu or hi accordingly.',
   'Answer ONLY with JSON: {"transcript": string, "lang": "en"|"gu"|"hi", "answer": string, "steps": [ ... ]}.'
 ].join('\n');
 
+/** Every number the person said — in this request, earlier in the conversation, in a recording\u2019s transcript. */
+function saidNumbers(p) {
+  const txt = [p.text, p.transcript || ''].concat(p.history.filter((h) => h.role === 'user').map((h) => h.text)).join(' ');
+  return (txt.replace(/,/g, '').match(/\d+(?:\.\d+)?/g) || []).map(Number).filter((n) => isFinite(n));
+}
 /** The steps Nexora AI proposed, checked against what was sent. */
 export function checkSteps(p, raw) {
   const out = [], dropped = [], missing = [];
@@ -778,19 +799,51 @@ export function checkSteps(p, raw) {
       /* "70 gram" is the bag: the GSM is Nexora's to find, never a guess */
       if (target && inputs['BD FAB GSM'] !== undefined) delete inputs['BD FAB GSM'];
       const q = num(s.bagQuantity);
+      /* 4.67.4 — "koi filed jarur hoy to pusatu nthi direct fill kri de che": a figure the
+         person never said (in this request or earlier in the conversation), and that is not
+         already on the bag being changed, is taken out and asked — Nexora AI's guess shown */
+      const guessed = {};
+      const said = saidNumbers(p);
+      const saidWords = (p.text + ' ' + p.history.filter((h) => h.role === 'user').map((h) => h.text).join(' ') + ' ' + (p.transcript || '')).toLowerCase();
+      const onBag = fresh ? {} : (p.now.calc.inputs || {});
+      Object.keys(inputs).forEach((k) => {
+        const v = inputs[k], f = fieldOf[k];
+        if (onBag[k] !== undefined && String(onBag[k]) === String(v)) return;
+        if (f && f.type === 'enum') { if (saidWords.indexOf(String(v).toLowerCase()) < 0) { guessed[k] = v; delete inputs[k]; } return; }
+        /* a size may have been said in another unit (19 inch in a mm plant); any other figure must be the very number said */
+        const lu = String(p.units.length || 'mm').toLowerCase();
+        const isLen = f && String(f.unit || '').toLowerCase() === lu && /^(mm|cm|in)$/.test(lu);
+        const conv = !isLen ? [1] : lu === 'mm' ? [1, 10, 25.4] : lu === 'cm' ? [1, 0.1, 2.54] : [1, 1 / 25.4, 1 / 2.54];
+        if (!said.some((n) => conv.some((c) => Math.abs(n * c - v) < Math.max(0.051, Math.abs(v) * 0.002)))) { guessed[k] = v; delete inputs[k]; }
+      });
       out.push({ do: 'calc', construction: con ? con.name : null, inputs: inputs, targetWeight: target, bagQuantity: q && q > 0 ? Math.round(q) : null, fresh: !!fresh });
+      Object.keys(guessed).forEach((k) => { const f = fieldOf[k] || {};
+        missing.push({ key: k, label: f.label || k, unit: f.unit, type: f.type, options: f.options, required: !!f.required, guess: guessed[k] }); });
       const have = Object.assign({}, fresh ? {} : p.now.calc.inputs, inputs);
       if (!con) missing.push({ key: '__construction', label: 'Construction', type: 'enum', options: p.constructions.map((x) => x.name) });
       else con.fields.forEach((k) => {
         const f = fieldOf[k];
-        if (!f || !f.required || have[k] !== undefined) return;
+        if (!f || !f.required || have[k] !== undefined || guessed[k] !== undefined) return;
         if (k === 'BD FAB GSM' && (target || (!fresh && p.now.calc.targetWeight))) return;
-        missing.push({ key: k, label: f.label, unit: f.unit, type: f.type, options: f.options });
+        missing.push({ key: k, label: f.label, unit: f.unit, type: f.type, options: f.options, required: true });
       });
       return;
     }
     if (d === 'save' || d === 'bom' || d === 'cost') { out.push({ do: d }); return; }
-    if (d === 'check') { out.push({ do: 'check' }); return; }
+    if (d === 'check' || d === 'accept' || d === 'savebom') { out.push({ do: d }); return; }
+    if (d === 'price') {
+      const m = matFind(s.material);
+      const ch = num(s.change), pc = num(s.pct), st = num(s.set);
+      const from = /^\d{4}-\d{2}-\d{2}$/.test(String(s.from || '')) ? s.from : null;
+      if (!m) { dropped.push('material ' + str(s.material, 30)); return; }
+      if (st !== null && st > 0) out.push({ do: 'price', material: m.code, set: st, from: from });
+      else if (pc !== null && pc > -100) out.push({ do: 'price', material: m.code, pct: pc, from: from });
+      else if (ch !== null && ch !== 0) out.push({ do: 'price', material: m.code, change: ch, from: from });
+      else dropped.push('price ' + m.code);
+      return;
+    }
+    if (d === 'suggest') { const sg = procFind(s.stage); if (sg) out.push({ do: 'suggest', stage: sg.code }); else dropped.push('suggest ' + str(s.stage, 30)); return; }
+    if (d === 'saveworkflow') { out.push({ do: 'saveworkflow', name: str(s.name, 80) }); return; }
     if (d === 'parts') {
       const KNOWN = ['BODY', 'TOP PATCH', 'BOTTOM PATCH', 'PATCH', 'VALVE', 'LINER', 'BOPP', 'HANDLE', 'ZIPPER'];
       const onBag = p.now.calc.parts.map((q) => q.key);
@@ -829,13 +882,22 @@ export function checkSteps(p, raw) {
       if (d === 'waste') { const v = num(s.pct != null ? s.pct : s.value); if (v !== null && v >= 0 && v < 100) out.push(Object.assign({ do: 'waste', stage: st.code, pct: v }, part ? { part: part } : {})); else dropped.push('waste'); return; }
       const lines = [];
       list(s.lines, 12).forEach((l) => {
+        if (l && l.earlier) {
+          const from = l.stage ? procFind(l.stage) : null;
+          const fig = l.figure ? p.figures.filter((f) => f.key === String(l.figure).trim().toUpperCase())[0] : null;
+          if (l.stage && !from) { dropped.push('stage ' + str(l.stage, 30)); return; }
+          if (l.figure && !fig) { dropped.push('figure ' + str(l.figure, 30)); return; }
+          const v = num(l.value);
+          lines.push({ earlier: true, stage: from ? from.code : null, basis: fig ? 'PART_G' : (l.basis === 'PART_G' ? 'PART_G' : 'PCT'), value: fig ? null : (v !== null && v > 0 ? v : 100), figure: fig ? fig.key : null });
+          return;
+        }
         if (l && l.part) { const k = partOf(l.part); const v = num(l.value); if (k) lines.push({ part: k, value: v !== null && v > 0 ? v : null }); else dropped.push('part ' + str(l.part, 30)); return; }
         const m = matFind(l && l.material); const v = num(l && l.value);
-        if (!m || v === null || v < 0) { dropped.push('material ' + str(l && l.material, 30)); return; }
+        if (!m || ((v === null || v < 0) && !s.remove)) { dropped.push('material ' + str(l && l.material, 30)); return; }
         lines.push({ material: m.code, name: m.name, value: v, basis: BASES[l.basis] ? l.basis : 'PCT' });
       });
       const w = num(s.wastePct);
-      if (lines.length) out.push(Object.assign({ do: 'recipe', stage: st.code, lines: lines, wastePct: w !== null && w >= 0 && w < 100 ? w : null }, part ? { part: part } : {}));
+      if (lines.length) out.push(Object.assign({ do: 'recipe', stage: st.code, lines: lines, wastePct: w !== null && w >= 0 && w < 100 ? w : null }, part ? { part: part } : {}, s.remove ? { remove: true } : (s.add ? { add: true } : {})));
       return;
     }
     if (d === 'open') { if (ASSIST_VIEWS.indexOf(s.view) > -1) out.push({ do: 'open', view: s.view }); else dropped.push('window ' + str(s.view, 20)); return; }
@@ -851,8 +913,8 @@ export async function assist(companyId, payload, lang, fetchImpl) {
   const m = mediaParts(payload);
   if (m.error) return m.error;
   if (!p.text && !m.parts.length) return { httpStatus: 400, body: { error: 'NOTHING', message: 'Say or type something first.' } };
-  const ctx = { SCREEN: p.screen, NOW: p.now, CONSTRUCTIONS: p.constructions, FIELDS: p.fields, PROCESSES: p.processes,
-    ROUTES: p.routes, MATERIALS: p.materials, LEARNED: p.learned, HELP_TOPICS: p.topics };
+  const ctx = { SCREEN: p.screen, UNITS: p.units, NOW: p.now, CONSTRUCTIONS: p.constructions, FIELDS: p.fields, PROCESSES: p.processes,
+    ROUTES: p.routes, MATERIALS: p.materials, FIGURES: p.figures, LEARNED: p.learned, HELP_TOPICS: p.topics };
   const contents = [{ role: 'user', parts: [{ text: 'CONTEXT:\n' + JSON.stringify(ctx) }] },
     { role: 'model', parts: [{ text: '{"transcript":"","lang":"en","answer":"Ready.","steps":[]}' }] }];
   p.history.forEach((h) => contents.push({ role: h.role, parts: [{ text: h.text }] }));
@@ -864,9 +926,17 @@ export async function assist(companyId, payload, lang, fetchImpl) {
   const a = await ask(companyId, ASSIST_SYSTEM, { contents: contents }, fetchImpl);
   if (a.fail) return a.fail;
   const j = a.json || {};
+  if (j.transcript) p.transcript = str(j.transcript, 1200);
   const checked = checkSteps(p, j.steps);
   const l = String(j.lang || '').toLowerCase();
+  let answer = str(j.answer, 3000);
+  if (!checked.steps.length && /\b(added|done|updated|changed|saved|removed|set it|applied)\b|ઉમેર્ય|ઉમેરી દ|કરી દી|કર્યુ|बदल दि|जोड़ दि|कर दिया|सेव कर/i.test(answer)) {
+    const lg = l === 'gu' || l === 'hi' ? l : 'en';
+    answer += lg === 'gu' ? '\n\n(ધ્યાન: હજુ કશું બદલાયું નથી — આ માટે કોઈ પગલું બન્યું નથી. Stage અને શું ઉમેરવું તે ફરી કહો.)'
+      : lg === 'hi' ? '\n\n(ध्यान दें: अभी कुछ नहीं बदला — इसके लिए कोई कदम नहीं बना। Stage और क्या जोड़ना है, फिर से कहें।)'
+      : '\n\n(Note: nothing has been changed — no step could be made for this. Say the stage and what to add again.)';
+  }
   return { httpStatus: 200, body: { ok: true, model: a.model, left: a.left, transcript: str(j.transcript, 1200),
-    lang: l === 'gu' || l === 'hi' ? l : 'en', answer: str(j.answer, 3000),
+    lang: l === 'gu' || l === 'hi' ? l : 'en', answer: answer,
     steps: checked.steps, missing: checked.missing, dropped: checked.dropped } };
 }
