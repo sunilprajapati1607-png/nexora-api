@@ -592,7 +592,7 @@ export async function speak(device, payload, fetchImpl) {
       generationConfig: { responseModalities: ['AUDIO'], speechConfig: Object.assign({ voiceConfig: { prebuiltVoiceConfig: { voiceName: String(process.env.GEMINI_VOICE || 'Kore') } } }, payload && /^[a-z]{2}-[A-Z]{2}$/.test(String(payload.languageCode || '')) ? { languageCode: payload.languageCode } : {}) } }) }, fetchImpl);
   } catch (e) { return { httpStatus: 504, body: { error: 'AI_TIMEOUT', message: 'The voice did not come in time.' } }; }
   console.log('ai voice ' + (r.ok ? 'ok' : r.status) + ' ' + (Date.now() - t0) + ' ms ' + name);
-  if (r.status === 429) return { httpStatus: 429, body: { error: 'AI_BUSY', retryAfter: 600, message: 'The voice has used Google2019s allowance for now.' } };
+  if (r.status === 429) return { httpStatus: 429, body: { error: 'AI_BUSY', retryAfter: 600, message: 'The voice has used Google’s allowance for now.' } };
   if (!r.ok) return { httpStatus: 502, body: { error: 'AI_FAILED', message: 'The voice could not be made (' + r.status + '): ' + scrub(r.body && r.body.error && r.body.error.message) } };
   const part = ((((r.body && r.body.candidates) || [])[0] || {}).content || {}).parts;
   const data = ((part || []).filter((p) => p && p.inlineData)[0] || {}).inlineData;
