@@ -17,7 +17,7 @@
  * per installation (the random device id the application keeps), see ai.js.
  */
 import { createServer } from 'node:http';
-import { assist, aiStatus, pickLang } from './src/ai.js';
+import { assist, aiStatus, pickLang, keySource } from './src/ai.js';
 
 const PORT = process.env.PORT || 3000;
 const MAX_BODY = 12 * 1024 * 1024;           /* a minute of speech or a few photos, as base64 */
@@ -75,5 +75,5 @@ if (process.argv[1] && /server\.js$/.test(process.argv[1])) {
     handle(req, res).catch(() => {
       try { send(res, 500, { error: 'SERVER_ERROR', message: 'Nexora AI could not complete that request. Your work is safe on this computer; try again shortly.' }); } catch (e) { /* gone */ }
     });
-  }).listen(PORT, () => console.log('Nexora Jobwork AI listening on ' + PORT + ' — AI ' + (aiStatus().configured ? 'on' : 'OFF (no GEMINI_API_KEY)')));
+  }).listen(PORT, () => { if (!keySource()) console.log('Environment names that might hold the key: ' + (Object.keys(process.env).filter((n) => /GEMINI|KEY|JOBWORK|NEXORA|API/i.test(n)).join(', ') || 'none')); console.log('Nexora Jobwork AI listening on ' + PORT + ' — AI ' + (keySource() ? 'on (key from ' + keySource() + ')' : 'OFF (no GEMINI_API_KEY)')); });
 }

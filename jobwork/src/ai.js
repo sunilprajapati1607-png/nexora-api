@@ -43,7 +43,20 @@ function bestOf(names) {
 const MODEL_TTL_MS = 6 * 60 * 60 * 1000;
 const TIMEOUT_MS = 40000;
 
-const key = () => String(process.env.GEMINI_API_KEY || '').trim();
+/* GEMINI_API_KEY — or, when the dashboard was given another name ("nexora
+   jobwork", "GEMINI KEY"…), the variable whose name says GEMINI, else the one
+   whose value is plainly an AI Studio key (AIza…). Only the NAME is ever
+   said (on /health and in the log), never the value. */
+export function keySource() {
+  const env = process.env;
+  if (String(env.GEMINI_API_KEY || '').trim()) return 'GEMINI_API_KEY';
+  const names = Object.keys(env);
+  const looks = (n) => /^AIza[\w\-]{20,}$/.test(String(env[n] || '').trim());
+  return names.filter((n) => /GEMINI/i.test(n) && String(env[n] || '').trim()).filter(looks)[0]
+    || names.filter((n) => /GEMINI|JOBWORK|NEXORA/i.test(n) && looks(n))[0]
+    || names.filter(looks)[0] || null;
+}
+const key = () => { const n = keySource(); return n ? String(process.env[n] || '').trim() : ''; };
 export function aiConfigured() { return !!key(); }
 
 /* never let the key into a message, a log or an answer */
@@ -97,7 +110,7 @@ export async function resolveModel(force, fetchImpl) {
 /** For /health — cached, never waits on Google. */
 export function aiStatus() {
   if (aiConfigured() && (!model.at || Date.now() - model.at > MODEL_TTL_MS)) resolveModel(false).catch(() => {});
-  return { configured: aiConfigured(), model: model.name, note: model.error || null };
+  return { configured: aiConfigured(), keyFrom: keySource(), model: model.name, note: model.error || null };
 }
 
 /* ---- limits ------------------------------------------------------------- */
@@ -186,7 +199,7 @@ export function cleanAssist(p) {
     plans: list(x.plans, 200).map((q) => ({
       no: docNo(q && q.no), dir: (q && q.dir) === 'OUT' ? 'OUT' : 'IN', party: ptok(q && q.party), status: str(q && q.status, 20),
       stage: oneOf(q && q.stage, STAGES, ''), date: str(q && q.date, 10), due: str(q && q.due, 10),
-      inKg: nr(q && q.inKg), outKg: nr(q && q.outKg), wasteKg: nr(q && q.wasteKg), balanceKg: nr(q && q.balanceKg),
+      inKg: nr(q && q.inKg), outKg: nr(q && q.outKg), wasteKg: nr(q && q.wasteKg), balanceKg: nr(q && q.balanceKg), unaccountedKg: nr(q && q.unaccountedKg),
       items: list(q && q.items, 12).map(itok).filter(Boolean), process: str(q && q.process, 40)
     })).filter((q) => q.no),
     orders: list(x.orders, 100).map((q) => ({ no: docNo(q && q.no), plan: docNo(q && q.plan), item: itok(q && q.item), status: str(q && q.status, 20),
