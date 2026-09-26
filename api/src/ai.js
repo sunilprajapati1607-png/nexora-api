@@ -432,9 +432,11 @@ export function langLine(lang, what) {
   const w = what || 'your answer';
   if (lang === 'gu') return 'Write ' + w + ' in Gujarati (Gujarati script). Keep codes, material names, process names, field names and Nexora button names in English.\n';
   if (lang === 'hi') return 'Write ' + w + ' in Hindi (Devanagari script). Keep codes, material names, process names, field names and Nexora button names in English.\n';
+  /* 4.67.3 — no language switch: the language the person used */
+  if (lang === 'auto') return 'Write ' + w + ' in the language the person used — English; Gujarati (even when typed in English letters) in Gujarati script; Hindi in Devanagari. If they said nothing in words, use English. Keep codes, material names, process names, field names and Nexora button names in English.\n';
   return 'Write ' + w + ' in plain English.\n';
 }
-export function pickLang(v) { return v === 'gu' || v === 'hi' ? v : 'en'; }
+export function pickLang(v) { return v === 'gu' || v === 'hi' || v === 'auto' ? v : 'en'; }
 
 /* ---- what a person may attach: their voice, a photo, a drawing, a PDF ---- */
 const MEDIA_TYPES = {
@@ -642,4 +644,229 @@ export async function chat(companyId, payload, lang, fetchImpl) {
   if (a.fail) return a.fail;
   const j = a.json || {};
   return { httpStatus: 200, body: { ok: true, model: a.model, left: a.left, transcript: str(j.transcript, 800), answer: str(j.answer, 3000) } };
+}
+
+/* ==========================================================================
+   4.67.3 — ONE NEXORA AI, ON EVERY WINDOW, THAT CAN DO THE WORK
+   --------------------------------------------------------------------------
+   Owner 2026-09-26: "ai derek screen par screen pramane react kre" · "ai
+   koi pan window par thi biji window nu kam kri sakvu joiye like ... 1l
+   stitch bag, 490x550 single fold 70 gram 40x40 ni meash nu calcualtion
+   kri ne bom banavi ne cost kadhi nakh reciepy tape ni 80+20 rakhje" ·
+   "ai fakt item name, customer name ne cost na joi sakvu joiye" ·
+   "પગલાં બતાવે, એક Run" · "same window multi language ... user ne language
+   switch na krvi pde" · "when i say target is 70 gram ai should work with
+   weight to gsm module" · "make it more powerfull and more smarter".
+
+   Nexora AI answers, and — when the person asks for work — returns STEPS
+   from a fixed list. The application shows the steps; the person presses
+   Run; the application does them with its own engines. The cost is worked
+   out and shown on the person's screen; it never comes here. Every step is
+   checked against what was sent: an unknown construction, field, process,
+   route or material is dropped and said.
+   ========================================================================== */
+export const ASSIST_VIEWS = ['dashboard', 'calculation', 'history', 'bom', 'bomrecords', 'routes', 'rm', 'structures', 'constants',
+  'quotation', 'quoterecords', 'compare', 'targetcost', 'priceimpact', 'workflows', 'settings'];
+const cleanSecs = (a) => list(a, 20).map((s) => ({ process: str(s && s.process, 30), wastePct: nr(s && s.wastePct),
+      lines: list(s && s.lines, 12).map((l) => ({ material: str(l && l.material, 60), basis: str(l && l.basis, 10), value: nr(l && l.value) })) })).filter((s) => s.process);
+export function cleanAssist(p) {
+  const x = p && typeof p === 'object' ? p : {};
+  const n = x.now && typeof x.now === 'object' ? x.now : {};
+  const c = n.calc && typeof n.calc === 'object' ? n.calc : {};
+  const fill = cleanFill({ constructions: x.constructions, fields: x.fields, current: c });
+  return {
+    screen: ASSIST_VIEWS.indexOf(x.screen) > -1 ? x.screen : 'dashboard',
+    text: str(x.text, 1200),
+    history: list(x.history, 20).map((h) => ({ role: h && h.role === 'model' ? 'model' : 'user', text: str(h && h.text, 2500) })).filter((h) => h.text),
+    constructions: fill.constructions,
+    fields: fill.fields,
+    processes: list(x.processes, 80).map((q) => ({ code: str(q && q.code, 30), name: str(q && q.name, 60) })).filter((q) => q.code),
+    routes: list(x.routes, 80).map((r) => ({ name: str(r && r.name, 80), steps: list(r && r.steps, 30).map((s) => str(s, 30)),
+      constructions: list(r && r.constructions, 30).map((s) => str(s, 60)), stages: cleanSecs(r && r.stages) })).filter((r) => r.name),
+    materials: list(x.materials, 300).map((m) => ({ code: str(m && m.code, 40), name: str(m && m.name, 60), group: str(m && m.group, 30) })).filter((m) => m.code),
+    topics: list(x.topics, 120).map((t) => str(t, 80)).filter(Boolean),
+    /* what Nexora has learned from this plant's own saved work (routes used, workflows matched, usual recipes) */
+    learned: (function (l) {
+      l = l && typeof l === 'object' ? l : {};
+      return {
+        routeUse: list(l.routeUse, 30).map((r) => ({ name: str(r && r.name, 80), bags: nr(r && r.bags), constructions: list(r && r.constructions, 20).map((c) => str(c, 60)) })).filter((r) => r.name),
+        workflows: list(l.workflows, 8).map((w) => ({ name: str(w && w.name, 80), construction: str(w && w.construction, 60), score: nr(w && w.score), fits: !!(w && w.fits),
+          reasons: list(w && w.reasons, 4).map((t) => str(t, 160)), blockers: list(w && w.blockers, 3).map((t) => str(t, 160)) })).filter((w) => w.name),
+        stages: list(l.stages, 40).map((s) => ({ process: str(s && s.process, 30), sections: nr(s && s.sections), usualWastePct: nr(s && s.usualWastePct),
+          usualMaterials: list(s && s.usualMaterials, 6).map((m) => ({ material: str(m && m.material, 40), basis: str(m && m.basis, 10), usualValue: nr(m && m.usualValue), seen: nr(m && m.seen) })) })).filter((s) => s.process),
+        lessons: list(l.lessons, 20).map((q) => ({ what: ['recipe', 'calculation', 'route'].indexOf(q && q.what) > -1 ? q.what : 'recipe', construction: str(q && q.construction, 60),
+          route: str(q && q.route, 80), process: str(q && q.process, 30), field: str(q && q.field, 30), ai: str(q && q.ai, 300), person: str(q && q.person, 300) })),
+        workflowRecipes: list(l.workflowRecipes, 5).map((w) => ({ name: str(w && w.name, 80), construction: str(w && w.construction, 60),
+          routes: list(w && w.routes, 4).map((r) => ({ name: str(r && r.name, 80), steps: list(r && r.steps, 30).map((c) => str(c, 30)), stages: cleanSecs(r && r.stages) })) })).filter((w) => w.name)
+      };
+    })(x.learned),
+    /* what is on the screen now — technical only; never an item name, a customer or a cost */
+    now: {
+      calc: {
+        structure: fill.current.structure, inputs: fill.current.inputs,
+        targetWeight: nr(c.targetWeight), bagQuantity: nr(c.bagQuantity), byWeight: !!c.byWeight,
+        netWeight: nr(c.netWeight), saved: !!c.saved, route: str(c.route, 80), madeByAi: !!c.madeByAi,
+        parts: list(c.parts, 16).map((q) => ({ key: str(q && q.key, 30).toUpperCase(), label: str(q && q.label, 40), grams: nr(q && q.grams), consumable: !!(q && q.consumable), within: str(q && q.within, 30) })).filter((q) => q.key)
+      },
+      bom: n.bom ? clean(n.bom) : null,
+      note: str(n.note, 300)
+    }
+  };
+}
+
+const STEP_LIST = [
+  '{"do":"calc","construction":NAME,"inputs":{FIELD KEY: value},"targetWeight":grams or null,"bagQuantity":number or null,"fresh":true|false} — fill the calculation (fresh:true starts a new one; false changes the one on screen).',
+  '{"do":"save"} — save the calculation.',
+  '{"do":"route","name":ROUTE NAME} — run this bag on a saved route; or {"do":"route","name":new name,"steps":[PROCESS CODE,...]} — a new route from the process master.',
+  '{"do":"workflow","name":WORKFLOW NAME} — make this bag follow a saved workflow from LEARNED.workflows (it brings its routes and recipes).',
+  '{"do":"parts","mode":"WHOLE"|"SPLIT","tabs":{PART KEY: true|false},"routes":{PART KEY: ROUTE NAME}} — which parts of the bag are made on their own route (a tab, SPLIT) and which are costed inside a stage; PART KEYs from NOW.calc.parts (or, for a new bag, BODY, TOP PATCH, BOTTOM PATCH, VALVE, LINER, BOPP as its construction has them).',
+  '{"do":"bom"} — open this bag’s BOM (it is costed there, on the person’s screen).',
+  '{"do":"check"} — after the BOM is built, check it all (routes, parts taken in, recipes, waste): "is everything right?".',
+  '{"do":"recipe","part":PART KEY or null,"stage":PROCESS CODE,"lines":[{"material":MATERIAL CODE,"value":number,"basis":"PCT"} or {"part":PART KEY,"value":grams or null}],"wastePct":number or null} — set the materials of one stage (of the body, or of a part on its own tab); a {"part":KEY} line TAKES IN that part at this stage (e.g. the patches and the valve at the bottom/finishing stage, BOPP at lamination). Earlier-stage rows stay.',
+  '{"do":"waste","part":PART KEY or null,"stage":PROCESS CODE,"pct":number} — the waste % of one stage.',
+  '{"do":"cost"} — show the cost per bag (worked out on the person’s screen; you never see it).',
+  '{"do":"open","view":one of ' + ASSIST_VIEWS.join('|') + '} — go to a window.'
+];
+const ASSIST_SYSTEM = [
+  'You are Nexora AI, the assistant inside Nexora — software for PP/PE woven sack plants: bag weight (calculation), bill of materials (BOM) by route and stage, recipes, costing, quotation.',
+  'You are an expert in woven sacks: tape extrusion (PP with filler/CaCO3 and masterbatch, usually 2–8 % waste), circular weaving, BOPP printing and slitting, lamination/coating (PP/LD granule), backseam, block bottom, pinch, stitching, liners, valves, finishing and packing.',
+  'You see the screen the person is on (NOW), the plant’s constructions and their fields, processes, routes and materials (codes, names and groups). You NEVER see, and must never ask for or guess, an item name, a customer name, a price, a rate or a cost.',
+  'Talk with the person about anything on this screen or in Nexora (HELP_TOPICS name its windows). When they ask for work to be done, return STEPS. Steps allowed: ' + STEP_LIST.join(' '),
+  'Rules for the calculation: dimensions in mm (inches ×25.4, cm ×10); "490x550" is width x length. A bag WEIGHT said in grams ("70 gram", "70 g bag", "target 70") is the TARGET WEIGHT — put it in "targetWeight"; Nexora then finds the body fabric GSM itself (weight → GSM), so never ask for the GSM then and never invent one. A number is a GSM only when the person says gsm or g/m². Mesh fields (M.WARP, M.WEFT) are threads per INCH (usually 8–16): "10x10" is 10 and 10; a mesh above 20 such as "40x40" is per 10 cm — divide by 3.94, round to 1 decimal, and say so in the answer. Choose the construction by name and meaning ("1L" = one layer, "stitch", "block bottom", "laminated"). An enum field takes one of its options exactly.',
+  'Rules for a recipe: "80+20" for a stage means two materials by percent — choose them from MATERIALS by what this plant usually uses on that stage (LEARNED.stages usualMaterials), else by what is usual in the trade (for tape: the PP granule and the filler), unless the person names them; say which you chose. When a stage’s waste is not said, LEARNED.stages usualWastePct is this plant’s own. Use only codes from MATERIALS and PROCESSES and names from ROUTES.',
+  'Choosing or creating a ROUTE — understand the bag first (layers, laminated or BOPP printed, stitched or block bottom or pinch, valve, liner, backseam) and use what Nexora has LEARNED from this plant: (1) a saved workflow in LEARNED.workflows with fits:true and the best score → a "workflow" step (it brings routes and recipes) — say its reasons; (2) a route in ROUTES whose constructions include this construction; (3) the route this plant runs most for similar bags (LEARNED.routeUse: same layers, same laminated/unlaminated, same bottom) → a "route" step with that name, and say "used by N saved bags"; (4) otherwise a NEW route from PROCESSES in the woven-sack order — tape → weaving → (BOPP printing → lamination, when laminated) → (backseam, when backseamed) → cutting/stitching/bottom/finishing → packing — only processes this plant has; give it a clear name. Nexora fills a new route’s sections from what the plant usually does. When the person only asks which route or to suggest one, explain the choice and return the route step (with save first if the bag is not saved).',
+  'THE WHOLE JOB FROM ONE SENTENCE: when the person says a bag and its specification and asks for the cost ("mare aa bag che ... cost aapo"), do all of it: calc → save → workflow or route (+ parts, if the bag has patches, a valve, a liner or BOPP) → bom → every stage\u2019s recipe/waste (and where each part is taken in) → check → cost. Ask only for what you truly cannot decide.',
+  'LEARNED.lessons are the PERSON\u2019S OWN CORRECTIONS of what you did before (you put "ai", they changed it to "person"). They win over everything else: for the same construction/process/field, do it the person\u2019s way, and say you did.',
+  'YOU DO THE WORK. When you pick or create a route, you also decide EVERY stage\u2019s recipe and waste yourself and return them as "recipe" (with its wastePct) or "waste" steps — do not leave stages for Nexora to fill. Learn what to put from this plant\u2019s own saved data: the route\u2019s own saved sections (ROUTES[].stages), the recipes of its saved workflows (LEARNED.workflowRecipes), and what the learning finds usual per process (LEARNED.stages). Skip a stage only when its saved section already fits and the person did not ask to change it. A stage fed only by the earlier stage (weaving, finishing, packing) needs only its "waste" step. When nothing is learned, use woven-sack practice and say in the answer that those figures are your estimate.',
+  'Order steps as the work goes: calc → save → route (only if needed) → bom → recipe/waste → cost. Leave out what NOW shows is already done. When the person corrects something ("no, width 520", "make it 75 gram"), return the WHOLE corrected list of steps again with the change, with "fresh":false on the calc step when NOW.calc.madeByAi is true.',
+  'If something needed is missing, still return the steps you can and ask for the rest in "answer". Keep "answer" short and practical: what you understood, what the steps will do, any assumption.',
+  'Reply in the SAME language the person used: English → English; Gujarati (in Gujarati script or in English letters) → Gujarati in Gujarati script; Hindi → Hindi in Devanagari. Keep codes, field names, material and process names and Nexora button names in English. Set "lang" to en, gu or hi accordingly.',
+  'Answer ONLY with JSON: {"transcript": string, "lang": "en"|"gu"|"hi", "answer": string, "steps": [ ... ]}.'
+].join('\n');
+
+/** The steps Nexora AI proposed, checked against what was sent. */
+export function checkSteps(p, raw) {
+  const out = [], dropped = [], missing = [];
+  const conOf = {}; p.constructions.forEach((c) => { conOf[c.name.toUpperCase()] = c; });
+  const fieldOf = {}; p.fields.forEach((f) => { fieldOf[f.key] = f; });
+  const procOf = {}; p.processes.forEach((q) => { procOf[q.code.toUpperCase()] = q; });
+  const routeOf = {}; p.routes.forEach((r) => { routeOf[r.name.toUpperCase()] = r; });
+  const matOf = {}; p.materials.forEach((m) => { matOf[m.code.toUpperCase()] = m; });
+  const matFind = (v) => { const k = String(v || '').trim().toUpperCase(); if (matOf[k]) return matOf[k];
+    return p.materials.filter((m) => m.name.toUpperCase() === k)[0] || null; };
+  const procFind = (v) => { const k = String(v || '').trim().toUpperCase(); if (procOf[k]) return procOf[k];
+    return p.processes.filter((q) => q.name.toUpperCase() === k)[0] || null; };
+  const num = (v) => { if (v === null || v === undefined || v === '') return null; const x = Number(String(v).replace(/,/g, '')); return isFinite(x) ? Math.round(x * 1000) / 1000 : null; };
+  const BASES = { PCT: 1, PERBAG_G: 1, PER1000: 1, ABS: 1 };
+  list(raw, 12).forEach((s) => {
+    const d = s && String(s.do || '').toLowerCase();
+    if (d === 'calc') {
+      const named = s.construction ? conOf[String(s.construction).trim().toUpperCase()] : null;
+      const fresh = s.fresh !== false || !p.now.calc.madeByAi;
+      const con = named || (!s.construction ? conOf[String(p.now.calc.structure || '').toUpperCase()] : null) || null;
+      if (s.construction && !named) dropped.push('construction ' + str(s.construction, 40));
+      const inputs = {};
+      Object.keys((s.inputs && typeof s.inputs === 'object') ? s.inputs : {}).forEach((k) => {
+        const f = fieldOf[k];
+        if (!f || (con && con.fields.indexOf(k) < 0)) { dropped.push(str(k, 30)); return; }
+        const v = s.inputs[k];
+        if (f.type === 'enum') { const hit = f.options.filter((o) => o.toUpperCase() === String(v).trim().toUpperCase())[0]; if (hit) inputs[k] = hit; else dropped.push(k); return; }
+        const x = num(v); if (x !== null && x >= 0) inputs[k] = x; else dropped.push(k);
+      });
+      const tw = num(s.targetWeight);
+      const target = tw !== null && tw > 0 && tw < 100000 ? tw : null;
+      /* "70 gram" is the bag: the GSM is Nexora's to find, never a guess */
+      if (target && inputs['BD FAB GSM'] !== undefined) delete inputs['BD FAB GSM'];
+      const q = num(s.bagQuantity);
+      out.push({ do: 'calc', construction: con ? con.name : null, inputs: inputs, targetWeight: target, bagQuantity: q && q > 0 ? Math.round(q) : null, fresh: !!fresh });
+      const have = Object.assign({}, fresh ? {} : p.now.calc.inputs, inputs);
+      if (!con) missing.push({ key: '__construction', label: 'Construction', type: 'enum', options: p.constructions.map((x) => x.name) });
+      else con.fields.forEach((k) => {
+        const f = fieldOf[k];
+        if (!f || !f.required || have[k] !== undefined) return;
+        if (k === 'BD FAB GSM' && (target || (!fresh && p.now.calc.targetWeight))) return;
+        missing.push({ key: k, label: f.label, unit: f.unit, type: f.type, options: f.options });
+      });
+      return;
+    }
+    if (d === 'save' || d === 'bom' || d === 'cost') { out.push({ do: d }); return; }
+    if (d === 'check') { out.push({ do: 'check' }); return; }
+    if (d === 'parts') {
+      const KNOWN = ['BODY', 'TOP PATCH', 'BOTTOM PATCH', 'PATCH', 'VALVE', 'LINER', 'BOPP', 'HANDLE', 'ZIPPER'];
+      const onBag = p.now.calc.parts.map((q) => q.key);
+      const okKey = (k) => onBag.length ? onBag.indexOf(k) > -1 : KNOWN.indexOf(k) > -1;
+      const tabs = {}, routes = {};
+      Object.keys((s.tabs && typeof s.tabs === 'object') ? s.tabs : {}).forEach((k0) => {
+        const k = String(k0).trim().toUpperCase();
+        if (!okKey(k)) { dropped.push('part ' + str(k0, 30)); return; }
+        tabs[k] = !!s.tabs[k0];
+        const rn = s.routes && (s.routes[k0] || s.routes[k]);
+        if (rn) { const hit = routeOf[String(rn).trim().toUpperCase()]; if (hit) routes[k] = hit.name; else dropped.push('route ' + str(rn, 40)); }
+      });
+      out.push({ do: 'parts', mode: s.mode === 'SPLIT' ? 'SPLIT' : 'WHOLE', tabs: tabs, routes: routes });
+      return;
+    }
+    if (d === 'workflow') {
+      const w = p.learned.workflows.filter((x) => x.name.toUpperCase() === String(s.name || '').trim().toUpperCase())[0];
+      if (w) out.push({ do: 'workflow', name: w.name }); else dropped.push('workflow ' + str(s.name, 40));
+      return;
+    }
+    if (d === 'route') {
+      const hit = routeOf[String(s.name || '').trim().toUpperCase()];
+      const asked = list(s.steps, 30);
+      if (hit && !asked.length) { out.push({ do: 'route', name: hit.name }); return; }
+      const steps = asked.map(procFind);
+      if (steps.length && steps.every(Boolean)) { out.push({ do: 'route', name: str(s.name, 60) || 'Nexora AI route', steps: steps.map((q) => q.code) }); return; }
+      if (hit) { out.push({ do: 'route', name: hit.name }); return; }
+      dropped.push('route ' + str(s.name, 40)); return;
+    }
+    if (d === 'recipe' || d === 'waste') {
+      const st = procFind(s.stage);
+      if (!st) { dropped.push(d + ' ' + str(s.stage, 30)); return; }
+      const partOf = (v) => { const k = String(v || '').trim().toUpperCase(); if (!k) return null; const onBag = p.now.calc.parts.map((q) => q.key);
+        return (!onBag.length || onBag.indexOf(k) > -1) ? k : null; };
+      const part = s.part ? partOf(s.part) : null;
+      if (d === 'waste') { const v = num(s.pct != null ? s.pct : s.value); if (v !== null && v >= 0 && v < 100) out.push(Object.assign({ do: 'waste', stage: st.code, pct: v }, part ? { part: part } : {})); else dropped.push('waste'); return; }
+      const lines = [];
+      list(s.lines, 12).forEach((l) => {
+        if (l && l.part) { const k = partOf(l.part); const v = num(l.value); if (k) lines.push({ part: k, value: v !== null && v > 0 ? v : null }); else dropped.push('part ' + str(l.part, 30)); return; }
+        const m = matFind(l && l.material); const v = num(l && l.value);
+        if (!m || v === null || v < 0) { dropped.push('material ' + str(l && l.material, 30)); return; }
+        lines.push({ material: m.code, name: m.name, value: v, basis: BASES[l.basis] ? l.basis : 'PCT' });
+      });
+      const w = num(s.wastePct);
+      if (lines.length) out.push(Object.assign({ do: 'recipe', stage: st.code, lines: lines, wastePct: w !== null && w >= 0 && w < 100 ? w : null }, part ? { part: part } : {}));
+      return;
+    }
+    if (d === 'open') { if (ASSIST_VIEWS.indexOf(s.view) > -1) out.push({ do: 'open', view: s.view }); else dropped.push('window ' + str(s.view, 20)); return; }
+    if (d) dropped.push(str(d, 20));
+  });
+  return { steps: out, dropped: dropped, missing: missing };
+}
+
+/** POST /v1/ai/assist */
+export async function assist(companyId, payload, lang, fetchImpl) {
+  if (!aiConfigured()) return { httpStatus: 503, body: { error: 'AI_OFF', message: 'Nexora AI is not switched on at the service yet.' } };
+  const p = cleanAssist(payload);
+  const m = mediaParts(payload);
+  if (m.error) return m.error;
+  if (!p.text && !m.parts.length) return { httpStatus: 400, body: { error: 'NOTHING', message: 'Say or type something first.' } };
+  const ctx = { SCREEN: p.screen, NOW: p.now, CONSTRUCTIONS: p.constructions, FIELDS: p.fields, PROCESSES: p.processes,
+    ROUTES: p.routes, MATERIALS: p.materials, LEARNED: p.learned, HELP_TOPICS: p.topics };
+  const contents = [{ role: 'user', parts: [{ text: 'CONTEXT:\n' + JSON.stringify(ctx) }] },
+    { role: 'model', parts: [{ text: '{"transcript":"","lang":"en","answer":"Ready.","steps":[]}' }] }];
+  p.history.forEach((h) => contents.push({ role: h.role, parts: [{ text: h.text }] }));
+  /* no language switch: Nexora AI answers in the language the person used,
+     unless a language was asked for by name */
+  const said = (lang === 'gu' || lang === 'hi') ? langLine(lang, 'the answer') : '';
+  contents.push({ role: 'user', parts: m.parts.concat([{ text: said + (m.audio ? 'The person speaks in the attached recording.' + (p.text ? ' Also typed: ' + p.text : '') : p.text) +
+    (m.files ? '\nAlso attached: ' + m.files + ' photo(s)/document(s) of the bag — read its sizes and specification from them.' : '') }]) });
+  const a = await ask(companyId, ASSIST_SYSTEM, { contents: contents }, fetchImpl);
+  if (a.fail) return a.fail;
+  const j = a.json || {};
+  const checked = checkSteps(p, j.steps);
+  const l = String(j.lang || '').toLowerCase();
+  return { httpStatus: 200, body: { ok: true, model: a.model, left: a.left, transcript: str(j.transcript, 1200),
+    lang: l === 'gu' || l === 'hi' ? l : 'en', answer: str(j.answer, 3000),
+    steps: checked.steps, missing: checked.missing, dropped: checked.dropped } };
 }
