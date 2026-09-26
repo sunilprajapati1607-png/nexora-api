@@ -3,7 +3,7 @@
    party's name, an item's name and money never leave this service. */
 import assert from 'node:assert/strict';
 import { handle } from './server.js';
-import { cleanAssist, checkSteps, _resetLimits, resolveModel } from './src/ai.js';
+import { cleanAssist, checkSteps, cleanTables, _resetLimits, resolveModel } from './src/ai.js';
 
 let pass = 0;
 const t = async (name, fn) => { try { await fn(); pass++; console.log('ok   ' + name); } catch (e) { console.error('FAIL ' + name + '\n', e); process.exitCode = 1; } };
@@ -149,6 +149,25 @@ await t('Gujarati asked for by name is said to Gemini', async () => {
   _resetLimits(); sent.length = 0;
   await call('POST', '/v1/ai/assist', { device: 'dev-12345678', lang: 'gu', assist: { text: 'stock ketlo che' } }, fakeGoogle({ lang: 'gu', answer: 'a', steps: [] }));
   assert.ok(sent.some((s) => /in Gujarati \(Gujarati script\)/.test(s.body)));
+});
+
+await t('a table step: known data, known fields, tokens only', async () => {
+  const p = cleanAssist(PAYLOAD);
+  const c = checkSteps(p, [
+    { do: 'table', title: 'Stock party wise', from: 'stock', where: { party: 'P1', item: 'Reliance', from: '2026-09-01', rate: 5 }, by: ['party', 'item', 'price'], show: ['kg', 'amount'], sort: '-kg', limit: 9999 },
+    { do: 'table', from: 'salaries' },
+    { do: 'table', from: 'invoices', by: ['month'], show: ['total'] }
+  ]);
+  assert.equal(c.steps.length, 2);
+  assert.deepEqual(c.steps[0], { do: 'table', title: 'Stock party wise', from: 'stock', where: { party: 'P1', from: '2026-09-01' }, by: ['party', 'item'], show: ['kg'], sort: '-kg', limit: 200 });
+  assert.deepEqual(c.steps[1].show, ['total']);
+  ['item Reliance', 'filter rate', 'group price', 'table salaries'].forEach((d) => assert.ok(c.dropped.indexOf(d) > -1, d));
+});
+
+await t('knowledge tables are cut to size and hold only text and numbers', async () => {
+  const t2 = cleanTables([{ title: 'ITC-04', columns: ['What', 'When'], rows: [['Goods sent', 'Quarterly'], [{ x: 1 }, 5, 'extra']], total: false }, { columns: [] }]);
+  assert.equal(t2.length, 1);
+  assert.deepEqual(t2[0].rows[1], ['[object Object]', 5]);
 });
 
 console.log(pass + ' passed');

@@ -226,8 +226,35 @@ export function cleanAssist(p) {
   };
 }
 
+/* ---- tables: asked for here, worked out on the person's screen ------------
+   "jobwork ma ai mahiti table ne lagti table swarupe aape ane total sathe".
+   A figure Nexora AI adds up itself can be wrong; a table the application
+   builds from its own book cannot. So for the plant's data Nexora AI asks
+   for a TABLE — which data, which filter, grouped by what, which columns —
+   and the application computes it, with the names and a total row, on the
+   person's screen. Nothing of the result comes back here, so a table may
+   even hold money (invoices): Google never sees a rupee of it. */
+export const TABLES = {
+  stock: { by: ['party', 'item', 'group', 'plan', 'stage', 'warehouse', 'batch', 'class'], show: ['kg', 'qty2', 'batches'] },
+  movements: { by: ['date', 'month', 'type', 'dir', 'party', 'item', 'group', 'plan', 'stage', 'warehouse', 'doc', 'batch'], show: ['kgIn', 'kgOut', 'net', 'qty2', 'count'] },
+  documents: { by: ['date', 'month', 'type', 'dir', 'doc', 'plan', 'party', 'status'], show: ['count', 'kg', 'lines'] },
+  plans: { by: ['plan', 'party', 'dir', 'status', 'stage', 'date', 'month', 'job', 'due'], show: ['count', 'receivedKg', 'addedKg', 'finishedKg', 'inStagesKg', 'unaccountedKg'] },
+  orders: { by: ['order', 'plan', 'party', 'item', 'status', 'due', 'stage'], show: ['count', 'plannedKg', 'issuedKg', 'madeKg', 'wasteKg', 'leftKg'] },
+  batches: { by: ['batch', 'item', 'group', 'plan', 'party', 'stage', 'warehouse', 'received', 'expiry', 'qc'], show: ['kg', 'count', 'ageDays'] },
+  challans: { by: ['challan', 'date', 'month', 'party', 'plan', 'state'], show: ['count', 'sentKg', 'backKg', 'balanceKg', 'daysLeft'] },
+  invoices: { by: ['invoice', 'date', 'month', 'party', 'plan', 'status'], show: ['count', 'subtotal', 'tax', 'total'] },
+  qc: { by: ['qc', 'date', 'month', 'plan', 'item', 'result', 'batch'], show: ['count', 'kg'] }
+};
+const WHERE = ['party', 'item', 'group', 'plan', 'order', 'stage', 'warehouse', 'type', 'dir', 'status', 'from', 'to', 'open', 'batch', 'result', 'state', 'class'];
+const TABLE_STEP = '{"do":"table","title":short title,"from":' + Object.keys(TABLES).map((k) => '"' + k + '"').join('|') +
+  ',"where":{FIELD: value, …},"by":[FIELD, …],"show":[COLUMN, …],"sort":"-COLUMN" or "FIELD","limit":number} — a TABLE worked out by Nexora from its own book, with names and a TOTAL row, shown in the chat. ' +
+  'Per "from": ' + Object.keys(TABLES).map((k) => k + ' (by ' + TABLES[k].by.join('/') + '; show ' + TABLES[k].show.join('/') + ')').join('; ') +
+  '. "where" may hold ' + WHERE.join(', ') + ' (party a P token, item an I token, plan/order a number, dir IN|OUT, from/to YYYY-MM-DD, open true|false, state overdue|due|ok|closed for challans, result PASS|FAIL|HOLD). ' +
+  '"by" empty = one row per record. movements are the ledger rows (receipts, issues, production, returns, waste), documents the posted documents; invoices hold money the person sees and you never do.';
+
 /* ---- the steps ----------------------------------------------------------- */
 const STEP_LIST = [
+  TABLE_STEP,
   '{"do":"open","view":VIEW} — go to a window (VIEW one of ' + VIEWS.filter((v) => v !== 'plan' && v !== 'porder').join('|') + ').',
   '{"do":"find","view":VIEW,"text":words} — open a register and put words in its search (a plan number, a batch, P3, I7…).',
   '{"do":"plan","no":PLAN NO} — open one plan (from PLANS).',
@@ -248,13 +275,25 @@ const SYSTEM = [
   'You are Nexora AI, the assistant inside Nexora Jobwork — software for job work in plastic packaging plants (PP/PE woven sacks, BOPP, lamination, printing, films, bags).',
   'You know job work well. INWARD job work (direction IN): a customer (the principal) sends its own material; the plant receives it (material receipt, their challan), makes a production order, issues material to production, receives what was made (production receipt, batches), tests it (QC), releases it to finished goods, sends it back to the party with a challan, and raises a job-work invoice for the processing. OUTWARD job work (OUT): the plant sends its own material to a job worker on a delivery challan and gets it back processed; under GST the goods must come back within 1 year (capital goods 3 years) and are reported on ITC-04. The plan pipeline is PLAN → RECEIPT → [PO → ISSUE → PRODUCTION] → QC → RELEASE → DISPATCH → INVOICE → CLOSED. Stock is kept by plan, stage, warehouse and batch; a batch is issued FIFO (oldest first) or FEFO (first to expire); the balance of a plan is what came in minus what went out, used and wasted.',
   'You see the window the person is on (SCREEN, NOW) and a summary of THIS plant: parties as tokens P1, P2… with their type, items as tokens I1, I2… with their material group, class (RM raw material, SFG semi-finished, FG finished) and units, open PLANS, production ORDERS, STOCK in kg, PENDING work, processes, routes and warehouses. Write P and I tokens exactly as given (Nexora shows the real names on the person’s screen). You NEVER see — and must never ask for, guess or invent — a party’s name, an item’s name, a rate, a price, an amount or a cost. If the person asks about money, say those figures are on their screen in Nexora (Invoices, Rates, Bills, Profit) and offer to open that window.',
-  'Answer questions from the data you were given: which plans are waiting for QC, how much of I3 is in stock for P2, which challans are overdue, what to do next on a plan. Add up and compare the kg figures carefully; say the plan numbers. If the data you have cannot answer it, say so plainly and open the window that can.',
+  'BE OPEN. Answer ANYTHING the person asks, as fully as they want it: this plant\u2019s work, job work and GST (job-work challans, ITC-04, section 143, e-way bills), processes and quality (extrusion, weaving, lamination, printing, stitching, yields, waste, QC), planning, how to do something in Nexora, or any general question. The only things you cannot give are a party\u2019s name, an item\u2019s name and money figures — and even those the person gets, because a table is worked out on their screen.',
+  'TABLES. Whenever the answer is a list, a comparison or figures from the plant\u2019s data — stock, movements, plans, orders, batches, challans, invoices, QC, "which", "how much", "list", "total", "party wise", "month wise" — return a "table" step (more than one if useful). Nexora works it out EXACTLY from its own book, with the real names and a total row; you do NOT add up or copy figures into "answer" — say in one line what the table shows and what to notice. A table step runs by itself; the person does not press Run. For knowledge that is naturally a table (a comparison, a checklist, a schedule), put it in "tables": [{"title": string, "columns": [string, …], "rows": [[cell, …], …], "total": true|false}] — "total": true only when a column is a quantity to add.',
+  'The summary you are given (PLANS, ORDERS, STOCK, PENDING) is for understanding what the person means; when you are not sure it holds everything, ask for a table.',
   'When the person asks for work to be done, return STEPS. Steps allowed: ' + STEP_LIST.join(' '),
   'Steps that make a document (newplan, receipt, porder, issue, production) only FILL the form — the person reads it and presses Post; Nexora checks it then. Use only plan and order numbers from PLANS and ORDERS, and only P and I tokens from PARTIES and ITEMS. Quantities are kg unless the person says the second unit (bags, pieces, rolls → qty2). "1.2 ton" is 1200 kg. Leave out a step the screen shows is already done. When the person corrects you ("no, 900 kg"), return the whole corrected list of steps again.',
   'If something needed is missing (which plan, which item, how much), still return the steps you can and ask for the rest in "answer". Keep "answer" short and practical.',
   'Reply in the SAME language the person used: English → English; Gujarati (in Gujarati script or in English letters) → Gujarati in Gujarati script; Hindi → Hindi in Devanagari. Keep document numbers, tokens, codes and Nexora button names in English; write numbers with the digits 0-9 (1200 kg, never ૧૨૦૦). Set "lang" to en, gu or hi accordingly.',
-  'Answer ONLY with JSON: {"transcript": string (what the person said, when it came as a recording), "lang": "en"|"gu"|"hi", "answer": string, "steps": [ ... ]}.'
+  'Answer ONLY with JSON: {"transcript": string (what the person said, when it came as a recording), "lang": "en"|"gu"|"hi", "answer": string, "steps": [ ... ], "tables": [ ... ]}.'
 ].join('\n');
+
+/** A knowledge table in the answer: at most 4, 12 columns, 80 rows; text or numbers only. */
+export function cleanTables(a) {
+  return list(a, 4).map((t) => {
+    const cols = list(t && t.columns, 12).map((c) => str(c, 60));
+    if (!cols.length) return null;
+    const rows = list(t && t.rows, 80).map((r) => list(r, cols.length).map((c) => (typeof c === 'number' && isFinite(c)) ? c : str(c, 200)));
+    return { title: str(t && t.title, 100), columns: cols, rows: rows, total: !!(t && t.total) };
+  }).filter(Boolean);
+}
 
 /** The steps Nexora AI proposed, checked against what was sent. */
 export function checkSteps(p, raw) {
@@ -274,8 +313,34 @@ export function checkSteps(p, raw) {
     if (!it || !kg) { dropped.push('line ' + str(l && l.item, 12)); return null; }
     return { item: it, kg: kg, qty2: q2 !== null && q2 > 0 ? q2 : null };
   }).filter(Boolean);
-  list(raw, 12).forEach((s) => {
+  list(raw, 14).forEach((s) => {
     const d = s && String(s.do || '').toLowerCase();
+    if (d === 'table') {
+      const from = TABLES[s.from] ? s.from : null;
+      if (!from) { dropped.push('table ' + str(s.from, 20)); return; }
+      const T = TABLES[from];
+      const where = {};
+      const w = s.where && typeof s.where === 'object' ? s.where : {};
+      Object.keys(w).forEach((k) => {
+        if (WHERE.indexOf(k) < 0) { dropped.push('filter ' + str(k, 20)); return; }
+        const v = w[k];
+        if (k === 'party') { const t = ptok(String(v || '').toUpperCase()); if (t && partyOk[t]) where.party = t; else dropped.push('party ' + str(v, 12)); return; }
+        if (k === 'item') { const t = item(v); if (t) where.item = t; else dropped.push('item ' + str(v, 12)); return; }
+        if (k === 'from' || k === 'to') { if (/^\d{4}-\d{2}-\d{2}$/.test(String(v))) where[k] = String(v); else dropped.push(k); return; }
+        if (k === 'open') { where.open = v === true || v === 'true'; return; }
+        if (k === 'dir') { if (v === 'IN' || v === 'OUT') where.dir = v; return; }
+        where[k] = str(v, 60).trim();
+      });
+      const by = list(s.by, 4).filter((f) => T.by.indexOf(f) > -1);
+      list(s.by, 4).filter((f) => T.by.indexOf(f) < 0).forEach((f) => dropped.push('group ' + str(f, 20)));
+      let show = list(s.show, 8).filter((f) => T.show.indexOf(f) > -1);
+      if (!show.length) show = T.show.slice(0, 1);
+      const sortKey = String(s.sort || '').replace(/^-/, '');
+      const sort = (T.show.indexOf(sortKey) > -1 || T.by.indexOf(sortKey) > -1) ? String(s.sort) : '';
+      const lim = Math.round(num(s.limit) || 0);
+      out.push({ do: 'table', title: str(s.title, 80) || from, from: from, where: where, by: by, show: show, sort: sort, limit: lim > 0 && lim <= 500 ? lim : 200 });
+      return;
+    }
     if (d === 'open') { const v = oneOf(s.view, VIEWS, null); if (v && v !== 'plan' && v !== 'porder') out.push({ do: 'open', view: v }); else dropped.push('window ' + str(s.view, 20)); return; }
     if (d === 'find') { const v = oneOf(s.view, VIEWS, null); const t = str(s.text, 60).trim(); if (v && t) out.push({ do: 'find', view: v, text: t }); else dropped.push('find'); return; }
     if (d === 'plan') { const q = plan(s.no); if (q) out.push({ do: 'plan', no: q.no }); else dropped.push('plan ' + str(s.no, 30)); return; }
@@ -323,7 +388,7 @@ async function ask(device, system, prompt, fetchImpl) {
   const payload = JSON.stringify({
     systemInstruction: { parts: [{ text: system }] },
     contents: prompt.contents,
-    generationConfig: { temperature: 0.2, responseMimeType: 'application/json', maxOutputTokens: 2048 }
+    generationConfig: { temperature: 0.2, responseMimeType: 'application/json', maxOutputTokens: 4096 }
   });
   let r;
   for (let attempt = 0; ; attempt++) {
@@ -374,7 +439,8 @@ export async function assist(device, payload, lang, fetchImpl) {
   if (a.fail) return a.fail;
   const j = a.json || {};
   const checked = checkSteps(p, j.steps);
+  const tables = cleanTables(j.tables);
   const l = String(j.lang || '').toLowerCase();
   return { httpStatus: 200, body: { ok: true, model: a.model, left: a.left, transcript: str(j.transcript, 1200),
-    lang: l === 'gu' || l === 'hi' ? l : 'en', answer: str(j.answer, 3000), steps: checked.steps, dropped: checked.dropped } };
+    lang: l === 'gu' || l === 'hi' ? l : 'en', answer: str(j.answer, 4000), steps: checked.steps, dropped: checked.dropped, tables: tables } };
 }
