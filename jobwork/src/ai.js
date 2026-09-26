@@ -175,6 +175,9 @@ export function mediaParts(payload) {
 
 /* ---- what may be sent ---------------------------------------------------- */
 const str = (v, n) => String(v == null ? '' : v).replace(/[\u0000-\u001f]/g, ' ').slice(0, n || 80);
+/* 2.0.2 — an answer keeps its lines: the headings, steps and bullets Nexora AI
+   writes are lines, and str() above made one paragraph of them all */
+const text = (v, n) => String(v == null ? '' : v).replace(/\r\n?/g, '\n').replace(/[\u0000-\u0008\u000b-\u001f]/g, ' ').replace(/\n{3,}/g, '\n\n').slice(0, n || 80);
 const nr = (v) => { const x = Number(v); return isFinite(x) ? Math.round(x * 1000) / 1000 : null; };
 const list = (a, n) => (Array.isArray(a) ? a.slice(0, n) : []);
 /* a party is P<n>, an item I<n> — anything else is dropped, so a real name
@@ -197,7 +200,7 @@ export function cleanAssist(p) {
     screen: oneOf(x.screen, VIEWS, 'dashboard'),
     today: /^\d{4}-\d{2}-\d{2}$/.test(String(x.today || '')) ? x.today : today(),
     text: str(x.text, 1200),
-    history: list(x.history, 20).map((h) => ({ role: h && h.role === 'model' ? 'model' : 'user', text: str(h && h.text, 2500) })).filter((h) => h.text),
+    history: list(x.history, 20).map((h) => ({ role: h && h.role === 'model' ? 'model' : 'user', text: text(h && h.text, 2500) })).filter((h) => h.text),
     parties: list(x.parties, 400).map((q) => ({ t: ptok(q && q.t), type: str(q && q.type, 20) })).filter((q) => q.t),
     items: list(x.items, 600).map((q) => ({ t: itok(q && q.t), group: str(q && q.group, 40), cls: str(q && q.cls, 6), uom: str(q && q.uom, 10), uom2: str(q && q.uom2, 10) })).filter((q) => q.t),
     groups: list(x.groups, 80).map((g) => str(g, 40)).filter(Boolean),
@@ -494,5 +497,5 @@ export async function assist(device, payload, lang, fetchImpl) {
   const tables = cleanTables(j.tables);
   const l = String(j.lang || '').toLowerCase();
   return { httpStatus: 200, body: { ok: true, model: a.model, left: a.left, transcript: str(j.transcript, 1200),
-    lang: l === 'gu' || l === 'hi' ? l : 'en', answer: str(j.answer, 9000), steps: checked.steps, dropped: checked.dropped, tables: tables } };
+    lang: l === 'gu' || l === 'hi' ? l : 'en', answer: text(j.answer, 9000), steps: checked.steps, dropped: checked.dropped, tables: tables } };
 }

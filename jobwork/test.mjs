@@ -215,4 +215,11 @@ await t('a window step is checked like a table and keeps its kind', async () => 
   assert.ok(c.dropped.indexOf('filter cost') > -1);
 });
 
+await t('an answer keeps its lines (headings, steps, bullets)', async () => {
+  _resetLimits();
+  const r = await call('POST', '/v1/ai/assist', { device: 'dev-lines0001', assist: { text: 'explain' } },
+    fakeGoogle({ lang: 'en', answer: '## Lamination\n\n1. Unwind\n2. Coat\n\n- **GSM** checked\u0007', steps: [] }));
+  assert.equal(r.json.answer, '## Lamination\n\n1. Unwind\n2. Coat\n\n- **GSM** checked ');
+});
+
 console.log(pass + ' passed');
