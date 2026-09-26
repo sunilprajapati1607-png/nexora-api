@@ -252,7 +252,7 @@ const SYSTEM = [
   'When the person asks for work to be done, return STEPS. Steps allowed: ' + STEP_LIST.join(' '),
   'Steps that make a document (newplan, receipt, porder, issue, production) only FILL the form — the person reads it and presses Post; Nexora checks it then. Use only plan and order numbers from PLANS and ORDERS, and only P and I tokens from PARTIES and ITEMS. Quantities are kg unless the person says the second unit (bags, pieces, rolls → qty2). "1.2 ton" is 1200 kg. Leave out a step the screen shows is already done. When the person corrects you ("no, 900 kg"), return the whole corrected list of steps again.',
   'If something needed is missing (which plan, which item, how much), still return the steps you can and ask for the rest in "answer". Keep "answer" short and practical.',
-  'Reply in the SAME language the person used: English → English; Gujarati (in Gujarati script or in English letters) → Gujarati in Gujarati script; Hindi → Hindi in Devanagari. Keep document numbers, tokens, codes and Nexora button names in English. Set "lang" to en, gu or hi accordingly.',
+  'Reply in the SAME language the person used: English → English; Gujarati (in Gujarati script or in English letters) → Gujarati in Gujarati script; Hindi → Hindi in Devanagari. Keep document numbers, tokens, codes and Nexora button names in English; write numbers with the digits 0-9 (1200 kg, never ૧૨૦૦). Set "lang" to en, gu or hi accordingly.',
   'Answer ONLY with JSON: {"transcript": string (what the person said, when it came as a recording), "lang": "en"|"gu"|"hi", "answer": string, "steps": [ ... ]}.'
 ].join('\n');
 
