@@ -43,20 +43,27 @@ function bestOf(names) {
 const MODEL_TTL_MS = 6 * 60 * 60 * 1000;
 const TIMEOUT_MS = 40000;
 
-/* GEMINI_API_KEY — or, when the dashboard was given another name ("nexora
-   jobwork", "GEMINI KEY"…), the variable whose name says GEMINI, else the one
-   whose value is plainly an AI Studio key (AIza…). Only the NAME is ever
-   said (on /health and in the log), never the value. */
+/* GEMINI_API_KEY — or the name the dashboard was given (the owner's is
+   NEXORA_JOBOWRK): a variable whose name says GEMINI, NEXORA or JOBWORK and
+   whose value is shaped like a key (one word, 30+ characters; quotes and
+   spaces a paste may bring are taken off). Only the NAME is ever said (on
+   /health and in the log), never the value. */
+const tidy = (v) => String(v || '').trim().replace(/^["'`]+|["'`]+$/g, '').replace(/\s+/g, '');
+const keyShaped = (v) => /^[\w\-.]{30,}$/.test(v);
 export function keySource() {
   const env = process.env;
-  if (String(env.GEMINI_API_KEY || '').trim()) return 'GEMINI_API_KEY';
+  if (tidy(env.GEMINI_API_KEY)) return 'GEMINI_API_KEY';
   const names = Object.keys(env);
-  const looks = (n) => /^AIza[\w\-]{20,}$/.test(String(env[n] || '').trim());
-  return names.filter((n) => /GEMINI/i.test(n) && String(env[n] || '').trim()).filter(looks)[0]
-    || names.filter((n) => /GEMINI|JOBWORK|NEXORA/i.test(n) && looks(n))[0]
-    || names.filter(looks)[0] || null;
+  return names.filter((n) => /GEMINI/i.test(n) && keyShaped(tidy(env[n])))[0]
+    || names.filter((n) => /NEXORA|JOB[OW]*[RW]*K/i.test(n) && keyShaped(tidy(env[n])))[0]
+    || names.filter((n) => /^AIza[\w\-]{20,}$/.test(tidy(env[n])))[0] || null;
 }
-const key = () => { const n = keySource(); return n ? String(process.env[n] || '').trim() : ''; };
+/** For the log when nothing was found: each candidate's length only. */
+export function keyHint() {
+  return Object.keys(process.env).filter((n) => /GEMINI|NEXORA|JOB/i.test(n))
+    .map((n) => n + ' (' + tidy(process.env[n]).length + ' characters)').join(', ') || 'none';
+}
+const key = () => { const n = keySource(); return n ? tidy(process.env[n]) : ''; };
 export function aiConfigured() { return !!key(); }
 
 /* never let the key into a message, a log or an answer */
