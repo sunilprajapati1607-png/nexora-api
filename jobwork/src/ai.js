@@ -250,7 +250,7 @@ const TABLE_STEP = '{"do":"table","title":short title,"from":' + Object.keys(TAB
   ',"where":{FIELD: value, …},"by":[FIELD, …],"show":[COLUMN, …],"sort":"-COLUMN" or "FIELD","limit":number} — a TABLE worked out by Nexora from its own book, with names and a TOTAL row, shown in the chat. ' +
   'Per "from": ' + Object.keys(TABLES).map((k) => k + ' (by ' + TABLES[k].by.join('/') + '; show ' + TABLES[k].show.join('/') + ')').join('; ') +
   '. "where" may hold ' + WHERE.join(', ') + ' (party a P token, item an I token, plan/order a number, dir IN|OUT, from/to YYYY-MM-DD, open true|false, state overdue|due|ok|closed for challans, result PASS|FAIL|HOLD). ' +
-  '"by" empty = one row per record. movements are the ledger rows (receipts, issues, production, returns, waste), documents the posted documents; invoices hold money the person sees and you never do.';
+  '"by" empty = one row per record. movements are the ledger rows; their "type" is exactly one of RECEIPT (material received from the party), ISSUE (issued to a stage or sent out), PRODUCTION_RECEIPT (made on the floor), ADD_MATERIAL (our material added), TRANSFER (moved, e.g. released to FG), RETURN (sent back to the party), WASTE, REJECTION — "material receipt" is type RECEIPT, "dispatch" is RETURN; "dir" is the PLAN\u2019s direction (IN inward job work, OUT outward), not in or out of the store — kgIn/kgOut are the quantities in and out. documents are the posted documents (type MATERIAL_RECEIPT, ISSUE, PRODUCTION_RECEIPT, RETURN, TRANSFER…); invoices hold money the person sees and you never do.';
 
 /* ---- the steps ----------------------------------------------------------- */
 const STEP_LIST = [
