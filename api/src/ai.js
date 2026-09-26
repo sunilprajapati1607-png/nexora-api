@@ -46,6 +46,14 @@ function bestOf(names) {
   return names.filter((n) => !blocked.has(n) && rankOf(n) !== null).sort((a, b) => rankOf(b) - rankOf(a))[0] || null;
 }
 export function _blocked() { return blocked; }
+/* 4.67.7 — "haju strong generative ai jevu banavo": the newest plain Flash the key lists (not
+   Lite); GEMINI_MODEL_STRONG names another, or "off" keeps every question on the Lite model */
+export function strongOf(names) {
+  const env = String(process.env.GEMINI_MODEL_STRONG || '').trim().replace(/^models\//, '');
+  if (env.toLowerCase() === 'off') return null;
+  if (env) return names.indexOf(env) > -1 && !blocked.has(env) ? env : null;
+  return names.filter((n) => !blocked.has(n) && /-flash(?:-\d{3})?$/.test(n) && rankOf(n) !== null).sort((a, b) => rankOf(b) - rankOf(a))[0] || null;
+}
 const MODEL_TTL_MS = 6 * 60 * 60 * 1000;
 const TIMEOUT_MS = 60000;              /* 4.67.6 — a question with the plant's whole memory takes longer */
 
@@ -64,10 +72,10 @@ function scrub(s) {
 let model = { name: null, at: 0, error: null, available: [] };
 let resolving = null;
 
-async function gfetch(url, opts, fetchImpl) {
+async function gfetch(url, opts, fetchImpl, ms) {
   const f = fetchImpl || globalThis.fetch;
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
+  const timer = setTimeout(() => ctrl.abort(), ms || TIMEOUT_MS);
   try {
     const r = await f(url, Object.assign({}, opts, { signal: ctrl.signal,
       headers: Object.assign({ 'content-type': 'application/json', 'x-goog-api-key': key() }, (opts && opts.headers) || {}) }));
@@ -197,7 +205,16 @@ function readAnswer(body) {
 
 
 /* ---- one call to Gemini, shared by every Nexora AI question ------------- */
-async function ask(companyId, system, prompt, fetchImpl) {
+const STRONG_MS = 45000;
+function readJson(r) {
+  const parts = (((r.body && r.body.candidates) || [])[0] || {}).content;
+  /* a thinking model may send its thought as a part of its own: only the answer's text is read */
+  const text = ((parts && parts.parts) || []).filter((x) => !x.thought).map((x) => x.text || '').join('').trim()
+    .replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '');
+  try { return text ? JSON.parse(text) : null; } catch (e) { return null; }
+}
+async function ask(companyId, system, prompt, fetchImpl, opts) {
+  opts = opts || {};
   if (!aiConfigured()) return { fail: { httpStatus: 503, body: { error: 'AI_OFF', message: 'Nexora AI is not switched on at the service yet.' } } };
   const t = take(companyId);
   if (t.busy) return { fail: { httpStatus: 429, body: { error: 'AI_BUSY', retryAfter: t.busy, message: 'Nexora AI is busy — try again in ' + t.busy + ' seconds.' } } };
@@ -207,15 +224,25 @@ async function ask(companyId, system, prompt, fetchImpl) {
   const payload = JSON.stringify({
     systemInstruction: { parts: [{ text: system }] },
     contents: (prompt && prompt.contents) ? prompt.contents : [{ role: 'user', parts: Array.isArray(prompt) ? prompt : [{ text: prompt }] }],   /* text, parts (a recording + text), or a whole conversation */   /* text, or parts (a recording + text) */
-    generationConfig: { temperature: 0.2, responseMimeType: 'application/json', maxOutputTokens: 2048 }
+    generationConfig: { temperature: 0.2, responseMimeType: 'application/json', maxOutputTokens: opts.maxTokens || 2048 }
   });
   let r;
+  /* the stronger model first (45 s), then the usual one (the rest of the minute) */
+  const strong = opts.strong ? strongOf(model.available || []) : null;
+  if (strong && strong !== name) {
+    let rs = null;
+    try { rs = await gfetch(API + '/models/' + encodeURIComponent(strong) + ':generateContent', { method: 'POST', body: payload }, fetchImpl, STRONG_MS); } catch (e) { rs = null; }
+    if (rs && rs.ok) { const got = readJson(rs); if (got) return { json: got, model: strong, left: t.left }; }
+    const sm = String((rs && rs.body && rs.body.error && rs.body.error.message) || '');
+    if (rs && !rs.ok && (rs.status === 404 || /no longer available|not found|is not supported|deprecated/i.test(sm))) blocked.add(strong);
+  }
   /* 4.67.1 — a model Google has retired is set aside and the request is
      asked again, of the model Google names (or the newest the key lists),
      at most twice — the person never sees "no longer available" */
   for (let attempt = 0; ; attempt++) {
     try {
-      r = await gfetch(API + '/models/' + encodeURIComponent(name) + ':generateContent', { method: 'POST', body: payload }, fetchImpl);
+      /* after the stronger model had its 45 s, the usual one gets what is left of the application's 75 s */
+      r = await gfetch(API + '/models/' + encodeURIComponent(name) + ':generateContent', { method: 'POST', body: payload }, fetchImpl, strong && strong !== name ? 25000 : TIMEOUT_MS);
     } catch (e) {
       return { fail: { httpStatus: 504, body: { error: 'AI_TIMEOUT', message: 'Nexora AI did not answer in time. Try again.' } } };
     }
@@ -234,11 +261,7 @@ async function ask(companyId, system, prompt, fetchImpl) {
     return { fail: { httpStatus: busy ? 429 : 502, body: { error: busy ? 'AI_BUSY' : 'AI_FAILED', retryAfter: busy ? 60 : undefined,
       message: busy ? 'Nexora AI is busy (Google’s limit) — try again in a minute.' : 'Nexora AI could not answer (' + r.status + '): ' + scrub(r.body && r.body.error && r.body.error.message) } } };
   }
-  const parts = (((r.body && r.body.candidates) || [])[0] || {}).content;
-  const text = ((parts && parts.parts) || []).map((x) => x.text || '').join('').trim()
-    .replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '');
-  let json = null;
-  try { json = text ? JSON.parse(text) : null; } catch (e) { json = null; }
+  const json = readJson(r);
   if (!json) return { fail: { httpStatus: 502, body: { error: 'AI_UNREADABLE', message: 'Nexora AI answered in a form Nexora could not read. Try again.' } } };
   return { json: json, model: name, left: t.left };
 }
@@ -667,7 +690,23 @@ export async function chat(companyId, payload, lang, fetchImpl) {
    route or material is dropped and said.
    ========================================================================== */
 export const ASSIST_VIEWS = ['dashboard', 'calculation', 'history', 'bom', 'bomrecords', 'routes', 'rm', 'structures', 'constants',
-  'quotation', 'quoterecords', 'compare', 'targetcost', 'priceimpact', 'workflows', 'settings'];
+  'quotation', 'quoterecords', 'compare', 'targetcost', 'priceimpact', 'workflows', 'settings', 'easycost'];
+/* 4.67.7 — "observe our alll work of software make most of compitible with ai": what a window
+   shows, as a small flat object of technical words and figures (never a name, a customer or a
+   bag's cost — the application leaves them out; this keeps only short strings and numbers) */
+function cleanView(v) {
+  const o = {};
+  if (!v || typeof v !== 'object') return o;
+  Object.keys(v).slice(0, 30).forEach((k0) => {
+    const k = str(k0, 30); const x = v[k0];
+    if (typeof x === 'number' && isFinite(x)) o[k] = nr(x);
+    else if (typeof x === 'boolean') o[k] = x;
+    else if (typeof x === 'string') o[k] = str(x, 160);
+    else if (Array.isArray(x)) o[k] = x.slice(0, 40).map((y) => (typeof y === 'number' ? nr(y) : str(y, 160)));
+  });
+  return o;
+}
+const ALLOWED = ['cost', 'calc', 'bom', 'route', 'rm', 'price', 'constants', 'quote', 'compare', 'targetcost', 'priceimpact', 'notes'];
 const cleanSecs = (a) => list(a, 20).map((s) => ({ process: str(s && s.process, 30), wastePct: nr(s && s.wastePct),
       lines: list(s && s.lines, 12).map((l) => ({ material: str(l && l.material, 60), basis: str(l && l.basis, 10), value: nr(l && l.value), figure: str(l && l.figure, 30) })) })).filter((s) => s.process);
 export function cleanAssist(p) {
@@ -687,6 +726,19 @@ export function cleanAssist(p) {
       constructions: list(r && r.constructions, 30).map((s) => str(s, 60)), stages: cleanSecs(r && r.stages) })).filter((r) => r.name),
     materials: list(x.materials, 300).map((m) => ({ code: str(m && m.code, 40), name: str(m && m.name, 60), group: str(m && m.group, 30), rate: nr(m && m.rate) })).filter((m) => m.code),
     rules: list(x.rules, 30).map((r) => str(r, 300)).filter(Boolean),
+    /* 4.67.7 — the plant's saved work by NUMBER and technical figures (never an item name or a customer) */
+    records: list(x.records, 120).map((r) => ({ n: str(r && r.n, 30), construction: str(r && r.construction, 60), width: nr(r && r.width), length: nr(r && r.length),
+      gsm: nr(r && r.gsm), weight: nr(r && r.weight), target: nr(r && r.target), bags: nr(r && r.bags), status: str(r && r.status, 16), date: str(r && r.date, 10),
+      bom: !!(r && r.bom), rev: nr(r && r.rev) })).filter((r) => r.n),
+    boms: list(x.boms, 80).map((b) => ({ n: str(b && b.n, 30), calc: str(b && b.calc, 30), construction: str(b && b.construction, 60), route: str(b && b.route, 80),
+      mode: str(b && b.mode, 10), date: str(b && b.date, 10) })).filter((b) => b.n),
+    quotes: list(x.quotes, 60).map((q) => ({ n: str(q && q.n, 30), calcs: list(q && q.calcs, 10).map((c) => str(c, 30)), bags: nr(q && q.bags), items: nr(q && q.items),
+      status: str(q && q.status, 16), date: str(q && q.date, 10) })).filter((q) => q.n),
+    constants: list(x.constants, 220).map((c) => ({ name: str(c && c.name, 80), value: typeof (c && c.value) === 'number' ? nr(c.value) : str(c && c.value, 30), unit: str(c && c.unit, 20),
+      group: str(c && c.group, 40) })).filter((c) => c.name),
+    groups: list(x.groups, 40).map((g) => str(g, 40)).filter(Boolean),
+    workflowList: list(x.workflowList, 60).map((w) => ({ name: str(w && w.name, 80), construction: str(w && w.construction, 60) })).filter((w) => w.name),
+    allowed: (function (a) { a = a && typeof a === 'object' ? a : {}; const o = {}; ALLOWED.forEach((k) => { o[k] = a[k] !== false; }); return o; })(x.allowed),
     topics: list(x.topics, 120).map((t) => str(t, 80)).filter(Boolean),
     figures: list(x.figures, 80).map((f) => ({ key: str(f && f.key, 30).toUpperCase(), label: str(f && f.label, 60) })).filter((f) => f.key),
     /* what Nexora has learned from this plant's own saved work (routes used, workflows matched, usual recipes) */
@@ -728,7 +780,8 @@ export function cleanAssist(p) {
         parts: list(c.parts, 16).map((q) => ({ key: str(q && q.key, 30).toUpperCase(), label: str(q && q.label, 40), grams: nr(q && q.grams), consumable: !!(q && q.consumable), within: str(q && q.within, 30) })).filter((q) => q.key)
       },
       bom: n.bom ? clean(n.bom) : null,
-      note: str(n.note, 300)
+      note: str(n.note, 300),
+      view: cleanView(n.view)
     }
   };
 }
@@ -750,6 +803,14 @@ const STEP_LIST = [
   '{"do":"price","material":MATERIAL CODE,"change":number or null,"pct":number or null,"set":number or null,"from":"YYYY-MM-DD" or null} — a new price version for a material: "+5" is change 5, "3 % up" is pct 3, "210 karo" is set 210.',
   '{"do":"quote","quantity":number,"rate":number or null,"margin":percent or null} — a quotation for the bag on screen (or the one just made): its quantity, and the selling rate the person said, or a margin over the bag\u2019s cost that Nexora works out on the person\u2019s computer. The buyer is typed by the person.',
   '{"do":"cost"} — show the cost per bag (worked out on the person’s screen; you never see it).',
+  '{"do":"find","what":"calc"|"bom"|"quote","number":a NUMBER from RECORDS/BOMS/QUOTES or null,"construction":NAME or null,"q":search words or null,"open":true|false} — find saved work; open:true opens the one found (a calculation in the calculation window, a BOM on the BOM window, a quotation to edit), else its records window is shown filtered.',
+  '{"do":"compare","a":CALC NUMBER or "current","b":CALC NUMBER} — two calculations side by side (weight, layers, and cost per bag for a person who may see it).',
+  '{"do":"targetcost","calc":CALC NUMBER or "current","mode":"PRICE"|"COST","price":selling price per bag or null,"margin":percent or null,"cost":target cost per bag or null} — Target Cost: what to change to bring the bag to that cost; it searches the options on the person\u2019s computer.',
+  '{"do":"priceimpact","changes":[{"material":MATERIAL CODE,"change":number or null,"pct":number or null,"set":number or null}]} — Price Impact: what every saved BOM costs at today\u2019s prices ([] ) or at what-if prices (nothing is saved).',
+  '{"do":"constant","name":CONSTANT NAME from CONSTANTS,"value":number} — set a constant (in its own unit, as CONSTANTS show it); it goes to the administrator for approval when the person may not change it.',
+  '{"do":"material","name":NAME,"group":GROUP from GROUPS,"code":CODE or null,"uom":"KG"|"PCS"|"MTR" or null,"wastePct":number or null} — add a raw material to the RM Master (its code is made from its group when not said; a price is a separate "price" step).',
+  '{"do":"note","text":TEXT} — write a note on the person\u2019s own note pad.',
+  '{"do":"guide","view":one of ' + ASSIST_VIEWS.join('|') + ',"button":the words on a button, tab or field of that window,"say":one short line} — SHOW the person where to press: open that window and point at it, with the line.',
   '{"do":"open","view":one of ' + ASSIST_VIEWS.join('|') + '} — go to a window.'
 ];
 const ASSIST_SYSTEM = [
@@ -778,7 +839,11 @@ const ASSIST_SYSTEM = [
   'Order steps as the work goes: calc → save → route (only if needed) → bom → recipe/waste → cost. Leave out what NOW shows is already done. When the person corrects something ("no, width 520", "make it 75 gram"), return the WHOLE corrected list of steps again with the change, with "fresh":false on the calc step when NOW.calc.madeByAi is true.',
   'If something needed is missing, still return the steps you can and ask for the rest in "answer". Keep "answer" short and practical: what you understood, what the steps will do, any assumption.',
   'Reply in the SAME language the person used: English → English; Gujarati (in Gujarati script or in English letters) → Gujarati in Gujarati script; Hindi → Hindi in Devanagari. Keep codes, field names, material and process names and Nexora button names in English. Set "lang" to en, gu or hi accordingly.',
-  'Answer ONLY with JSON: {"transcript": string, "lang": "en"|"gu"|"hi", "answer": string, "steps": [ ... ], "remember": string or null, "forget": [string]}.'
+  'EVERY WINDOW (4.67.7): NOW.view is what the window on screen shows (its filters, the numbers listed, what is picked). RECORDS are the saved calculations, BOMS the saved BOMs, QUOTES the quotations — by their NUMBERS and technical figures (width, length, GSM, weight, construction, date; never an item name or a customer). Answer questions about them yourself ("how many 2L bags this month", "which bag is heaviest", "which bags have no BOM") and use their numbers in find/compare/targetcost steps. CONSTANTS are the plant\u2019s constants (name, value, unit); WORKFLOWLIST the saved workflows; GROUPS the RM groups.',
+  'ALLOWED says what this person may do (cost = may see costs; rm, price, constants, route, quote, compare, targetcost, priceimpact, notes). Never propose a step for what is false; say who can do it (an administrator in Settings \u2192 Users).',
+  'BE THE EXPERT, EASY AND EXACT. Write the answer for a busy person who does not know the software: first the result in one line, then the reason. Use short lines; "- " bullets; "1. 2. 3." for steps to follow; **bold** for the key figure; a table ("| a | b |" rows) when comparing. Use ONLY figures from CONTEXT or that you work out from them — show the working in one line (e.g. denier = GSM x DENIER FACTOR / (warp + weft) with the plant\u2019s own constant), and mark any estimate as an estimate. "How do I…" → numbered steps in the person\u2019s words, plus a "guide" step at the first button (and "open" when it is on another window). When the person only asks, answer — no steps.',
+  'NEXT: give "next" — up to 3 short follow-ups the person is likely to want now, in THEIR language, each a complete request Nexora AI could do (e.g. "Save it and open the BOM", "Compare it with CAL-2026-000012").',
+  'Answer ONLY with JSON: {"transcript": string, "lang": "en"|"gu"|"hi", "answer": string, "steps": [ ... ], "remember": string or null, "forget": [string], "next": [string]}.'
 ].join('\n');
 
 /** What a construction needs, read from its own fields and its name: the processes its layers and parts call for. */
@@ -829,7 +894,7 @@ export function checkSteps(p, raw) {
     return p.processes.filter((q) => q.name.toUpperCase() === k)[0] || null; };
   const num = (v) => { if (v === null || v === undefined || v === '') return null; const x = Number(String(v).replace(/,/g, '')); return isFinite(x) ? Math.round(x * 1000) / 1000 : null; };
   const BASES = { PCT: 1, PERBAG_G: 1, PER1000: 1, ABS: 1 };
-  list(raw, 12).forEach((s) => {
+  list(raw, 24).forEach((s) => {
     const d = s && String(s.do || '').toLowerCase();
     if (d === 'calc') {
       const named = s.construction ? conOf[String(s.construction).trim().toUpperCase()] : null;
@@ -999,6 +1064,83 @@ export function checkSteps(p, raw) {
       return;
     }
     if (d === 'open') { if (ASSIST_VIEWS.indexOf(s.view) > -1) out.push({ do: 'open', view: s.view }); else dropped.push('window ' + str(s.view, 20)); return; }
+    /* 4.67.7 — the rest of Nexora */
+    const recOf = (v) => { const k = String(v || '').trim().toUpperCase(); return k ? p.records.filter((r) => r.n.toUpperCase() === k)[0] || null : null; };
+    const may = (k, what) => { if (p.allowed[k] === false) { dropped.push(what + ' (not in your access)'); return false; } return true; };
+    if (d === 'find') {
+      const what = ['calc', 'bom', 'quote'].indexOf(s.what) > -1 ? s.what : 'calc';
+      const pool = what === 'bom' ? p.boms : what === 'quote' ? p.quotes : p.records;
+      const numb = s.number ? String(s.number).trim().toUpperCase() : '';
+      const hit = numb ? pool.filter((r) => r.n.toUpperCase() === numb || (what === 'bom' && r.calc && r.calc.toUpperCase() === numb))[0] : null;
+      if (numb && !hit) { dropped.push(what + ' ' + str(s.number, 30) + ' (not found)'); return; }
+      const con = s.construction ? conOf[String(s.construction).trim().toUpperCase()] : null;
+      if (s.construction && !con) { dropped.push('construction ' + str(s.construction, 40)); return; }
+      if (what === 'bom' && !may('bom', 'BOM')) return;
+      if (what === 'quote' && !may('quote', 'quotation')) return;
+      out.push({ do: 'find', what: what, number: hit ? hit.n : null, construction: con ? con.name : null, q: str(s.q, 60) || null, open: !!(s.open && hit) });
+      return;
+    }
+    if (d === 'compare') {
+      if (!may('compare', 'compare')) return;
+      const a = String(s.a || '').toLowerCase() === 'current' ? { n: 'current' } : recOf(s.a);
+      const b = recOf(s.b);
+      if (!a || !b || a.n === b.n) { dropped.push('compare ' + str(s.a, 20) + ' / ' + str(s.b, 20)); return; }
+      out.push({ do: 'compare', a: a.n, b: b.n });
+      return;
+    }
+    if (d === 'targetcost') {
+      if (!may('targetcost', 'Target Cost') || !may('cost', 'Target Cost')) return;
+      const c = String(s.calc || 'current').toLowerCase() === 'current' ? { n: 'current' } : recOf(s.calc);
+      if (!c) { dropped.push('calculation ' + str(s.calc, 30)); return; }
+      const mode = s.mode === 'COST' ? 'COST' : 'PRICE';
+      const pr = num(s.price), mg = num(s.margin), co = num(s.cost);
+      out.push({ do: 'targetcost', calc: c.n, mode: mode, price: pr !== null && pr > 0 ? pr : null, margin: mg !== null && mg >= 0 && mg < 100 ? mg : null, cost: co !== null && co > 0 ? co : null });
+      return;
+    }
+    if (d === 'priceimpact') {
+      if (!may('priceimpact', 'Price Impact') || !may('cost', 'Price Impact')) return;
+      const ch = [];
+      list(s.changes, 20).forEach((c) => {
+        const m = matFind(c && c.material); if (!m) { dropped.push('material ' + str(c && c.material, 30)); return; }
+        const a = num(c.change), pc = num(c.pct), st = num(c.set);
+        if (st !== null && st > 0) ch.push({ material: m.code, set: st });
+        else if (pc !== null && pc > -100) ch.push({ material: m.code, pct: pc });
+        else if (a !== null && a !== 0) ch.push({ material: m.code, change: a });
+        else dropped.push('price ' + m.code);
+      });
+      out.push({ do: 'priceimpact', changes: ch });
+      return;
+    }
+    if (d === 'constant') {
+      const c = p.constants.filter((x) => x.name.toUpperCase() === String(s.name || '').trim().toUpperCase())[0];
+      const v = num(s.value);
+      if (!c) { dropped.push('constant ' + str(s.name, 40)); return; }
+      /* ask, never guess: the figure must be one the person said */
+      if (v === null || !saidNumbers(p).some((n) => Math.abs(n - v) < 1e-9)) { missing.push({ key: '__constant', label: c.name + (c.unit ? ' (' + c.unit + ')' : ''), required: true }); out.push({ do: 'constant', name: c.name, value: null }); return; }
+      out.push({ do: 'constant', name: c.name, value: v });
+      return;
+    }
+    if (d === 'material') {
+      if (!may('rm', 'new material')) return;
+      const name = str(s.name, 60);
+      const g = p.groups.filter((x) => x.toUpperCase() === String(s.group || '').trim().toUpperCase())[0] || null;
+      const code = s.code ? str(String(s.code).trim().toUpperCase(), 20) : null;
+      if (!name) { dropped.push('material without a name'); return; }
+      if (code && matOf[code]) { dropped.push('material ' + code + ' (already in the RM Master)'); return; }
+      if (p.materials.some((m) => m.name.toUpperCase() === name.toUpperCase())) { dropped.push('material ' + name + ' (already in the RM Master)'); return; }
+      if (!g) { missing.push({ key: '__group', label: 'RM group for ' + name, type: 'enum', options: p.groups, required: true }); }
+      const w = num(s.wastePct);
+      out.push({ do: 'material', name: name, group: g, code: code, uom: ['KG', 'PCS', 'MTR'].indexOf(String(s.uom || '').toUpperCase()) > -1 ? String(s.uom).toUpperCase() : 'KG', wastePct: w !== null && w >= 0 && w < 100 ? w : null });
+      return;
+    }
+    if (d === 'note') { const t = str(s.text, 1000); if (t && may('notes', 'note')) out.push({ do: 'note', text: t }); else if (!t) dropped.push('empty note'); return; }
+    if (d === 'guide') {
+      const v = ASSIST_VIEWS.indexOf(s.view) > -1 ? s.view : p.screen;
+      const b = str(s.button, 40);
+      if (!b) { dropped.push('guide without a button'); return; }
+      out.push({ do: 'guide', view: v, button: b, say: str(s.say, 200) });
+      return;
+    }
     if (d) dropped.push(str(d, 20));
   });
   return { steps: out, dropped: dropped, missing: missing, notes: notes };
@@ -1011,8 +1153,9 @@ export async function assist(companyId, payload, lang, fetchImpl) {
   const m = mediaParts(payload);
   if (m.error) return m.error;
   if (!p.text && !m.parts.length) return { httpStatus: 400, body: { error: 'NOTHING', message: 'Say or type something first.' } };
-  const ctx = { SCREEN: p.screen, UNITS: p.units, RULES: p.rules, NOW: p.now, CONSTRUCTIONS: p.constructions, FIELDS: p.fields, PROCESSES: p.processes,
-    ROUTES: p.routes, MATERIALS: p.materials, FIGURES: p.figures, LEARNED: p.learned, HELP_TOPICS: p.topics };
+  const ctx = { SCREEN: p.screen, UNITS: p.units, RULES: p.rules, ALLOWED: p.allowed, NOW: p.now, CONSTRUCTIONS: p.constructions, FIELDS: p.fields, PROCESSES: p.processes,
+    ROUTES: p.routes, MATERIALS: p.materials, GROUPS: p.groups, CONSTANTS: p.constants, FIGURES: p.figures, RECORDS: p.records, BOMS: p.boms, QUOTES: p.quotes,
+    WORKFLOWLIST: p.workflowList, LEARNED: p.learned, HELP_TOPICS: p.topics };
   const contents = [{ role: 'user', parts: [{ text: 'CONTEXT:\n' + JSON.stringify(ctx) }] },
     { role: 'model', parts: [{ text: '{"transcript":"","lang":"en","answer":"Ready.","steps":[]}' }] }];
   p.history.forEach((h) => contents.push({ role: h.role, parts: [{ text: h.text }] }));
@@ -1021,13 +1164,13 @@ export async function assist(companyId, payload, lang, fetchImpl) {
   const said = (lang === 'gu' || lang === 'hi') ? langLine(lang, 'the answer') : '';
   contents.push({ role: 'user', parts: m.parts.concat([{ text: said + (m.audio ? 'The person speaks in the attached recording.' + (p.text ? ' Also typed: ' + p.text : '') : p.text) +
     (m.files ? '\nAlso attached: ' + m.files + ' photo(s)/document(s) of the bag — read its sizes and specification from them.' : '') }]) });
-  const a = await ask(companyId, ASSIST_SYSTEM, { contents: contents }, fetchImpl);
+  const a = await ask(companyId, ASSIST_SYSTEM, { contents: contents }, fetchImpl, { strong: true, maxTokens: 8192 });
   if (a.fail) return a.fail;
   const j = a.json || {};
   if (j.transcript) p.transcript = str(j.transcript, 1200);
   const checked = checkSteps(p, j.steps);
   const l = String(j.lang || '').toLowerCase();
-  let answer = str(j.answer, 3000);
+  let answer = str(j.answer, 6000);
   if (!checked.steps.length && /\b(added|done|updated|changed|saved|removed|set it|applied)\b|ઉમેર્ય|ઉમેરી દ|કરી દી|કર્યુ|बदल दि|जोड़ दि|कर दिया|सेव कर/i.test(answer)) {
     const lg = l === 'gu' || l === 'hi' ? l : 'en';
     answer += lg === 'gu' ? '\n\n(ધ્યાન: હજુ કશું બદલાયું નથી — આ માટે કોઈ પગલું બન્યું નથી. Stage અને શું ઉમેરવું તે ફરી કહો.)'
@@ -1037,5 +1180,6 @@ export async function assist(companyId, payload, lang, fetchImpl) {
   return { httpStatus: 200, body: { ok: true, model: a.model, left: a.left, transcript: str(j.transcript, 1200),
     lang: l === 'gu' || l === 'hi' ? l : 'en', answer: answer,
     steps: checked.steps, missing: checked.missing, dropped: checked.dropped, notes: checked.notes, remember: j.remember ? str(j.remember, 300) : null,
-    forget: list(j.forget, 10).map((x) => str(x, 300)).filter((x) => p.rules.indexOf(x) > -1) } };
+    forget: list(j.forget, 10).map((x) => str(x, 300)).filter((x) => p.rules.indexOf(x) > -1),
+    next: list(j.next, 3).map((x) => str(x, 120)).filter(Boolean) } };
 }
