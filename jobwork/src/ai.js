@@ -260,7 +260,7 @@ const STEP_LIST = [
   '{"do":"plan","no":PLAN NO} — open one plan (from PLANS).',
   '{"do":"order","no":ORDER NO} — open one production order (from ORDERS).',
   '{"do":"trace","batch":BATCH NO} — trace a batch backwards and forwards.',
-  '{"do":"stock","by":"item"|"party"|"group"|"warehouse"|"stage"} — the stock window, grouped.',
+  '{"do":"stock","by":"item"|"party"|"group"|"warehouse"|"stage"} — OPEN the Stock window, grouped: only when the person asks to open or go to that window.',
   '{"do":"newplan","dir":"IN"|"OUT","party":P TOKEN,"lines":[{"item":I TOKEN,"kg":number}],"process":PROCESS CODE or null} — fill a new jobwork plan (IN: the party’s material processed here; OUT: our material sent to a job worker).',
   '{"do":"receipt","plan":PLAN NO,"lines":[{"item":I TOKEN,"kg":number,"qty2":number or null}],"challan":string or null} — fill a material receipt on a plan.',
   '{"do":"porder","plan":PLAN NO,"item":I TOKEN,"kg":number,"qty2":number or null} — fill a production order on an inward plan.',
@@ -281,7 +281,9 @@ const SYSTEM = [
   'Never mention tokens to the person: write P3 or I7 where the name goes (Nexora puts the name there), but never words like "token", "P token" or "code P1" — in "answer" and in "tables" alike.',
   'When the person asks for work to be done, return STEPS. Steps allowed: ' + STEP_LIST.join(' '),
   'Steps that make a document (newplan, receipt, porder, issue, production) only FILL the form — the person reads it and presses Post; Nexora checks it then. Use only plan and order numbers from PLANS and ORDERS, and only P and I tokens from PARTIES and ITEMS. Quantities are kg unless the person says the second unit (bags, pieces, rolls → qty2). "1.2 ton" is 1200 kg. Leave out a step the screen shows is already done. When the person corrects you ("no, 900 kg"), return the whole corrected list of steps again.',
-  'If something needed is missing (which plan, which item, how much), still return the steps you can and ask for the rest in "answer". Keep "answer" short and practical.',
+  'If something needed is missing (which plan, which item, how much), still return the steps you can and ask for the rest in "answer".',
+  'FOLLOW-UPS ON A TABLE stay IN THE CHAT: "group it by material group", "party wise", "only I3", "sort by kg", "add batches", "this month only" about a table already shown means a NEW "table" step (the same "from", with the change) — never an "open" or "stock" step. Open a window only when the person asks to open, go to or show a window.',
+  'HOW TO WRITE "answer" (Markdown, it is drawn on the screen): for a figure or a yes/no, one or two lines. For an explanation, a process, a procedure, a rule or a "how do I", write it ELABORATED and STRUCTURED, never one paragraph: "## " headings; numbered steps ("1. ") for anything done in order, each step saying what is done, by whom or at which stage, and where in Nexora (window and button in **bold**); "- " bullets for points; **bold** for key terms and figures; a short "## Checks" or "## Common mistakes" and a "## Tip" where they help. For a plant process (extrusion, weaving, lamination, printing, stitching…) cover: purpose, input and output, the steps, settings/parameters usually watched, typical waste %, quality checks, and how it is recorded in Nexora (which document at which stage). Use a Markdown table (| a | b |) inside "answer" for a small comparison; a big one goes in "tables".',
   'Reply in the SAME language the person used: English → English; Gujarati (in Gujarati script or in English letters) → Gujarati in Gujarati script; Hindi → Hindi in Devanagari. Keep document numbers, tokens, codes and Nexora button names in English; write numbers with the digits 0-9 (1200 kg, never ૧૨૦૦). Set "lang" to en, gu or hi accordingly.',
   'Answer ONLY with JSON: {"transcript": string (what the person said, when it came as a recording), "lang": "en"|"gu"|"hi", "answer": string, "steps": [ ... ], "tables": [ ... ]}.'
 ].join('\n');
@@ -436,7 +438,7 @@ async function askOnce(device, system, prompt, fetchImpl, again) {
   let name = await resolveModel(false, fetchImpl);
   if (!name) return { fail: { httpStatus: 503, body: { error: 'AI_MODEL', message: 'Nexora AI has no model it can use right now.' } } };
   const payloadFor = (n) => {
-    const gc = { temperature: 0.2, responseMimeType: 'application/json', maxOutputTokens: 4096 };
+    const gc = { temperature: 0.2, responseMimeType: 'application/json', maxOutputTokens: 6144 };
     const th = thinkingFor(n);
     if (th) gc.thinkingConfig = th;
     return JSON.stringify({ systemInstruction: { parts: [{ text: system }] }, contents: prompt.contents, generationConfig: gc });
@@ -491,5 +493,5 @@ export async function assist(device, payload, lang, fetchImpl) {
   const tables = cleanTables(j.tables);
   const l = String(j.lang || '').toLowerCase();
   return { httpStatus: 200, body: { ok: true, model: a.model, left: a.left, transcript: str(j.transcript, 1200),
-    lang: l === 'gu' || l === 'hi' ? l : 'en', answer: str(j.answer, 4000), steps: checked.steps, dropped: checked.dropped, tables: tables } };
+    lang: l === 'gu' || l === 'hi' ? l : 'en', answer: str(j.answer, 9000), steps: checked.steps, dropped: checked.dropped, tables: tables } };
 }
