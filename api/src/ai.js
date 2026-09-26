@@ -70,6 +70,7 @@ function scrub(s) {
 
 /* ---- the model ---------------------------------------------------------- */
 let model = { name: null, at: 0, error: null, available: [] };
+let allNames = [];                   /* 4.67.8 — every model the key lists, the voice ones too */
 let resolving = null;
 
 async function gfetch(url, opts, fetchImpl, ms) {
@@ -99,6 +100,7 @@ export async function resolveModel(force, fetchImpl) {
       const names = ((r.body && r.body.models) || [])
         .filter((m) => (m.supportedGenerationMethods || []).indexOf('generateContent') > -1)
         .map((m) => String(m.name || '').replace(/^models\//, ''));
+      allNames = ((r.body && r.body.models) || []).map((m) => String(m.name || '').replace(/^models\//, ''));
       const pick = (names.indexOf(wanted) > -1 && !blocked.has(wanted)) ? wanted : bestOf(names);
       model = { name: pick, at: Date.now(), error: pick ? (pick === wanted ? null : 'asked for ' + wanted + ', using ' + pick) : 'no usable model on this key', available: names.slice(0, 40) };
     } catch (e) {
@@ -726,6 +728,7 @@ export function cleanAssist(p) {
       constructions: list(r && r.constructions, 30).map((s) => str(s, 60)), stages: cleanSecs(r && r.stages) })).filter((r) => r.name),
     materials: list(x.materials, 300).map((m) => ({ code: str(m && m.code, 40), name: str(m && m.name, 60), group: str(m && m.group, 30), rate: nr(m && m.rate) })).filter((m) => m.code),
     rules: list(x.rules, 30).map((r) => str(r, 300)).filter(Boolean),
+    voice: !!x.voice,
     /* 4.67.7 — the plant's saved work by NUMBER and technical figures (never an item name or a customer) */
     records: list(x.records, 120).map((r) => ({ n: str(r && r.n, 30), construction: str(r && r.construction, 60), width: nr(r && r.width), length: nr(r && r.length),
       gsm: nr(r && r.gsm), weight: nr(r && r.weight), target: nr(r && r.target), bags: nr(r && r.bags), status: str(r && r.status, 16), date: str(r && r.date, 10),
@@ -843,7 +846,8 @@ const ASSIST_SYSTEM = [
   'ALLOWED says what this person may do (cost = may see costs; rm, price, constants, route, quote, compare, targetcost, priceimpact, notes). Never propose a step for what is false; say who can do it (an administrator in Settings \u2192 Users).',
   'BE THE EXPERT, EASY AND EXACT. Write the answer for a busy person who does not know the software: first the result in one line, then the reason. Use short lines; "- " bullets; "1. 2. 3." for steps to follow; **bold** for the key figure; a table ("| a | b |" rows) when comparing. Use ONLY figures from CONTEXT or that you work out from them — show the working in one line (e.g. denier = GSM x DENIER FACTOR / (warp + weft) with the plant\u2019s own constant), and mark any estimate as an estimate. "How do I…" → numbered steps in the person\u2019s words, plus a "guide" step at the first button (and "open" when it is on another window). When the person only asks, answer — no steps.',
   'NEXT: give "next" — up to 3 short follow-ups the person is likely to want now, in THEIR language, each a complete request Nexora AI could do (e.g. "Save it and open the BOM", "Compare it with CAL-2026-000012").',
-  'Answer ONLY with JSON: {"transcript": string, "lang": "en"|"gu"|"hi", "answer": string, "steps": [ ... ], "remember": string or null, "forget": [string], "next": [string]}.'
+  'BY VOICE (4.67.8): when VOICE is true the answer is SPOKEN to the person — two or three short spoken sentences, no table, no list, no symbols; the plan still carries every step. When the person asks to go ahead with the plan already shown and adds nothing new ("run", "run karo", "chalavo", "haa, karo", "kari do", "go ahead", "चलाओ", "कर दो"), answer "run": true with no steps. A voice transcript may mishear a number: repeat the figures you understood in the answer.',
+  'Answer ONLY with JSON: {"transcript": string, "lang": "en"|"gu"|"hi", "answer": string, "steps": [ ... ], "remember": string or null, "forget": [string], "next": [string], "run": true|false}.'
 ].join('\n');
 
 /** What a construction needs, read from its own fields and its name: the processes its layers and parts call for. */
@@ -1153,7 +1157,7 @@ export async function assist(companyId, payload, lang, fetchImpl) {
   const m = mediaParts(payload);
   if (m.error) return m.error;
   if (!p.text && !m.parts.length) return { httpStatus: 400, body: { error: 'NOTHING', message: 'Say or type something first.' } };
-  const ctx = { SCREEN: p.screen, UNITS: p.units, RULES: p.rules, ALLOWED: p.allowed, NOW: p.now, CONSTRUCTIONS: p.constructions, FIELDS: p.fields, PROCESSES: p.processes,
+  const ctx = { SCREEN: p.screen, VOICE: p.voice, UNITS: p.units, RULES: p.rules, ALLOWED: p.allowed, NOW: p.now, CONSTRUCTIONS: p.constructions, FIELDS: p.fields, PROCESSES: p.processes,
     ROUTES: p.routes, MATERIALS: p.materials, GROUPS: p.groups, CONSTANTS: p.constants, FIGURES: p.figures, RECORDS: p.records, BOMS: p.boms, QUOTES: p.quotes,
     WORKFLOWLIST: p.workflowList, LEARNED: p.learned, HELP_TOPICS: p.topics };
   const contents = [{ role: 'user', parts: [{ text: 'CONTEXT:\n' + JSON.stringify(ctx) }] },
@@ -1181,5 +1185,90 @@ export async function assist(companyId, payload, lang, fetchImpl) {
     lang: l === 'gu' || l === 'hi' ? l : 'en', answer: answer,
     steps: checked.steps, missing: checked.missing, dropped: checked.dropped, notes: checked.notes, remember: j.remember ? str(j.remember, 300) : null,
     forget: list(j.forget, 10).map((x) => str(x, 300)).filter((x) => p.rules.indexOf(x) > -1),
-    next: list(j.next, 3).map((x) => str(x, 120)).filter(Boolean) } };
+    next: list(j.next, 3).map((x) => str(x, 120)).filter(Boolean),
+    run: j.run === true && !checked.steps.length } };
+}
+
+/* ==========================================================================
+   4.67.8 — "does app support continues conversation via voice in multi
+   language?" · "go". The answer read aloud, in English, Gujarati or Hindi,
+   by Google's speech model (the application uses the computer's own voice
+   first and asks here only when it has none for the language — Gujarati,
+   on most Windows computers). Only the answer's words come here, never
+   anything else; the voice goes back as audio.
+   ========================================================================== */
+const speakRecent = [];
+const speakPerCompany = new Map();
+function takeSpeak(companyId) {
+  const now = Date.now();
+  while (speakRecent.length && now - speakRecent[0] > 60000) speakRecent.shift();
+  if (speakRecent.length >= (Math.max(1, parseInt(process.env.AI_SPEAK_PER_MINUTE, 10) || 12))) return { busy: true };
+  const k = String(companyId || 'none'); const c = speakPerCompany.get(k); const d = today();
+  const used = c && c.day === d ? c.n : 0;
+  if (used >= (Math.max(1, parseInt(process.env.AI_SPEAK_DAILY, 10) || 200))) return { spent: true };
+  speakPerCompany.set(k, { day: d, n: used + 1 }); speakRecent.push(now);
+  return {};
+}
+export function _resetSpeak() { speakRecent.length = 0; speakPerCompany.clear(); }
+/** The voice model: GEMINI_TTS_MODEL, else the newest Flash-Lite TTS the key lists (it answers soonest), else Flash TTS. */
+export function ttsOf(names) {
+  const env = String(process.env.GEMINI_TTS_MODEL || '').trim().replace(/^models\//, '');
+  if (env) return env;
+  const ver = (n) => { const m = /gemini-(\d+)(?:\.(\d+))?/.exec(n); return m ? Number(m[1]) * 1000 + Number(m[2] || 0) : 0; };
+  const pick = (re) => names.filter((n) => re.test(n) && !blocked.has(n)).sort((a, b) => ver(b) - ver(a))[0];
+  return pick(/flash-lite.*tts|tts.*flash-lite/) || pick(/flash.*tts/) || 'gemini-3.8-flash-lite-tts';
+}
+/** Words that read well aloud: no marks, no table, not too long. */
+export function speakable(t) {
+  const lines = String(t || '').split('\n').filter((l) => !/^\s*\|/.test(l)).map((l) => l.replace(/^\s*(?:[-*•]|\d+[.)])\s+/, ''));
+  let x = lines.join(' ').replace(/\*\*|__|`|#{1,4}\s/g, '').replace(/^\s*[-*\u2022]\s+/gm, '').replace(/[\u2726\u2714\u2713\u{1F4CC}\u{1F5D1}]/gu, '')
+    .replace(/\s+/g, ' ').trim();
+  if (x.length > 700) { const cut = x.slice(0, 700); const end = Math.max(cut.lastIndexOf('. '), cut.lastIndexOf('\u0964'), cut.lastIndexOf('? ')); x = end > 200 ? cut.slice(0, end + 1) : cut; }
+  return x;
+}
+function audioOf(body) {
+  /* the interactions answer: steps[].content[] of type audio */
+  const steps = (body && body.steps) || [];
+  for (let i = steps.length - 1; i >= 0; i--) {
+    const c = (steps[i] && steps[i].content) || [];
+    for (let j = c.length - 1; j >= 0; j--) if (c[j] && c[j].type === 'audio' && c[j].data) return { data: c[j].data, mime: c[j].mime_type || c[j].mimeType || 'audio/wav' };
+  }
+  /* the generateContent answer: candidates[0].content.parts[].inlineData */
+  const parts = ((((body && body.candidates) || [])[0] || {}).content || {}).parts || [];
+  for (let i = 0; i < parts.length; i++) { const d = parts[i] && (parts[i].inlineData || parts[i].inline_data); if (d && d.data) return { data: d.data, mime: d.mimeType || d.mime_type || 'audio/L16;rate=24000' }; }
+  return null;
+}
+/** POST /v1/ai/speak {text, lang} → {ok, mime, data} */
+export async function speak(companyId, payload, lang, fetchImpl) {
+  if (!aiConfigured()) return { httpStatus: 503, body: { error: 'AI_OFF', message: 'Nexora AI is not switched on at the service yet.' } };
+  const x = payload && typeof payload === 'object' ? payload : {};
+  const text = speakable(x.text);
+  if (!text) return { httpStatus: 400, body: { error: 'NOTHING', message: 'Nothing to say.' } };
+  const t = takeSpeak(companyId);
+  if (t.busy) return { httpStatus: 429, body: { error: 'AI_BUSY', message: 'Nexora AI is speaking for others — the answer is on the screen.' } };
+  if (t.spent) return { httpStatus: 429, body: { error: 'AI_DAILY', message: 'Today\u2019s spoken answers are used up — the answers stay on the screen.' } };
+  await resolveModel(false, fetchImpl);
+  const name = ttsOf(allNames.length ? allNames : model.available || []);
+  const voice = String(process.env.GEMINI_TTS_VOICE || 'Kore').trim();
+  const say = [{ type: 'text', text: text }];
+  let r = null;
+  try {
+    r = await gfetch(API + '/interactions', { method: 'POST', body: JSON.stringify({ model: name, input: [{ type: 'user_input', content: say }],
+      response_format: { type: 'audio' }, generation_config: { speech_config: [{ voice: voice }] } }) }, fetchImpl, 30000);
+  } catch (e) { r = null; }
+  let a = r && r.ok ? audioOf(r.body) : null;
+  if (!a) {
+    /* the older way of asking the same model */
+    try {
+      r = await gfetch(API + '/models/' + encodeURIComponent(name) + ':generateContent', { method: 'POST', body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: text }] }],
+        generationConfig: { responseModalities: ['AUDIO'], speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voice } } } } }) }, fetchImpl, 30000);
+    } catch (e) { return { httpStatus: 504, body: { error: 'AI_TIMEOUT', message: 'The voice did not come in time — the answer is on the screen.' } }; }
+    a = r && r.ok ? audioOf(r.body) : null;
+  }
+  if (!a) {
+    const busy = r && r.status === 429;
+    return { httpStatus: busy ? 429 : 502, body: { error: busy ? 'AI_BUSY' : 'AI_VOICE', message: busy ? 'The voice is busy — the answer is on the screen.' :
+      'The answer could not be spoken (' + (r ? r.status : 'no answer') + ': ' + scrub(r && r.body && r.body.error && r.body.error.message) + ').' } };
+  }
+  return { httpStatus: 200, body: { ok: true, model: name, mime: a.mime, data: a.data, lang: ['gu', 'hi'].indexOf(lang) > -1 ? lang : 'en' } };
 }
