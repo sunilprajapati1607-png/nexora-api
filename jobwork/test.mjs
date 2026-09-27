@@ -3,7 +3,7 @@
    party's name, an item's name and money never leave this service. */
 import assert from 'node:assert/strict';
 import { handle } from './server.js';
-import { strongModel, _blocked as _blockedSet, cleanAssist, checkSteps, cleanTables, _resetLimits, resolveModel, thinkingFor, _noThinking, readJsonAnswer, earModel, voiceModel } from './src/ai.js';
+import { _resting, strongModel, _blocked as _blockedSet, cleanAssist, checkSteps, cleanTables, _resetLimits, resolveModel, thinkingFor, _noThinking, readJsonAnswer, earModel, voiceModel } from './src/ai.js';
 
 let pass = 0;
 process.env.GEMINI_MODEL_STRONG = 'off';
@@ -313,6 +313,25 @@ await t('remember, forget, next and run come back; guide and note are checked', 
   assert.deepEqual(r.json.steps, [{ do: 'guide', view: 'plans', button: 'New', say: 'Press New' }, { do: 'note', text: 'call P1' }]);
   const run = await call('POST', '/v1/ai/assist', { device: 'dev-rules002', assist: { text: 'run karo' } }, fakeGoogle({ lang: 'gu', answer: 'ok', run: true, steps: [] }));
   assert.equal(run.json.run, true);
+});
+
+await t('a strong model that says 429 rests, and the next Flash is asked', async () => {
+  delete process.env.GEMINI_MODEL_STRONG;
+  _resetLimits(); _blockedReset(); _resting().clear();
+  const list = async (url, init) => {
+    if (/\/models\?/.test(url)) return new Response(JSON.stringify({ models: ['gemini-3.5-flash-lite', 'gemini-3.8-flash', 'gemini-3.5-flash'].map((n) => ({ name: 'models/' + n, supportedGenerationMethods: ['generateContent'] })) }), { status: 200 });
+    if (/gemini-3\.8-flash:generateContent/.test(url)) return new Response(JSON.stringify({ error: { message: 'quota' } }), { status: 429 });
+    return fakeGoogle({ lang: 'en', answer: 'from ' + url.replace(/.*models\/|:generateContent/g, ''), steps: [] })(url, init);
+  };
+  await resolveModel(true, list);
+  assert.equal(strongModel(), 'gemini-3.8-flash');
+  const a = await call('POST', '/v1/ai/assist', { device: 'dev-rest0001', assist: { text: 'why' } }, list);
+  assert.equal(a.json.model, 'gemini-3.5-flash-lite');
+  assert.equal(strongModel(), 'gemini-3.5-flash');
+  const b = await call('POST', '/v1/ai/assist', { device: 'dev-rest0002', assist: { text: 'why' } }, list);
+  assert.equal(b.json.model, 'gemini-3.5-flash');
+  _resting().clear(); process.env.GEMINI_MODEL_STRONG = 'off';
+  await resolveModel(true, fakeGoogle({}));
 });
 
 console.log(pass + ' passed');

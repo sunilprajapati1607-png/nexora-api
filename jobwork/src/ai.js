@@ -138,12 +138,17 @@ function flashRank(n) {
    slow or refuses, Flash-Lite answers the same question. Not for a voice turn — a person waiting on
    a spoken answer wants it now. GEMINI_MODEL_STRONG names another; "off" keeps Lite for all. */
 const STRONG_MS = Math.max(5000, parseInt(process.env.AI_STRONG_MS, 10) || 20000);
+/* measured 2026-09-27: the newest Flash answered 429 at once — this key has little free allowance
+   for it. A model that says 429 rests fifteen minutes and the next Flash is asked instead. */
+const resting = new Map();          // model -> until (ms)
+export function _resting() { return resting; }
 export function strongModel() {
   const env = String(process.env.GEMINI_MODEL_STRONG || '').trim().replace(/^models\//, '');
   if (env.toLowerCase() === 'off') return null;
   const names = model.available || [];
-  if (env) return names.indexOf(env) > -1 && !blocked.has(env) ? env : null;
-  const f = names.filter((n) => !blocked.has(n) && flashRank(n) !== null);
+  const awake = (n) => !(resting.get(n) > Date.now());
+  if (env) return names.indexOf(env) > -1 && !blocked.has(env) && awake(env) ? env : null;
+  const f = names.filter((n) => !blocked.has(n) && flashRank(n) !== null && awake(n));
   f.sort((a, b) => flashRank(b) - flashRank(a));
   return f[0] || null;
 }
@@ -332,7 +337,7 @@ const STEP_LIST = [
   '{"do":"qc","plan":PLAN NO} — open the QC test for a plan.',
   '{"do":"release","plan":PLAN NO} — open Release to FG for a plan (after QC passed).',
   '{"do":"invoice","plan":PLAN NO} — open a job-work invoice for a plan (Nexora puts the rates; you never see them).',
-  '{"do":"guide","view":VIEW,"button":the words on a button, tab, field or menu item of that window,"say":one short line} — SHOW the person where to press: Nexora opens that window and points at it, with the line. For every "how do I…" / "kya dabavu" / "kevi rite" add one (it runs by itself).',
+  '{"do":"guide","view":VIEW,"button":the words on a button, tab, field or menu item of that window,"say":one short line} — SHOW the person where to press: Nexora opens that window and points at it, with the line. It runs by itself. EVERY answer to "how do I…", "how to…", "where is…", "show me where", "kevi rite", "kya dabavu", "kaha hai" MUST carry one guide step: the window and the words on the FIRST button to press (e.g. view "porders", button "New").',
   '{"do":"note","text":words} — put a note on the person\u2019s own notes pad (names as P/I tokens; Nexora writes the names).'
 ];
 
@@ -349,6 +354,7 @@ const SYSTEM = [
   'STANDING INSTRUCTIONS: when the person says how things should ALWAYS be done ("from next time\u2026", "always\u2026", "hamesha\u2026", "have thi\u2026", "\u0939\u092e\u0947\u0936\u093e\u2026"), put it in "remember" as one short sentence. RULES are the instructions already given \u2014 follow every one of them, every time. When asked to drop one ("forget \u2026", "no longer \u2026"), put its exact text from RULES in "forget".',
   'NEXT: give "next" \u2014 up to 3 short follow-ups the person is likely to want now, in THEIR language, each a complete request you could do (e.g. "Issue 500 kg FIFO on JW-2026-A-000002", "Group it by month").',
   'RUN BY VOICE: when the person asks to go ahead with the plan already shown and adds nothing new ("run", "run karo", "chalavo", "haa, karo", "kari do", "go ahead", "\u091a\u0932\u093e\u0913", "\u0915\u0930 \u0926\u094b"), answer "run": true with no steps. A spoken question may mishear a number: repeat the figures you understood.',
+  'Write every P and I token EXACTLY as given, in Latin letters and digits (P3, I1) — never translated or transliterated (not \u0a86\u0a87 \u0ae7, not \u0906\u0908 1), in "answer", "tables", "speech" and "next" alike.',
   'Never mention tokens to the person: write P3 or I7 where the name goes (Nexora puts the name there), but never words like "token", "P token" or "code P1" — in "answer" and in "tables" alike.',
   'When the person asks for work to be done, return STEPS. Steps allowed: ' + STEP_LIST.join(' '),
   'Steps that make a document (newplan, receipt, porder, issue, production) only FILL the form — the person reads it and presses Post; Nexora checks it then. Use only plan and order numbers from PLANS and ORDERS, and only P and I tokens from PARTIES and ITEMS. Quantities are kg unless the person says the second unit (bags, pieces, rolls → qty2). "1.2 ton" is 1200 kg. Leave out a step the screen shows is already done. When the person corrects you ("no, 900 kg"), return the whole corrected list of steps again.',
@@ -532,6 +538,7 @@ async function askOnce(device, system, prompt, fetchImpl, again, opts) {
     let rs = null;
     try { rs = await gfetch(API + '/models/' + encodeURIComponent(strong) + ':generateContent', { method: 'POST', body: payloadFor(strong) }, fetchImpl, STRONG_MS); } catch (e) { rs = null; }
     if (rs && rs.status === 400 && /think/i.test(String((rs.body && rs.body.error && rs.body.error.message) || ''))) noThinking.add(strong);
+    if (rs && rs.status === 429) resting.set(strong, Date.now() + 15 * 60 * 1000);
     if (rs && rs.ok) { const got = readJsonAnswer(rs.body); if (got) return { json: got, model: strong, left: t.left }; }
     console.log('ai strong ' + (rs ? rs.status : 'timeout') + ' after ' + (Date.now() - ts) + ' ms, Lite answers');
   }
