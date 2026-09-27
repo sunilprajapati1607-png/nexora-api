@@ -3,9 +3,10 @@
    party's name, an item's name and money never leave this service. */
 import assert from 'node:assert/strict';
 import { handle } from './server.js';
-import { _blocked as _blockedSet, cleanAssist, checkSteps, cleanTables, _resetLimits, resolveModel, thinkingFor, _noThinking, readJsonAnswer, earModel, voiceModel } from './src/ai.js';
+import { strongModel, _blocked as _blockedSet, cleanAssist, checkSteps, cleanTables, _resetLimits, resolveModel, thinkingFor, _noThinking, readJsonAnswer, earModel, voiceModel } from './src/ai.js';
 
 let pass = 0;
+process.env.GEMINI_MODEL_STRONG = 'off';
 const _blockedReset = () => { try { _blockedSet().clear(); } catch (e) {} };
 const t = async (name, fn) => { try { await fn(); pass++; console.log('ok   ' + name); } catch (e) { console.error('FAIL ' + name + '\n', e); process.exitCode = 1; } };
 
@@ -284,6 +285,34 @@ await t('the ear: a busy Flash (503) hands the recording to Lite', async () => {
   };
   const r = await call('POST', '/v1/ai/transcribe', { device: 'dev-ear00002', lang: 'gu', careful: true, audio: { mime: 'audio/wav', data: 'AAAA' } }, busy);
   assert.equal(r.status, 200, JSON.stringify(r.json)); assert.equal(r.json.model, 'gemini-3.5-flash-lite'); assert.equal(r.json.text, 'stock ketlo che');
+});
+
+await t('the stronger model answers first; when it is busy, Lite answers the same question; a voice turn goes to Lite', async () => {
+  delete process.env.GEMINI_MODEL_STRONG;
+  _resetLimits(); _blockedReset(); sent.length = 0;
+  await resolveModel(true, fakeGoogle({}));
+  assert.equal(strongModel(), 'gemini-3.5-flash');
+  const ok = await call('POST', '/v1/ai/assist', { device: 'dev-strong01', assist: { text: 'why is my yield low' } }, fakeGoogle({ lang: 'en', answer: 'strong', steps: [] }));
+  assert.equal(ok.json.model, 'gemini-3.5-flash');
+  const busy = async (url, init) => /gemini-3\.5-flash:generateContent/.test(url) ? new Response(JSON.stringify({ error: { message: 'overloaded' } }), { status: 503 }) : fakeGoogle({ lang: 'en', answer: 'lite', steps: [] })(url, init);
+  const fb = await call('POST', '/v1/ai/assist', { device: 'dev-strong02', assist: { text: 'why' } }, busy);
+  assert.equal(fb.json.model, 'gemini-3.5-flash-lite'); assert.equal(fb.json.answer, 'lite');
+  sent.length = 0;
+  const v = await call('POST', '/v1/ai/assist', { device: 'dev-strong03', assist: { text: 'stock', voice: true } }, fakeGoogle({ lang: 'en', answer: 'x', speech: 'x', steps: [] }));
+  assert.equal(v.json.model, 'gemini-3.5-flash-lite');
+  assert.ok(!sent.some((x) => /gemini-3\.5-flash:generateContent/.test(x.url)));
+  process.env.GEMINI_MODEL_STRONG = 'off';
+});
+
+await t('remember, forget, next and run come back; guide and note are checked', async () => {
+  _resetLimits();
+  const r = await call('POST', '/v1/ai/assist', { device: 'dev-rules001', assist: { text: 'hamesha FEFO', rules: ['Always FIFO'], role: 'OPERATOR', allowed: ['ISSUE'] } },
+    fakeGoogle({ lang: 'gu', answer: 'ok', remember: 'Always issue FEFO.', forget: ['Always FIFO'], next: ['a', 'b', 'c', 'd'], run: false,
+      steps: [{ do: 'guide', view: 'plans', button: 'New', say: 'Press New' }, { do: 'guide', view: 'nowhere' }, { do: 'note', text: 'call P1' }] }));
+  assert.equal(r.json.remember, 'Always issue FEFO.'); assert.deepEqual(r.json.forget, ['Always FIFO']); assert.equal(r.json.next.length, 3);
+  assert.deepEqual(r.json.steps, [{ do: 'guide', view: 'plans', button: 'New', say: 'Press New' }, { do: 'note', text: 'call P1' }]);
+  const run = await call('POST', '/v1/ai/assist', { device: 'dev-rules002', assist: { text: 'run karo' } }, fakeGoogle({ lang: 'gu', answer: 'ok', run: true, steps: [] }));
+  assert.equal(run.json.run, true);
 });
 
 console.log(pass + ' passed');

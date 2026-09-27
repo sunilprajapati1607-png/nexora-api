@@ -79,10 +79,10 @@ function scrub(s) {
 let model = { name: null, at: 0, error: null };
 let resolving = null;
 
-async function gfetch(url, opts, fetchImpl) {
+async function gfetch(url, opts, fetchImpl, ms) {
   const f = fetchImpl || globalThis.fetch;
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
+  const timer = setTimeout(() => ctrl.abort(), ms || TIMEOUT_MS);
   try {
     const r = await f(url, Object.assign({}, opts, { signal: ctrl.signal,
       headers: Object.assign({ 'content-type': 'application/json', 'x-goog-api-key': key() }, (opts && opts.headers) || {}) }));
@@ -118,7 +118,7 @@ export async function resolveModel(force, fetchImpl) {
 /** For /health — cached, never waits on Google. */
 export function aiStatus() {
   if (aiConfigured() && (!model.at || Date.now() - model.at > MODEL_TTL_MS)) resolveModel(false).catch(() => {});
-  return { configured: aiConfigured(), keyFrom: keySource(), model: model.name, ear: earModel(), voice: voiceModel(), note: model.error || null };
+  return { configured: aiConfigured(), keyFrom: keySource(), model: model.name, strong: strongModel(), ear: earModel(), voice: voiceModel(), note: model.error || null };
 }
 
 /* ---- the ear and the voice (2.0.3) ------------------------------------------
@@ -132,6 +132,20 @@ export function aiStatus() {
 function flashRank(n) {
   const m = /^gemini-(\d+)(?:\.(\d+))?-flash(?:-(\d{3}))?$/.exec(n);
   return m ? Number(m[1]) * 1000 + Number(m[2] || 0) * 10 + (m[3] ? 0 : 1) : null;
+}
+/* 2.0.4 — from the weight calculator 4.67.7 ("haju strong generative ai jevu banavo"): the newest
+   plain Flash (it reasons before it answers) is asked first, within STRONG_MS; when it is busy,
+   slow or refuses, Flash-Lite answers the same question. Not for a voice turn — a person waiting on
+   a spoken answer wants it now. GEMINI_MODEL_STRONG names another; "off" keeps Lite for all. */
+const STRONG_MS = Math.max(5000, parseInt(process.env.AI_STRONG_MS, 10) || 20000);
+export function strongModel() {
+  const env = String(process.env.GEMINI_MODEL_STRONG || '').trim().replace(/^models\//, '');
+  if (env.toLowerCase() === 'off') return null;
+  const names = model.available || [];
+  if (env) return names.indexOf(env) > -1 && !blocked.has(env) ? env : null;
+  const f = names.filter((n) => !blocked.has(n) && flashRank(n) !== null);
+  f.sort((a, b) => flashRank(b) - flashRank(a));
+  return f[0] || null;
 }
 export function earModel() {
   const env = String(process.env.GEMINI_AUDIO_MODEL || '').trim();
@@ -266,6 +280,9 @@ export function cleanAssist(p) {
       kg: nr(a && a.kg), days: nr(a && a.days), who: str(a && a.who, 30) })).filter((a) => a.what),
     /* what the window shows — names as tokens, money taken out, by the application */
     screenText: text(x.screenText, 3500),
+    /* 2.0.4 — the person's role and what it may post; the instructions they asked to be kept */
+    role: str(x.role, 20), allowed: list(x.allowed, 12).map((a) => str(a, 30)).filter(Boolean),
+    rules: list(x.rules, 20).map((r) => str(r, 300)).filter(Boolean),
     /* what is open on the screen — numbers and tokens only */
     now: { plan: docNo(n.plan), order: docNo(n.order), doc: docNo(n.doc), batch: docNo(n.batch), form: str(n.form, 40), note: str(n.note, 300) }
   };
@@ -314,7 +331,9 @@ const STEP_LIST = [
   '{"do":"production","plan":PLAN NO,"order":ORDER NO or null,"item":I TOKEN,"kg":number,"qty2":number or null} — fill a production receipt (what came off the machine).',
   '{"do":"qc","plan":PLAN NO} — open the QC test for a plan.',
   '{"do":"release","plan":PLAN NO} — open Release to FG for a plan (after QC passed).',
-  '{"do":"invoice","plan":PLAN NO} — open a job-work invoice for a plan (Nexora puts the rates; you never see them).'
+  '{"do":"invoice","plan":PLAN NO} — open a job-work invoice for a plan (Nexora puts the rates; you never see them).',
+  '{"do":"guide","view":VIEW,"button":the words on a button, tab, field or menu item of that window,"say":one short line} — SHOW the person where to press: Nexora opens that window and points at it, with the line. For every "how do I…" / "kya dabavu" / "kevi rite" add one (it runs by itself).',
+  '{"do":"note","text":words} — put a note on the person\u2019s own notes pad (names as P/I tokens; Nexora writes the names).'
 ];
 
 const SYSTEM = [
@@ -325,6 +344,11 @@ const SYSTEM = [
   'TABLES. Whenever the answer is a list, a comparison or figures from the plant\u2019s data — stock, movements, plans, orders, batches, challans, invoices, QC, "which", "how much", "list", "total", "party wise", "month wise" — return a "table" step (more than one if useful). Nexora works it out EXACTLY from its own book, with the real names and a total row; you do NOT add up or copy figures into "answer" — say in one line what the table shows and what to notice. A table step runs by itself; the person does not press Run. For knowledge that is naturally a table (a comparison, a checklist, a schedule), put it in "tables": [{"title": string, "columns": [string, …], "rows": [[cell, …], …], "total": true|false}] — "total": true only when a column is a quantity to add. NEVER copy the plant\u2019s own figures (stock, kg, plans, orders, invoices) into "tables" — the plant\u2019s data always goes as a table step, and never both.',
   'The summary you are given (PLANS, ORDERS, STOCK, PENDING) is for understanding what the person means; when you are not sure it holds everything, ask for a table.',
   'ATTENTION is what needs somebody NOW, worked out by Nexora from the book: each open plan\u2019s next step, problems and exceptions, challans near or past the GST limit, QC waiting, batches near expiry, material still to issue on open orders — with level (problem, warning, todo) and who usually does it (stores, production, QC, office). For "what needs attention", "what is pending", "what should I do today", "kone shu karvanu che", "shu baki che", "kya pending hai" answer FROM ATTENTION: problems first, then warnings, then the to-dos, grouped by who does them, each with the plan or order number, what to do and where in Nexora (window and button in bold); offer to fill the first one. If ATTENTION is empty, say nothing is waiting. SCREEN_TEXT is what the person\u2019s window shows (names as tokens, money taken out): use it for questions about "this", "here", "this screen" or "the dashboard".',
+  'BE THE EXPERT, EASY AND EXACT: first the result in one line, then the reason; short lines, bullets, numbered steps for anything done in order, **bold** for the key figure; figures only from CONTEXT or a table step, with the working in one line when you work one out.',
+  'ROLE and ALLOWED say what this person may post (MANAGER and ADMIN: everything). Never propose a document step for a kind they may not post; say who can (a Supervisor or Manager, or Settings \u2192 Who is posting).',
+  'STANDING INSTRUCTIONS: when the person says how things should ALWAYS be done ("from next time\u2026", "always\u2026", "hamesha\u2026", "have thi\u2026", "\u0939\u092e\u0947\u0936\u093e\u2026"), put it in "remember" as one short sentence. RULES are the instructions already given \u2014 follow every one of them, every time. When asked to drop one ("forget \u2026", "no longer \u2026"), put its exact text from RULES in "forget".',
+  'NEXT: give "next" \u2014 up to 3 short follow-ups the person is likely to want now, in THEIR language, each a complete request you could do (e.g. "Issue 500 kg FIFO on JW-2026-A-000002", "Group it by month").',
+  'RUN BY VOICE: when the person asks to go ahead with the plan already shown and adds nothing new ("run", "run karo", "chalavo", "haa, karo", "kari do", "go ahead", "\u091a\u0932\u093e\u0913", "\u0915\u0930 \u0926\u094b"), answer "run": true with no steps. A spoken question may mishear a number: repeat the figures you understood.',
   'Never mention tokens to the person: write P3 or I7 where the name goes (Nexora puts the name there), but never words like "token", "P token" or "code P1" — in "answer" and in "tables" alike.',
   'When the person asks for work to be done, return STEPS. Steps allowed: ' + STEP_LIST.join(' '),
   'Steps that make a document (newplan, receipt, porder, issue, production) only FILL the form — the person reads it and presses Post; Nexora checks it then. Use only plan and order numbers from PLANS and ORDERS, and only P and I tokens from PARTIES and ITEMS. Quantities are kg unless the person says the second unit (bags, pieces, rolls → qty2). "1.2 ton" is 1200 kg. Leave out a step the screen shows is already done. When the person corrects you ("no, 900 kg"), return the whole corrected list of steps again.',
@@ -333,7 +357,7 @@ const SYSTEM = [
   'HOW TO WRITE "answer" (Markdown, it is drawn on the screen): for a figure or a yes/no, one or two lines. For an explanation, a process, a procedure, a rule or a "how do I", write it ELABORATED and STRUCTURED, never one paragraph: "## " headings; numbered steps ("1. ", with the digits 0-9 — never ૧ ૨ ૩ or १ २ ३, in headings too) for anything done in order, each step saying what is done, by whom or at which stage, and where in Nexora (window and button in **bold**); "- " bullets for points; **bold** for key terms and figures; a short "## Checks" or "## Common mistakes" and a "## Tip" where they help. For a plant process (extrusion, weaving, lamination, printing, stitching…) cover: purpose, input and output, the steps, settings/parameters usually watched, typical waste %, quality checks, and how it is recorded in Nexora (which document at which stage). Use a Markdown table (| a | b |) inside "answer" for a small comparison; a big one goes in "tables".',
   'Reply in the SAME language the person used: English → English; Gujarati (in Gujarati script or in English letters) → Gujarati in Gujarati script; Hindi → Hindi in Devanagari. Keep document numbers, tokens, codes and Nexora button names in English; write numbers with the digits 0-9 (1200 kg, never ૧૨૦૦). Set "lang" to en, gu or hi accordingly.',
   'When VOICE is true the person is TALKING with you and will HEAR "speech": put in "speech" what to say aloud — two to four short spoken sentences in the person\u2019s language, no Markdown, no symbols, numbers said plainly, a table only summed up ("the table is on your screen"); and, when that language is not English, the same in simple English in "speechEn". "answer" still carries the full written answer. End "speech" with a short follow-up question only when one is natural.',
-  'Answer ONLY with JSON: {"transcript": string (what the person said, when it came as a recording), "lang": "en"|"gu"|"hi", "answer": string, "speech": string (only when VOICE), "speechEn": string (only when VOICE and not English), "steps": [ ... ], "tables": [ ... ]}.'
+  'Answer ONLY with JSON: {"transcript": string (what the person said, when it came as a recording), "lang": "en"|"gu"|"hi", "answer": string, "speech": string (only when VOICE), "speechEn": string (only when VOICE and not English), "steps": [ ... ], "tables": [ ... ], "remember": string or null, "forget": [string], "next": [string], "run": true|false}.'
 ].join('\n');
 
 /** A knowledge table in the answer: at most 4, 12 columns, 80 rows; text or numbers only. */
@@ -426,6 +450,14 @@ export function checkSteps(p, raw) {
       out.push(step);
       return;
     }
+    if (d === 'guide') {
+      const v = oneOf(s.view, VIEWS, null);
+      const b = str(s.button, 60).trim();
+      if (v && v !== 'plan' && v !== 'porder') out.push({ do: 'guide', view: v, button: b, say: str(s.say, 200) });
+      else dropped.push('guide ' + str(s.view, 20));
+      return;
+    }
+    if (d === 'note') { const tx = str(s.text, 500).trim(); if (tx) out.push({ do: 'note', text: tx }); else dropped.push('note'); return; }
     if (d === 'qc' || d === 'release' || d === 'invoice') { const q = plan(s.plan); if (q) out.push({ do: d, plan: q.no }); else dropped.push(d + ' ' + str(s.plan, 30)); return; }
     if (d) dropped.push(str(d, 20));
   });
@@ -450,10 +482,10 @@ export function thinkingFor(name) {
 export function _noThinking() { return noThinking; }
 
 /* ---- one call to Gemini --------------------------------------------------- */
-async function ask(device, system, prompt, fetchImpl) {
+async function ask(device, system, prompt, fetchImpl, opts) {
   const t0 = Date.now();
   const done = (out, what) => { console.log('ai ' + what + ' ' + (Date.now() - t0) + ' ms' + (out && out.model ? ' ' + out.model : '')); return out; };
-  let r0 = await askOnce(device, system, prompt, fetchImpl);
+  let r0 = await askOnce(device, system, prompt, fetchImpl, false, opts);
   /* an answer that could not be read is asked for once more (not counted
      again) — the person should not press Send twice for Google's slip */
   if (r0.fail && r0.fail.body && r0.fail.body.error === 'AI_UNREADABLE') {
@@ -478,7 +510,8 @@ export function readJsonAnswer(body) {
   try { return JSON.parse(text.slice(a, b + 1)); } catch (e) { return null; }
 }
 
-async function askOnce(device, system, prompt, fetchImpl, again) {
+async function askOnce(device, system, prompt, fetchImpl, again, opts) {
+  opts = opts || {};
   if (!aiConfigured()) return { fail: { httpStatus: 503, body: { error: 'AI_OFF', message: 'Nexora AI is not switched on at the service yet.' } } };
   const t = again ? { left: undefined } : take(device);
   if (t.busy) return { fail: { httpStatus: 429, body: { error: 'AI_BUSY', retryAfter: t.busy, message: 'Nexora AI is busy — try again in ' + t.busy + ' seconds.' } } };
@@ -492,6 +525,16 @@ async function askOnce(device, system, prompt, fetchImpl, again) {
     return JSON.stringify({ systemInstruction: { parts: [{ text: system }] }, contents: prompt.contents, generationConfig: gc });
   };
   let r;
+  /* the stronger model first, within its budget; Lite answers when it cannot */
+  const strong = opts.strong && !again ? strongModel() : null;
+  if (strong && strong !== name) {
+    const ts = Date.now();
+    let rs = null;
+    try { rs = await gfetch(API + '/models/' + encodeURIComponent(strong) + ':generateContent', { method: 'POST', body: payloadFor(strong) }, fetchImpl, STRONG_MS); } catch (e) { rs = null; }
+    if (rs && rs.status === 400 && /think/i.test(String((rs.body && rs.body.error && rs.body.error.message) || ''))) noThinking.add(strong);
+    if (rs && rs.ok) { const got = readJsonAnswer(rs.body); if (got) return { json: got, model: strong, left: t.left }; }
+    console.log('ai strong ' + (rs ? rs.status : 'timeout') + ' after ' + (Date.now() - ts) + ' ms, Lite answers');
+  }
   for (let attempt = 0; ; attempt++) {
     try {
       r = await gfetch(API + '/models/' + encodeURIComponent(name) + ':generateContent', { method: 'POST', body: payloadFor(name) }, fetchImpl);
@@ -609,19 +652,21 @@ export async function assist(device, payload, lang, fetchImpl) {
   const m = mediaParts(payload);
   if (m.error) return m.error;
   if (!p.text && !m.parts.length) return { httpStatus: 400, body: { error: 'NOTHING', message: 'Say or type something first.' } };
-  const ctx = { SCREEN: p.screen, SCREEN_TEXT: p.screenText, ATTENTION: p.attention, TODAY: p.today, VOICE: !!(payload && payload.voice), NOW: p.now, PARTIES: p.parties, ITEMS: p.items, GROUPS: p.groups, WAREHOUSES: p.warehouses,
+  const ctx = { SCREEN: p.screen, ROLE: p.role, ALLOWED: p.allowed, RULES: p.rules, SCREEN_TEXT: p.screenText, ATTENTION: p.attention, TODAY: p.today, VOICE: !!(payload && payload.voice), NOW: p.now, PARTIES: p.parties, ITEMS: p.items, GROUPS: p.groups, WAREHOUSES: p.warehouses,
     PROCESSES: p.processes, ROUTES: p.routes, PLANS: p.plans, ORDERS: p.orders, STOCK: p.stock, PENDING: p.pending, HELP_TOPICS: p.topics };
   const contents = [{ role: 'user', parts: [{ text: 'CONTEXT:\n' + JSON.stringify(ctx) }] },
     { role: 'model', parts: [{ text: '{"transcript":"","lang":"en","answer":"Ready.","steps":[]}' }] }];
   p.history.forEach((h) => contents.push({ role: h.role, parts: [{ text: h.text }] }));
   contents.push({ role: 'user', parts: m.parts.concat([{ text: langLine(lang, 'the answer') + (m.audio ? 'The person speaks in the attached recording.' + (p.text ? ' Also typed: ' + p.text : '') : p.text) +
     (m.files ? '\nAlso attached: ' + m.files + ' photo(s)/document(s) — a challan, a slip or a list; read the quantities from them.' : '') }]) });
-  const a = await ask(device, SYSTEM, { contents: contents }, fetchImpl);
+  const a = await ask(device, SYSTEM, { contents: contents }, fetchImpl, { strong: !(payload && payload.voice) });
   if (a.fail) return a.fail;
   const j = a.json || {};
   const checked = checkSteps(p, j.steps);
   const tables = cleanTables(j.tables);
   const l = String(j.lang || '').toLowerCase();
   return { httpStatus: 200, body: { ok: true, model: a.model, left: a.left, transcript: str(j.transcript, 1200),
-    lang: l === 'gu' || l === 'hi' ? l : 'en', answer: text(j.answer, 9000), speech: str(j.speech, 1200), speechEn: str(j.speechEn, 1200), steps: checked.steps, dropped: checked.dropped, tables: tables } };
+    lang: l === 'gu' || l === 'hi' ? l : 'en', answer: text(j.answer, 9000), speech: str(j.speech, 1200), speechEn: str(j.speechEn, 1200), remember: j.remember ? str(j.remember, 300) : null,
+    forget: list(j.forget, 5).map((f) => str(f, 300)).filter(Boolean), next: list(j.next, 3).map((q) => str(q, 120)).filter(Boolean),
+    run: j.run === true && !checked.steps.filter((x) => x.do !== 'table' && x.do !== 'window' && x.do !== 'guide').length, steps: checked.steps, dropped: checked.dropped, tables: tables } };
 }
