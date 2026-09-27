@@ -723,7 +723,11 @@ export function cleanAssist(p) {
     units: fill.units,
     constructions: fill.constructions.map((c) => Object.assign({}, c, { needs: needsOf(c) })),
     fields: fill.fields,
-    processes: list(x.processes, 80).map((q) => ({ code: str(q && q.code, 30), name: str(q && q.name, 60) })).filter((q) => q.code),
+    /* 4.67.10 — each process's own resources (conversion charges): name, type, basis, and the rate for a person who may see costs */
+    processes: list(x.processes, 80).map((q) => Object.assign({ code: str(q && q.code, 30), name: str(q && q.name, 60) },
+      Array.isArray(q && q.resources) ? { resources: list(q.resources, 12).map((r) => Object.assign({ name: str(r && r.name, 40), type: str(r && r.type, 30), basis: str(r && r.basis, 10) },
+        r && r.rate != null ? { rate: nr(r.rate) } : {}, r && r.perBags ? { perBags: nr(r.perBags) } : {})).filter((r) => r.name) } : {})).filter((q) => q.code),
+    resourceTypes: list(x.resourceTypes, 30).map((t) => str(t, 30)).filter(Boolean),
     routes: list(x.routes, 80).map((r) => ({ name: str(r && r.name, 80), steps: list(r && r.steps, 30).map((s) => str(s, 30)),
       constructions: list(r && r.constructions, 30).map((s) => str(s, 60)), stages: cleanSecs(r && r.stages) })).filter((r) => r.name),
     materials: list(x.materials, 300).map((m) => ({ code: str(m && m.code, 40), name: str(m && m.name, 60), group: str(m && m.group, 30), rate: nr(m && m.rate) })).filter((m) => m.code),
@@ -800,6 +804,10 @@ const STEP_LIST = [
   '{"do":"suggest","stage":PROCESS CODE} — fill that stage from the calculation with Nexora\u2019s own Suggest (layer shares on a coating/lamination stage, grams per bag on a finishing, pasting, easy-open or stitching stage) and save it.',
   '{"do":"recipe","add":true|false,"remove":true|false,"part":PART KEY or null,"stage":PROCESS CODE,"lines":[{"material":MATERIAL CODE,"value":number,"basis":"PCT"} or {"part":PART KEY,"value":grams or null} or {"earlier":true,"stage":PROCESS CODE or null,"basis":"PCT"|"PART_G","value":number or null,"figure":FIGURE KEY or null}],"wastePct":number or null} — set the materials of one stage (of the body, or of a part on its own tab); a {"part":KEY} line TAKES IN that part at this stage (e.g. the patches and the valve at the bottom/finishing stage, BOPP at lamination). Earlier-stage rows stay.',
   '{"do":"waste","part":PART KEY or null,"stage":PROCESS CODE,"pct":number} — the waste % of one stage.',
+  '{"do":"resources","from":a BOM or calculation NUMBER from BOMS/RECORDS (the reference),"stage":PROCESS CODE or null} — give this bag\u2019s stages the resources the reference BOM uses at the same stages (every matching stage when none is named).',
+  '{"do":"resource","action":"add"|"set"|"remove","stage":PROCESS CODE,"name":RESOURCE NAME,"type":one of RESOURCETYPES or null,"basis":"KG"|"BAG"|"PER1000"|"PERN" or null,"rate":number or null,"perBags":number or null,"forAll":true|false,"part":PART KEY or null} — add, change or take out ONE resource on a stage of this bag (forAll:true changes the process itself in the Process master — every route that runs it).',
+  '{"do":"stage","action":"remove"|"add","stage":PROCESS CODE,"after":PROCESS CODE or null,"part":PART KEY or null} — take a WHOLE stage off this bag\u2019s route, its section with it — or put a process on the route after the stage named (before packing when none is named). The route is changed as in Route Master, so every bag on that route follows.',
+  '{"do":"recipe","stage":PROCESS CODE,"clear":true,"part":PART KEY or null} — empty that stage\u2019s materials (the stage stays on the route; what it takes from the stage before stays).',
   '{"do":"accept"} — save the stages Nexora suggested on this BOM into its route (they are then the plant\u2019s own).',
   '{"do":"savebom"} — save the BOM as a record (with its version).',
   '{"do":"saveworkflow","name":NAME} — save this bag\u2019s whole set-up (routes, tabs, every recipe) as a workflow, loaded on the next bag of this construction.',
@@ -831,6 +839,8 @@ const ASSIST_SYSTEM = [
   'THE STAGE BEFORE: a stage that takes the fabric or tube from an earlier stage says HOW with an "earlier" line. Where parts or other materials are ADDED at that stage (finishing, stitching, block bottom, pinch, bag making: patches, valve, liner, yarn, zipper) it takes the BODY AS A WHOLE PART by its own weight — {"earlier":true,"basis":"PART_G","figure":"BODY.TOTAL"} — never 100 % of everything before, which would count what is added twice. A stage that only converts what comes in (weaving, slitting, packing) takes {"earlier":true,"basis":"PCT","value":100} or needs no line. Always follow how THIS plant\u2019s saved sections do it (ROUTES[].stages and LEARNED.workflowRecipes lines "EARLIER STAGE …" with their basis and figure). FIGURES lists the part figures (NOW.calc.figures has this bag\u2019s grams).',
   'NO PROCESS THE BAG DOES NOT NEED: never add printing (flexo or BOPP printing), lamination, coating, BOPP, backseam, liner or valve steps unless the person said so, the construction has it (e.g. BOPP / laminated in its name or fields), or this plant\u2019s own route for the construction has it. When unsure, leave it out and ask in "answer".',
   'ADD OR REPLACE: "add weaving in lamination", "LD 5 % umero", "take in the valve" ADD to what the stage already holds — set "add": true (the section keeps its lines; a line of the same stage, material or part is replaced). Without "add" the stage\u2019s materials are replaced by yours. "Weaving in lamination as per calculation weight" = {"do":"recipe","add":true,"stage":"LAMINATION","lines":[{"earlier":true,"stage":"WEAVING","figure":"BODY.FAB"}]} — the woven fabric by the calculation\u2019s own weight (FIGURES: BODY.FAB base fabric, BODY.TOTAL whole body).',
+  'RESOURCES are a stage\u2019s conversion charges (manpower, electricity, consumables, overhead…), each with a basis: KG (per kg through the stage), BAG, PER1000 or PERN (per N bags). PROCESSES[].resources are each process\u2019s own. "take the resources from BOM-… / like CAL-…" → a "resources" step with that number. "add labour 0.40 per kg on weaving", "remove electricity from tape", "make packing labour 12 per 1000 bags" → a "resource" step; its rate ONLY as the person says it (never a guess; ask). Only when ALLOWED.cost is true.',
+  'A WHOLE STAGE: "remove the flexo printing section", "flexo printing kadho", "X stage nathi joitu", "take X off the BOM" → {"do":"stage","action":"remove","stage":X} — never a recipe step for that. "add slitting after weaving", "X stage umero" → {"do":"stage","action":"add","stage":X,"after":Y}. Only "empty / clear the materials of X" is a recipe step with "clear": true.',
   'ADD, CHANGE, REMOVE — ANYTHING: to change a line\u2019s value use "add" with the new value (the same material/stage/part is replaced); to take lines out use "remove": true with those lines; "from the calculation" / "calculation par thi" / "suggest" for a stage = a "suggest" step.',
   'LEARN FROM ALL THE SAVED BOMs: LEARNED.boms gathers EVERY saved BOM of this plant per construction — the routes used and how often, whole bag or by parts, and each material\u2019s kg per 1000 kg of finished bags (average, min–max, in how many BOMs) at the stages it was used. For a similar bag use the route used most and the materials in their usual proportions at the same stages, unless the person says otherwise.',
   'LEARN FROM ALL THE SAVED BAGS: LEARNED.typical gathers EVERY saved bag of this plant per construction — for each field the figure used most (inputs), how often (seen), its range and the other figures used (values) — patch sizes, valve, mesh, coating, BOPP, fold…. For a new bag of that construction take every figure it needs from there unless the person says otherwise, and say "the rest from your saved <construction> bag <from>". Ask only for what belongs to this bag alone: width and length when not said, and the body fabric GSM OR the target weight — ONE of the two, never both (a GSM gives the weight, a weight gives the GSM).',
@@ -1064,6 +1074,7 @@ export function checkSteps(p, raw) {
         lines.push({ material: m.code, name: m.name, value: v, basis: BASES[l.basis] ? l.basis : 'PCT' });
       });
       const w = num(s.wastePct);
+      if (s.clear === true) { out.push(Object.assign({ do: 'recipe', stage: st.code, lines: [], clear: true, wastePct: w !== null && w >= 0 && w < 100 ? w : null }, part ? { part: part } : {})); return; }
       if (lines.length) out.push(Object.assign({ do: 'recipe', stage: st.code, lines: lines, wastePct: w !== null && w >= 0 && w < 100 ? w : null }, part ? { part: part } : {}, s.remove ? { remove: true } : (s.add ? { add: true } : {})));
       return;
     }
@@ -1071,6 +1082,52 @@ export function checkSteps(p, raw) {
     /* 4.67.7 — the rest of Nexora */
     const recOf = (v) => { const k = String(v || '').trim().toUpperCase(); return k ? p.records.filter((r) => r.n.toUpperCase() === k)[0] || null : null; };
     const may = (k, what) => { if (p.allowed[k] === false) { dropped.push(what + ' (not in your access)'); return false; } return true; };
+    if (d === 'resources') {
+      if (!may('cost', 'resources')) return;
+      const k = String(s.from || '').trim().toUpperCase();
+      const b = p.boms.filter((x) => x.n.toUpperCase() === k || (x.calc && x.calc.toUpperCase() === k))[0];
+      const c = !b ? p.records.filter((x) => x.n.toUpperCase() === k)[0] : null;
+      if (!b && !c) { dropped.push('reference ' + str(s.from, 30) + ' (not found)'); return; }
+      const st = s.stage ? procFind(s.stage) : null;
+      if (s.stage && !st) { dropped.push('stage ' + str(s.stage, 30)); return; }
+      out.push({ do: 'resources', from: b ? b.n : c.n, calc: b ? (b.calc || null) : c.n, stage: st ? st.code : null });
+      return;
+    }
+    if (d === 'resource') {
+      if (!may('cost', 'resource')) return;
+      const st = procFind(s.stage);
+      if (!st) { dropped.push('resource: stage ' + str(s.stage, 30)); return; }
+      const act = ['add', 'set', 'remove'].indexOf(s.action) > -1 ? s.action : 'add';
+      const name = str(s.name, 40);
+      if (!name) { dropped.push('resource without a name'); return; }
+      const BASIS = { KG: 1, BAG: 1, PER1000: 1, PERN: 1 };
+      const o = { do: 'resource', action: act, stage: st.code, name: name, forAll: s.forAll === true };
+      const onBag = p.now.calc.parts.map((q) => q.key);
+      if (s.part && (!onBag.length || onBag.indexOf(String(s.part).toUpperCase()) > -1)) o.part = String(s.part).toUpperCase();
+      if (act !== 'remove') {
+        const t = String(s.type || '').trim().toUpperCase();
+        o.type = p.resourceTypes.indexOf(t) > -1 ? t : (t ? 'OTHER' : null);
+        o.basis = BASIS[String(s.basis || '').toUpperCase()] ? String(s.basis).toUpperCase() : null;
+        const pb = num(s.perBags); o.perBags = o.basis === 'PERN' && pb > 0 ? pb : null;
+        const r = num(s.rate);
+        /* a rate is the person's to say */
+        o.rate = r !== null && r >= 0 && saidNumbers(p).some((n) => Math.abs(n - r) < 1e-9) ? r : null;
+        if (o.rate === null && act === 'add') missing.push({ key: '__rate', label: 'Rate for ' + name + ' on ' + st.name + (o.basis ? ' (' + o.basis + ')' : ''), required: true });
+      }
+      out.push(o);
+      return;
+    }
+    if (d === 'stage') {
+      const st = procFind(s.stage);
+      if (!st) { dropped.push('stage ' + str(s.stage, 30)); return; }
+      const act = s.action === 'add' ? 'add' : 'remove';
+      const after = s.after ? procFind(s.after) : null;
+      if (s.after && !after) dropped.push('stage ' + str(s.after, 30) + ' (to put it after)');
+      const onBag = p.now.calc.parts.map((q) => q.key);
+      const part = s.part && (!onBag.length || onBag.indexOf(String(s.part).toUpperCase()) > -1) ? String(s.part).toUpperCase() : null;
+      out.push(Object.assign({ do: 'stage', action: act, stage: st.code }, act === 'add' ? { after: after ? after.code : null } : {}, part ? { part: part } : {}));
+      return;
+    }
     if (d === 'find') {
       const what = ['calc', 'bom', 'quote'].indexOf(s.what) > -1 ? s.what : 'calc';
       const pool = what === 'bom' ? p.boms : what === 'quote' ? p.quotes : p.records;
