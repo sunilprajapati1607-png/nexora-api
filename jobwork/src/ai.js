@@ -137,7 +137,7 @@ function flashRank(n) {
    plain Flash (it reasons before it answers) is asked first, within STRONG_MS; when it is busy,
    slow or refuses, Flash-Lite answers the same question. Not for a voice turn — a person waiting on
    a spoken answer wants it now. GEMINI_MODEL_STRONG names another; "off" keeps Lite for all. */
-const STRONG_MS = Math.max(5000, parseInt(process.env.AI_STRONG_MS, 10) || 20000);
+const STRONG_MS = Math.max(5000, parseInt(process.env.AI_STRONG_MS, 10) || 12000);
 /* measured 2026-09-27: the newest Flash answered 429 at once — this key has little free allowance
    for it. A model that says 429 rests fifteen minutes and the next Flash is asked instead. */
 const resting = new Map();          // model -> until (ms)
@@ -538,7 +538,8 @@ async function askOnce(device, system, prompt, fetchImpl, again, opts) {
     let rs = null;
     try { rs = await gfetch(API + '/models/' + encodeURIComponent(strong) + ':generateContent', { method: 'POST', body: payloadFor(strong) }, fetchImpl, STRONG_MS); } catch (e) { rs = null; }
     if (rs && rs.status === 400 && /think/i.test(String((rs.body && rs.body.error && rs.body.error.message) || ''))) noThinking.add(strong);
-    if (rs && rs.status === 429) resting.set(strong, Date.now() + 15 * 60 * 1000);
+    /* busy, out of allowance or out of time: it rests, so the next question does not wait on it again */
+    if (!rs || rs.status === 429 || rs.status >= 500) resting.set(strong, Date.now() + 15 * 60 * 1000);
     if (rs && rs.ok) { const got = readJsonAnswer(rs.body); if (got) return { json: got, model: strong, left: t.left }; }
     console.log('ai strong ' + (rs ? rs.status : 'timeout') + ' after ' + (Date.now() - ts) + ' ms, Lite answers');
   }
