@@ -246,7 +246,7 @@ export const VIEWS = ['dashboard', 'plans', 'plans-in', 'plans-out', 'plan', 'or
   'quick-receipt', 'quick-issue', 'labels', 'stock', 'reconcile', 'trace', 'relation', 'material-ledger', 'pending',
   'challans', 'itc04', 'ageing', 'invoices', 'rates', 'bills', 'exceptions', 'waste', 'profit', 'parties', 'items',
   'item_groups', 'specs', 'uoms', 'processes', 'warehouses', 'routes', 'recipes', 'activity', 'sync', 'settings', 'notes'];
-const STAGES = ['PLAN', 'RECEIPT', 'PO', 'ISSUE', 'PRODUCTION', 'QC', 'RELEASE', 'DISPATCH', 'INVOICE', 'CLOSED'];
+const STAGES = ['PLAN', 'RECEIPT', 'PO', 'FLOOR', 'ISSUE', 'PRODUCTION', 'QC', 'RELEASE', 'DISPATCH', 'INVOICE', 'CLOSED'];
 
 export function cleanAssist(p) {
   const x = p && typeof p === 'object' ? p : {};
@@ -332,7 +332,9 @@ const STEP_LIST = [
   '{"do":"newplan","dir":"IN"|"OUT","party":P TOKEN,"lines":[{"item":I TOKEN,"kg":number}],"process":PROCESS CODE or null} — fill a new jobwork plan (IN: the party’s material processed here; OUT: our material sent to a job worker).',
   '{"do":"receipt","plan":PLAN NO,"lines":[{"item":I TOKEN,"kg":number,"qty2":number or null}],"challan":string or null} — fill a material receipt on a plan.',
   '{"do":"porder","plan":PLAN NO,"item":I TOKEN,"kg":number,"qty2":number or null} — fill a production order on an inward plan.',
-  '{"do":"issue","plan":PLAN NO,"order":ORDER NO or null,"item":I TOKEN or null,"kg":number,"pick":"FIFO"|"FEFO"} — fill an issue to production; the batches are picked FIFO (oldest first) or FEFO (first to expire).',
+  '{"do":"floor","plan":PLAN NO,"order":ORDER NO or null,"item":I TOKEN or null,"kg":number,"pick":"FIFO"|"FEFO"} — fill a STORE ISSUE TO THE PRODUCTION FLOOR (step 1 of the two-step issue: an internal transfer from the store into the production floor store, nothing consumed).',
+  '{"do":"issue","plan":PLAN NO,"order":ORDER NO or null,"item":I TOKEN or null,"kg":number,"pick":"FIFO"|"FEFO"} — fill an ISSUE FOR PRODUCTION (step 2: from the production floor store to the machine — the consumption); the batches are picked FIFO (oldest first) or FEFO (first to expire).',
+  '{"do":"return","plan":PLAN NO,"item":I TOKEN or null,"kg":number or null,"pick":"FIFO"|"FEFO"} — fill a RETURN TO THE CUSTOMER on an inward plan (the return challan); with no item and kg it offers all the finished goods. After it posts, Nexora offers to print the challan; every return challan is in Jobwork Challans → Return challans.',
   '{"do":"production","plan":PLAN NO,"order":ORDER NO or null,"item":I TOKEN,"kg":number,"qty2":number or null} — fill a production receipt (what came off the machine).',
   '{"do":"qc","plan":PLAN NO} — open the QC test for a plan.',
   '{"do":"release","plan":PLAN NO} — open Release to FG for a plan (after QC passed).',
@@ -343,7 +345,7 @@ const STEP_LIST = [
 
 const SYSTEM = [
   'You are Nexora AI, the assistant inside Nexora Jobwork — software for job work in plastic packaging plants (PP/PE woven sacks, BOPP, lamination, printing, films, bags).',
-  'You know job work well. INWARD job work (direction IN): a customer (the principal) sends its own material; the plant receives it (material receipt, their challan), makes a production order, issues material to production, receives what was made (production receipt, batches), tests it (QC), releases it to finished goods, sends it back to the party with a challan, and raises a job-work invoice for the processing. OUTWARD job work (OUT): the plant sends its own material to a job worker on a delivery challan and gets it back processed; under GST the goods must come back within 1 year (capital goods 3 years) and are reported on ITC-04. The plan pipeline is PLAN → RECEIPT → [PO → ISSUE → PRODUCTION] → QC → RELEASE → DISPATCH → INVOICE → CLOSED. Stock is kept by plan, stage, warehouse and batch; a batch is issued FIFO (oldest first) or FEFO (first to expire); the balance of a plan is what came in minus what went out, used and wasted.',
+  'You know job work well. INWARD job work (direction IN): a customer (the principal) sends its own material; the plant receives it (material receipt, their challan), makes a production order, issues material to production, receives what was made (production receipt, batches), tests it (QC), releases it to finished goods, sends it back to the party with a challan, and raises a job-work invoice for the processing. OUTWARD job work (OUT): the plant sends its own material to a job worker on a delivery challan and gets it back processed; under GST the goods must come back within 1 year (capital goods 3 years) and are reported on ITC-04. The plan pipeline is PLAN → RECEIPT → [PO → FLOOR → ISSUE → PRODUCTION] → QC → RELEASE → DISPATCH → INVOICE → CLOSED. THE TWO-STEP ISSUE (on unless the plant turned it off in Settings → Documents): the STORE first issues material to the PRODUCTION FLOOR STORE ("Store issue to floor", an internal transfer — still raw material on the plan, nothing consumed); then "Issue for production" takes it from the floor store to the machine — that is the consumption; the production receipt converts it into output, waste and loss. DISPATCH is the return to the customer on a return challan (Rule 55); every document prints from its row, challans in three copies, and Jobwork Challans has two tabs — Delivery challans (to job workers) and Return challans (to principals). Stock is kept by plan, stage, warehouse and batch; a batch is issued FIFO (oldest first) or FEFO (first to expire); the balance of a plan is what came in minus what went out, used and wasted.',
   'You see the window the person is on (SCREEN, NOW) and a summary of THIS plant: parties as tokens P1, P2… with their type, items as tokens I1, I2… with their material group, class (RM raw material, SFG semi-finished, FG finished) and units, open PLANS, production ORDERS, STOCK in kg, PENDING work, processes, routes and warehouses. Write P and I tokens exactly as given (Nexora shows the real names on the person’s screen). You NEVER see — and must never ask for, guess or invent — a party’s name, an item’s name, a rate, a price, an amount or a cost. When the person asks about money (invoice amounts, totals, tax), return an "invoices" table — Nexora works the amounts out on their screen and you never see them; for rates, bills or profit open that window.',
   'BE OPEN. Answer ANYTHING the person asks, as fully as they want it: this plant\u2019s work, job work and GST (job-work challans, ITC-04, section 143, e-way bills), processes and quality (extrusion, weaving, lamination, printing, stitching, yields, waste, QC), planning, how to do something in Nexora, or any general question. The only things you cannot give are a party\u2019s name, an item\u2019s name and money figures — and even those the person gets, because a table is worked out on their screen.',
   'TABLES. Whenever the answer is a list, a comparison or figures from the plant\u2019s data — stock, movements, plans, orders, batches, challans, invoices, QC, "which", "how much", "list", "total", "party wise", "month wise" — return a "table" step (more than one if useful). Nexora works it out EXACTLY from its own book, with the real names and a total row; you do NOT add up or copy figures into "answer" — say in one line what the table shows and what to notice. A table step runs by itself; the person does not press Run. For knowledge that is naturally a table (a comparison, a checklist, a schedule), put it in "tables": [{"title": string, "columns": [string, …], "rows": [[cell, …], …], "total": true|false}] — "total": true only when a column is a quantity to add. NEVER copy the plant\u2019s own figures (stock, kg, plans, orders, invoices) into "tables" — the plant\u2019s data always goes as a table step, and never both.',
@@ -443,7 +445,7 @@ export function checkSteps(p, raw) {
       const q = plan(s.plan); if (!q) { dropped.push('receipt ' + str(s.plan, 30)); return; }
       out.push({ do: 'receipt', plan: q.no, lines: lines(s.lines), challan: s.challan ? str(s.challan, 30) : null }); return;
     }
-    if (d === 'porder' || d === 'issue' || d === 'production') {
+    if (d === 'porder' || d === 'issue' || d === 'production' || d === 'floor' || d === 'return') {
       const q = plan(s.plan); if (!q) { dropped.push(d + ' ' + str(s.plan, 30)); return; }
       const o = s.order ? order(s.order) : null;
       if (s.order && !o) dropped.push('order ' + str(s.order, 30));
@@ -451,8 +453,8 @@ export function checkSteps(p, raw) {
       if (s.item && !it) dropped.push('item ' + str(s.item, 12));
       const kg = kgOk(s.kg), q2 = num(s.qty2);
       const step = { do: d, plan: q.no, item: it, kg: kg, qty2: q2 !== null && q2 > 0 ? q2 : null };
-      if (d !== 'porder') step.order = o ? o.no : null;
-      if (d === 'issue') step.pick = s.pick === 'FEFO' ? 'FEFO' : 'FIFO';
+      if (d !== 'porder' && d !== 'return') step.order = o ? o.no : null;
+      if (d === 'issue' || d === 'floor' || d === 'return') step.pick = s.pick === 'FEFO' ? 'FEFO' : 'FIFO';
       out.push(step);
       return;
     }

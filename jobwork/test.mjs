@@ -126,6 +126,19 @@ await t('steps are checked: unknown plans, tokens and windows are dropped', asyn
   assert.ok(c.dropped.indexOf('delete') > -1 && c.dropped.some((d) => /plan JW-IN\/9999/.test(d)));
 });
 
+await t('the two-step issue and the return are steps: floor, issue, return', async () => {
+  const p = cleanAssist(PAYLOAD);
+  const c = checkSteps(p, [
+    { do: 'floor', plan: 'JW-IN/0007', order: 'PO-0003', item: 'I2', kg: 400 },
+    { do: 'return', plan: 'JW-IN/0007', item: 'I2', kg: 250, pick: 'FEFO', order: 'PO-0003' },
+    { do: 'return', plan: 'JW-IN/9999' }
+  ]);
+  assert.deepEqual(c.steps.map((s) => s.do), ['floor', 'return']);
+  assert.deepEqual(c.steps[0], { do: 'floor', plan: 'JW-IN/0007', item: 'I2', kg: 400, qty2: null, order: 'PO-0003', pick: 'FIFO' });
+  assert.deepEqual(c.steps[1], { do: 'return', plan: 'JW-IN/0007', item: 'I2', kg: 250, qty2: null, pick: 'FEFO' });
+  assert.ok(c.dropped.some((d) => /return JW-IN\/9999/.test(d)));
+});
+
 await t('limits: per device a day, then tomorrow', async () => {
   _resetLimits();
   process.env.AI_DAILY_PER_DEVICE = '2'; process.env.AI_PER_MINUTE = '50';
