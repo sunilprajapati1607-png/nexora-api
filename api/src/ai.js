@@ -207,7 +207,13 @@ function readAnswer(body) {
 
 
 /* ---- one call to Gemini, shared by every Nexora AI question ------------- */
-const STRONG_MS = 45000;
+/* 4.67.12 — "even in typing not responding": the strong model, busy (429) or slow on a large question,
+   held every question 45 s and left the usual model 25 s — both ran out. Now it gets 12 s, and after
+   it fails in any way it rests 15 minutes, so the next questions go straight to the quick model. */
+const STRONG_MS = 12000;
+const STRONG_REST_MS = 15 * 60 * 1000;
+let strongRestUntil = 0;
+export function _resetStrong() { strongRestUntil = 0; }
 function readJson(r) {
   const parts = (((r.body && r.body.candidates) || [])[0] || {}).content;
   /* a thinking model may send its thought as a part of its own: only the answer's text is read */
@@ -230,13 +236,14 @@ async function ask(companyId, system, prompt, fetchImpl, opts) {
   });
   let r;
   /* the stronger model first (45 s), then the usual one (the rest of the minute) */
-  const strong = opts.strong ? strongOf(model.available || []) : null;
+  const strong = opts.strong && Date.now() > strongRestUntil ? strongOf(model.available || []) : null;
   if (strong && strong !== name) {
     let rs = null;
     try { rs = await gfetch(API + '/models/' + encodeURIComponent(strong) + ':generateContent', { method: 'POST', body: payload }, fetchImpl, STRONG_MS); } catch (e) { rs = null; }
     if (rs && rs.ok) { const got = readJson(rs); if (got) return { json: got, model: strong, left: t.left }; }
     const sm = String((rs && rs.body && rs.body.error && rs.body.error.message) || '');
     if (rs && !rs.ok && (rs.status === 404 || /no longer available|not found|is not supported|deprecated/i.test(sm))) blocked.add(strong);
+    strongRestUntil = Date.now() + STRONG_REST_MS;
   }
   /* 4.67.1 — a model Google has retired is set aside and the request is
      asked again, of the model Google names (or the newest the key lists),
@@ -244,7 +251,7 @@ async function ask(companyId, system, prompt, fetchImpl, opts) {
   for (let attempt = 0; ; attempt++) {
     try {
       /* after the stronger model had its 45 s, the usual one gets what is left of the application's 75 s */
-      r = await gfetch(API + '/models/' + encodeURIComponent(name) + ':generateContent', { method: 'POST', body: payload }, fetchImpl, strong && strong !== name ? 25000 : TIMEOUT_MS);
+      r = await gfetch(API + '/models/' + encodeURIComponent(name) + ':generateContent', { method: 'POST', body: payload }, fetchImpl, strong && strong !== name ? 58000 : TIMEOUT_MS);
     } catch (e) {
       return { fail: { httpStatus: 504, body: { error: 'AI_TIMEOUT', message: 'Nexora AI did not answer in time. Try again.' } } };
     }
@@ -734,14 +741,14 @@ export function cleanAssist(p) {
     rules: list(x.rules, 30).map((r) => str(r, 300)).filter(Boolean),
     voice: !!x.voice,
     /* 4.67.7 — the plant's saved work by NUMBER and technical figures (never an item name or a customer) */
-    records: list(x.records, 120).map((r) => ({ n: str(r && r.n, 30), construction: str(r && r.construction, 60), width: nr(r && r.width), length: nr(r && r.length),
+    records: list(x.records, 60).map((r) => ({ n: str(r && r.n, 30), construction: str(r && r.construction, 60), width: nr(r && r.width), length: nr(r && r.length),
       gsm: nr(r && r.gsm), weight: nr(r && r.weight), target: nr(r && r.target), bags: nr(r && r.bags), status: str(r && r.status, 16), date: str(r && r.date, 10),
       bom: !!(r && r.bom), rev: nr(r && r.rev) })).filter((r) => r.n),
     boms: list(x.boms, 80).map((b) => ({ n: str(b && b.n, 30), calc: str(b && b.calc, 30), construction: str(b && b.construction, 60), route: str(b && b.route, 80),
       mode: str(b && b.mode, 10), date: str(b && b.date, 10) })).filter((b) => b.n),
     quotes: list(x.quotes, 60).map((q) => ({ n: str(q && q.n, 30), calcs: list(q && q.calcs, 10).map((c) => str(c, 30)), bags: nr(q && q.bags), items: nr(q && q.items),
       status: str(q && q.status, 16), date: str(q && q.date, 10) })).filter((q) => q.n),
-    constants: list(x.constants, 220).map((c) => ({ name: str(c && c.name, 80), value: typeof (c && c.value) === 'number' ? nr(c.value) : str(c && c.value, 30), unit: str(c && c.unit, 20),
+    constants: list(x.constants, 150).map((c) => ({ name: str(c && c.name, 80), value: typeof (c && c.value) === 'number' ? nr(c.value) : str(c && c.value, 30), unit: str(c && c.unit, 20),
       group: str(c && c.group, 40) })).filter((c) => c.name),
     groups: list(x.groups, 40).map((g) => str(g, 40)).filter(Boolean),
     workflowList: list(x.workflowList, 60).map((w) => ({ name: str(w && w.name, 80), construction: str(w && w.construction, 60) })).filter((w) => w.name),
@@ -858,6 +865,7 @@ const ASSIST_SYSTEM = [
   'BE THE EXPERT, EASY AND EXACT. Write the answer for a busy person who does not know the software: first the result in one line, then the reason. Use short lines; "- " bullets; "1. 2. 3." for steps to follow; **bold** for the key figure; a table ("| a | b |" rows) when comparing. Use ONLY figures from CONTEXT or that you work out from them — show the working in one line (e.g. denier = GSM x DENIER FACTOR / (warp + weft) with the plant\u2019s own constant), and mark any estimate as an estimate. "How do I…" → numbered steps in the person\u2019s words, plus a "guide" step at the first button (and "open" when it is on another window). When the person only asks, answer — no steps.',
   'NEXT: give "next" — up to 3 short follow-ups the person is likely to want now, in THEIR language, each a complete request Nexora AI could do (e.g. "Save it and open the BOM", "Compare it with CAL-2026-000012").',
   'BY VOICE (4.67.8): when VOICE is true the answer is SPOKEN to the person — two or three short spoken sentences, no table, no list, no symbols; the plan still carries every step. When the person asks to go ahead with the plan already shown and adds nothing new ("run", "run karo", "chalavo", "haa, karo", "kari do", "go ahead", "चलाओ", "कर दो"), answer "run": true with no steps. A voice transcript may mishear a number: repeat the figures you understood in the answer.',
+  'A RECORDING: put in "transcript" exactly the words you heard, in the script they were spoken. Take a NEW bag only from what this recording (or these typed words) says — never carry a construction, a size or a weight over from earlier in the conversation unless the person points to it ("the same bag", "that one", "it"). When the recording is unclear or seems cut short, say what you heard and ask — no calculation step.',
   'Answer ONLY with JSON: {"transcript": string, "lang": "en"|"gu"|"hi", "answer": string, "steps": [ ... ], "remember": string or null, "forget": [string], "next": [string], "run": true|false}.'
 ].join('\n');
 
@@ -895,6 +903,29 @@ function saidNumbers(p) {
   const txt = [p.text, p.transcript || ''].concat(p.history.filter((h) => h.role === 'user').map((h) => h.text)).join(' ');
   return (txt.replace(/,/g, '').match(/\d+(?:\.\d+)?/g) || []).map(Number).filter((n) => isFinite(n));
 }
+/* 4.67.12 — what the person's own words say about the bag: its layers, and its kind of bottom.
+   A new calculation that contradicts them ("4L block bottom" said, "1L STITCH BAG" planned) is not
+   run — it is asked. Words in English, Gujarati or Hindi, spoken or typed. */
+export function saidBag(t) {
+  const x = String(t || '').toLowerCase();
+  const NUM = { one: 1, two: 2, three: 3, four: 4, five: 5, ek: 1, be: 2, tran: 3, char: 4, 'એક': 1, 'બે': 2, 'ત્રણ': 3, 'ચાર': 4, 'दो': 2, 'तीन': 3, 'चार': 4 };
+  let layers = null;
+  const m = /(\d|one|two|three|four|five|ek|be|tran|char|એક|બે|ત્રણ|ચાર|दो|तीन|चार)\s*-?\s*(?:l\b|layer|layers|લેયર|એલ|લ\b|लेयर|एल|परत)/i.exec(x);
+  if (m) layers = /\d/.test(m[1]) ? Number(m[1]) : (NUM[m[1]] || null);
+  const block = /block\s*-?\s*bottom|blockbottom|બ્લોક|ब्लॉक/.test(x);
+  const pinch = /pinch|પિંચ|पिंच/.test(x);
+  const stitch = /stitch|સ્ટીચ|સિલાઈ|स्टिच|सिलाई/.test(x);
+  return { layers: layers, bottom: block ? 'BLOCK' : pinch ? 'PINCH' : stitch ? 'STITCH' : null };
+}
+function bagMismatch(said, conName) {
+  const n = String(conName || '').toUpperCase();
+  const lay = Number((/^(\d)L\b/.exec(n) || [])[1]) || null;
+  const bottom = /BLOCK BOTTOM/.test(n) ? 'BLOCK' : /PINCH/.test(n) ? 'PINCH' : /STITCH/.test(n) ? 'STITCH' : null;
+  const why = [];
+  if (said.layers && lay && said.layers !== lay) why.push(said.layers + 'L');
+  if (said.bottom && bottom && said.bottom !== bottom) why.push(said.bottom === 'BLOCK' ? 'block bottom' : said.bottom === 'PINCH' ? 'pinch bottom' : 'stitched');
+  return why;
+}
 /** The steps Nexora AI proposed, checked against what was sent. */
 export function checkSteps(p, raw) {
   const out = [], dropped = [], missing = [], notes = [];
@@ -914,6 +945,16 @@ export function checkSteps(p, raw) {
     if (d === 'calc') {
       const named = s.construction ? conOf[String(s.construction).trim().toUpperCase()] : null;
       const fresh = s.fresh !== false || !p.now.calc.madeByAi;
+      /* the words of THIS request (typed, or heard) against the bag planned */
+      if (fresh && named) {
+        const why = bagMismatch(saidBag(p.text + ' ' + (p.transcript || '')), named.name);
+        if (why.length) {
+          dropped.push('construction ' + named.name + ' (you said ' + why.join(', ') + ')');
+          missing.push({ key: '__construction', label: 'Construction \u2014 you said ' + why.join(', '), type: 'enum', required: true,
+            options: p.constructions.map((c) => c.name).filter((c) => !bagMismatch(saidBag(p.text + ' ' + (p.transcript || '')), c).length).concat(p.constructions.map((c) => c.name)).filter((c, i, a) => a.indexOf(c) === i) });
+          return;
+        }
+      }
       const con = named || (!s.construction ? conOf[String(p.now.calc.structure || '').toUpperCase()] : null) || null;
       if (s.construction && !named) dropped.push('construction ' + str(s.construction, 40));
       const inputs = {};
@@ -1215,8 +1256,14 @@ export async function assist(companyId, payload, lang, fetchImpl) {
   const m = mediaParts(payload);
   if (m.error) return m.error;
   if (!p.text && !m.parts.length) return { httpStatus: 400, body: { error: 'NOTHING', message: 'Say or type something first.' } };
+  /* 4.67.12 — what the question does not need is not sent: a route another bag made its own (named
+     "<route> — CAL-…") is that bag's business, and a route no construction runs on goes without its
+     sections (its steps still go) */
+  const curRoute = String(p.now.calc.route || '');
+  const routesSent = p.routes.filter((r) => !/ \u2014 [A-Z]{2,5}-\d{4}-\d+/.test(r.name) || r.name === curRoute)
+    .map((r) => (r.constructions.length || r.name === curRoute) ? r : Object.assign({}, r, { stages: [] }));
   const ctx = { SCREEN: p.screen, VOICE: p.voice, UNITS: p.units, RULES: p.rules, ALLOWED: p.allowed, NOW: p.now, CONSTRUCTIONS: p.constructions, FIELDS: p.fields, PROCESSES: p.processes,
-    ROUTES: p.routes, MATERIALS: p.materials, GROUPS: p.groups, CONSTANTS: p.constants, FIGURES: p.figures, RECORDS: p.records, BOMS: p.boms, QUOTES: p.quotes,
+    ROUTES: routesSent, MATERIALS: p.materials, GROUPS: p.groups, CONSTANTS: p.constants, FIGURES: p.figures, RECORDS: p.records, BOMS: p.boms, QUOTES: p.quotes,
     WORKFLOWLIST: p.workflowList, LEARNED: p.learned, HELP_TOPICS: p.topics };
   const contents = [{ role: 'user', parts: [{ text: 'CONTEXT:\n' + JSON.stringify(ctx) }] },
     { role: 'model', parts: [{ text: '{"transcript":"","lang":"en","answer":"Ready.","steps":[]}' }] }];
@@ -1226,7 +1273,7 @@ export async function assist(companyId, payload, lang, fetchImpl) {
   const said = (lang === 'gu' || lang === 'hi') ? langLine(lang, 'the answer') : '';
   contents.push({ role: 'user', parts: m.parts.concat([{ text: said + (m.audio ? 'The person speaks in the attached recording.' + (p.text ? ' Also typed: ' + p.text : '') : p.text) +
     (m.files ? '\nAlso attached: ' + m.files + ' photo(s)/document(s) of the bag — read its sizes and specification from them.' : '') }]) });
-  const a = await ask(companyId, ASSIST_SYSTEM, { contents: contents }, fetchImpl, { strong: true, maxTokens: 8192 });
+  const a = await ask(companyId, ASSIST_SYSTEM, { contents: contents }, fetchImpl, { strong: !p.voice && !m.audio, maxTokens: 8192 });
   if (a.fail) return a.fail;
   const j = a.json || {};
   if (j.transcript) p.transcript = str(j.transcript, 1200);
