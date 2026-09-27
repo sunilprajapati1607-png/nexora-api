@@ -115,7 +115,7 @@ export async function resolveModel(force, fetchImpl) {
 /** For /health — cached, never waits on Google. */
 export function aiStatus() {
   if (aiConfigured() && (!model.at || Date.now() - model.at > MODEL_TTL_MS)) resolveModel(false).catch(() => {});
-  return { configured: aiConfigured(), model: model.name, note: model.error || null };
+  return { configured: aiConfigured(), model: model.name, note: model.error || null, lastAudio: lastAudio };
 }
 
 /* ---- limits ------------------------------------------------------------- */
@@ -478,6 +478,26 @@ const MEDIA_TYPES = {
 };
 const MAX_MEDIA_B64 = 8 * 1024 * 1024;
 /** The recording and the attachments of a request, checked, as Gemini parts. */
+/* 4.67.13 — "still voice command on ai is not working its giving me different option": the bubble
+   said "spoken" — Nexora AI heard no words at all, and answered from the conversation before. What a
+   16-bit WAV holds is measured here: its seconds and how loud it is (RMS, 0–1). A recording that is
+   all but silent is the microphone's doing, not Google's; it is said so, and nothing is planned. */
+export function wavLevel(b64) {
+  try {
+    const buf = Buffer.from(String(b64 || ''), 'base64');
+    if (buf.length < 44 || buf.toString('ascii', 0, 4) !== 'RIFF' || buf.toString('ascii', 8, 12) !== 'WAVE') return null;
+    const rate = buf.readUInt32LE(24), bits = buf.readUInt16LE(34);
+    let off = 12, dataAt = -1, dataLen = 0;
+    while (off + 8 <= buf.length) { const id = buf.toString('ascii', off, off + 4), len = buf.readUInt32LE(off + 4); if (id === 'data') { dataAt = off + 8; dataLen = Math.min(len, buf.length - off - 8); break; } off += 8 + len; }
+    if (dataAt < 0 || bits !== 16 || !rate) return null;
+    const n = Math.floor(dataLen / 2);
+    let sum = 0, peak = 0;
+    for (let i = 0; i < n; i++) { const v = buf.readInt16LE(dataAt + i * 2) / 32768; sum += v * v; if (Math.abs(v) > peak) peak = Math.abs(v); }
+    return { seconds: Math.round(n / rate * 10) / 10, rms: n ? Math.round(Math.sqrt(sum / n) * 10000) / 10000 : 0, peak: Math.round(peak * 1000) / 1000 };
+  } catch (e) { return null; }
+}
+let lastAudio = null;
+export function audioStatus() { return lastAudio; }
 export function mediaParts(payload) {
   const x = payload && typeof payload === 'object' ? payload : {};
   const all = [].concat(x.audio && typeof x.audio === 'object' ? [x.audio] : [], Array.isArray(x.attachments) ? x.attachments.slice(0, 4) : []);
@@ -491,7 +511,9 @@ export function mediaParts(payload) {
     if (total > MAX_MEDIA_B64) return { error: { httpStatus: 413, body: { error: 'MEDIA_BIG', message: 'That is too much to send at once — a minute of speech, or a few photos.' } } };
     parts.push({ inlineData: { mimeType: mime, data: data } });
   }
-  return { parts: parts, audio: all.some((m) => /^audio\//.test(String(m && m.mime))), files: all.filter((m) => !/^audio\//.test(String(m && m.mime))).length };
+  const au = all.filter((m) => /^audio\//.test(String(m && m.mime)))[0];
+  return { parts: parts, audio: !!au, files: all.filter((m) => !/^audio\//.test(String(m && m.mime))).length,
+    level: au ? wavLevel(au.data) : null, audioBytes: au ? Math.round(String(au.data || '').length * 3 / 4) : 0 };
 }
 
 /* ---- BOM changes, said or typed -------------------------------------------
@@ -1262,6 +1284,15 @@ export async function assist(companyId, payload, lang, fetchImpl) {
   const curRoute = String(p.now.calc.route || '');
   const routesSent = p.routes.filter((r) => !/ \u2014 [A-Z]{2,5}-\d{4}-\d+/.test(r.name) || r.name === curRoute)
     .map((r) => (r.constructions.length || r.name === curRoute) ? r : Object.assign({}, r, { stages: [] }));
+  const lg0 = (lang === 'gu' || lang === 'hi') ? lang : 'en';
+  const nothing = (why) => ({ httpStatus: 200, body: { ok: true, model: null, transcript: '', lang: lg0, heard: false, steps: [], missing: [], dropped: [], notes: [], next: [], run: false,
+    answer: lg0 === 'gu' ? (why === 'silent' ? 'રેકોર્ડિંગમાં અવાજ જ નથી આવ્યો — microphone તપાસો (Windows → Settings → Privacy → Microphone), પછી ફરી બોલો કે લખો. કશું કર્યું નથી.' : 'હું સાંભળી ન શક્યો — ફરી બોલો કે લખો. કશું કર્યું નથી.')
+      : lg0 === 'hi' ? (why === 'silent' ? 'रिकॉर्डिंग में आवाज़ ही नहीं आई — microphone जाँचें, फिर से बोलें या लिखें। कुछ नहीं किया।' : 'मैं सुन नहीं पाया — फिर से बोलें या लिखें। कुछ नहीं किया।')
+      : (why === 'silent' ? 'The recording came through silent — check the microphone (Windows → Settings → Privacy → Microphone), then say it again or type it. Nothing was done.' : 'I could not hear that — please say it again, or type it. Nothing was done.') } });
+  if (m.audio) {
+    lastAudio = { at: new Date().toISOString(), bytes: m.audioBytes, seconds: m.level ? m.level.seconds : null, rms: m.level ? m.level.rms : null, peak: m.level ? m.level.peak : null, transcriptChars: null, model: null };
+    if (m.level && m.level.peak < 0.01 && !p.text) { lastAudio.verdict = 'silent'; return nothing('silent'); }
+  }
   const ctx = { SCREEN: p.screen, VOICE: p.voice, UNITS: p.units, RULES: p.rules, ALLOWED: p.allowed, NOW: p.now, CONSTRUCTIONS: p.constructions, FIELDS: p.fields, PROCESSES: p.processes,
     ROUTES: routesSent, MATERIALS: p.materials, GROUPS: p.groups, CONSTANTS: p.constants, FIGURES: p.figures, RECORDS: p.records, BOMS: p.boms, QUOTES: p.quotes,
     WORKFLOWLIST: p.workflowList, LEARNED: p.learned, HELP_TOPICS: p.topics };
@@ -1277,6 +1308,10 @@ export async function assist(companyId, payload, lang, fetchImpl) {
   if (a.fail) return a.fail;
   const j = a.json || {};
   if (j.transcript) p.transcript = str(j.transcript, 1200);
+  if (m.audio && lastAudio) { lastAudio.transcriptChars = String(j.transcript || '').trim().length; lastAudio.model = a.model; }
+  /* spoken, and no words came back: nothing is planned on a guess */
+  if (m.audio && !p.text && String(j.transcript || '').trim().length < 2) { if (lastAudio) lastAudio.verdict = 'no-words'; return nothing('unheard'); }
+  if (m.audio && lastAudio) lastAudio.verdict = 'heard';
   const checked = checkSteps(p, j.steps);
   const l = String(j.lang || '').toLowerCase();
   let answer = str(j.answer, 6000);
