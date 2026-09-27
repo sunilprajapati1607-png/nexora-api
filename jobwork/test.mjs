@@ -334,4 +334,14 @@ await t('a strong model that says 429 rests, and the next Flash is asked', async
   await resolveModel(true, fakeGoogle({}));
 });
 
+await t('a typed table never goes beside a table worked out from the book', async () => {
+  _resetLimits();
+  const both = await call('POST', '/v1/ai/assist', { device: 'dev-typed001', assist: { text: 'stock by group' } },
+    fakeGoogle({ lang: 'en', answer: 'here', steps: [{ do: 'table', from: 'stock', by: ['group'], show: ['kg'] }], tables: [{ title: 'Stock', columns: ['Group', 'Kg'], rows: [['PP', 3456.75]], total: true }] }));
+  assert.equal(both.json.steps.length, 1); assert.deepEqual(both.json.tables, []);
+  const know = await call('POST', '/v1/ai/assist', { device: 'dev-typed002', assist: { text: 'ITC-04 as a table' } },
+    fakeGoogle({ lang: 'en', answer: 'here', steps: [], tables: [{ title: 'ITC-04', columns: ['Table', 'What'], rows: [['4', 'sent']], total: false }] }));
+  assert.equal(know.json.tables.length, 1);
+});
+
 console.log(pass + ' passed');

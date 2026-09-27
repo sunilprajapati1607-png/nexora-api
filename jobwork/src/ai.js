@@ -671,7 +671,11 @@ export async function assist(device, payload, lang, fetchImpl) {
   if (a.fail) return a.fail;
   const j = a.json || {};
   const checked = checkSteps(p, j.steps);
-  const tables = cleanTables(j.tables);
+  /* 2.0.4 — seen live: asked for stock by material group, the model sent the worked-out table AND one of its
+     own, typed from the summary, with a different total (3,456.75 against the book's 3,904.75). Where the book
+     answers, only the book answers: a typed table goes only with an answer that has no table from the book. */
+  const fromBook = checked.steps.some((x) => x.do === 'table' || x.do === 'window');
+  const tables = fromBook ? [] : cleanTables(j.tables);
   const l = String(j.lang || '').toLowerCase();
   return { httpStatus: 200, body: { ok: true, model: a.model, left: a.left, transcript: str(j.transcript, 1200),
     lang: l === 'gu' || l === 'hi' ? l : 'en', answer: text(j.answer, 9000), speech: str(j.speech, 1200), speechEn: str(j.speechEn, 1200), remember: j.remember ? str(j.remember, 300) : null,
