@@ -592,6 +592,22 @@ export async function checkBom(companyId, payload, lang, fetchImpl) {
    Nothing is created here: the application shows the proposal and the user
    presses Create or Use. The recipes of a new route's stages are then filled
    by Nexora's own learning, marked as suggestions. */
+/* 4.67.19 — owner: "why ther eis tow input window, upper side is working for change and bottom side is just
+   providing information why make every where single". Every Nexora AI window has ONE box now, so each of its
+   jobs (fill the calculation, plan the bag, change the BOM, write the letter, help) also takes the conversation
+   so far — "change it to 95 %" knows what "it" is — and answers a plain question in "answer" instead of making
+   something. The conversation is what the person typed and what came back; a question Google did not answer
+   stays out (answeredOnly). */
+export function convoOf(raw) {
+  const h = raw && typeof raw === 'object' && Array.isArray(raw.history) ? raw.history.slice(-12) : [];
+  return answeredOnly(h.map((x) => ({ role: x && x.role === 'model' ? 'model' : 'user', text: str(x && x.text, 1500) })).filter((x) => x.text));
+}
+export function convoText(h) {
+  return h && h.length ? '\nTHE CONVERSATION SO FAR in this window, oldest first (read "it", "that", "again" from it):\n' +
+    h.map((x) => (x.role === 'user' ? 'Person: ' : 'Nexora AI: ') + x.text).join('\n') + '\n' : '';
+}
+const ANSWER_LINE = 'ONE BOX: the person uses the same box to ask and to have things done. When they only ask a question (why, what, how much, is it…) and ask for nothing to be done, answer it in "answer" \u2014 short and exact, from what is given \u2014 and do nothing else. When they ask for something to be done, do it; "answer" may then say one line or be "".';
+
 export function cleanPlan(p) {
   const x = p && typeof p === 'object' ? p : {};
   const bag = x.bag && typeof x.bag === 'object' ? x.bag : {};
@@ -616,7 +632,8 @@ const PLAN_SYSTEM = [
   'Prefer, in this order: a saved workflow that fits (choice "workflow"); a saved route that fits (choice "route"); otherwise a new route (choice "new").',
   'A new route is an ordered list of process CODES taken ONLY from the process master, each code at most twice. Follow the material: each step should consume what an earlier step produces, or raw material (RM). A bag has BOPP printing and slitting stages only if it is BOPP laminated; the fabric (tape, weaving) and the film (BOPP printing, slitting) meet at lamination. Put lamination after both lines, then backseam or bottom forming, finishing and packing as the bag needs. Do not invent processes; if one is missing, say so in notes.',
   'You do not choose materials, quantities, prices or costs.',
-  'Answer ONLY with JSON: {"summary": string, "choice": "workflow" | "route" | "new", "workflowId": string or null, "routeId": string or null, "route": {"name": string, "steps": [{"code": string, "why": string}]} or null, "notes": [string]}.'
+  ANSWER_LINE + ' A question only: choice "none".',
+  'Answer ONLY with JSON: {"answer": string, "summary": string, "choice": "workflow" | "route" | "new" | "none", "workflowId": string or null, "routeId": string or null, "route": {"name": string, "steps": [{"code": string, "why": string}]} or null, "notes": [string]}.'
 ].join(' ');
 
 /** POST /v1/ai/plan-route — phase 2 */
@@ -627,8 +644,8 @@ export async function planRoute(companyId, payload, lang, fetchImpl) {
   if (!p.text && !p.bag.construction) return { httpStatus: 400, body: { error: 'NOTHING', message: 'Say what the bag is first.' } };
   const m = mediaParts(payload);
   if (m.error) return m.error;
-  const prompt = langLine(lang, 'summary, why and notes') +
-    (m.audio ? 'The person describes the bag in the attached recording.\n' : '') + 'INPUT:\n' + JSON.stringify(p);
+  const prompt = langLine(lang, 'answer, summary, why and notes') +
+    (m.audio ? 'The person describes the bag in the attached recording.\n' : '') + 'INPUT:\n' + JSON.stringify(p) + convoText(convoOf(payload));
   const a = await ask(companyId, PLAN_SYSTEM, m.parts.concat([{ text: prompt }]), fetchImpl, { kind: 'plan-route' });
   if (a.fail) return a.fail;
   const j = a.json || {};
@@ -646,14 +663,14 @@ export async function planRoute(companyId, payload, lang, fetchImpl) {
       seen[s.code] = (seen[s.code] || 0) + 1;
       return seen[s.code] <= 2;
     });
-  let choice = ['workflow', 'route', 'new'].indexOf(j.choice) > -1 ? j.choice : 'new';
+  let choice = ['workflow', 'route', 'new', 'none'].indexOf(j.choice) > -1 ? j.choice : 'new';
   const workflowId = choice === 'workflow' && wfIds[j.workflowId] ? j.workflowId : null;
   const routeId = choice === 'route' && rtIds[j.routeId] ? j.routeId : null;
   if (choice === 'workflow' && !workflowId) choice = steps.length ? 'new' : 'none';
   if (choice === 'route' && !routeId) choice = steps.length ? 'new' : 'none';
   if (choice === 'new' && !steps.length) choice = 'none';
   return { httpStatus: 200, body: {
-    ok: true, model: a.model, left: a.left, summary: str(j.summary, 600), choice: choice,
+    ok: true, model: a.model, left: a.left, answer: str(j.answer, 3000), summary: str(j.summary, 600), choice: choice,
     workflowId: workflowId, routeId: routeId,
     route: choice === 'new' ? { name: str(j.route && j.route.name, 80) || 'Nexora AI route', steps: steps } : null,
     notes: list(j.notes, 6).map((n) => str(n, 300)).filter(Boolean)
@@ -698,7 +715,8 @@ const FILL_SYSTEM = [
   'Units: every field is in the unit FIELDS gives it — this plant\u2019s own (UNITS: sizes and mesh as the plant types them). Put what the person says EXACTLY in those units ("32 by 32" mesh → M.WARP 32, M.WEFT 32; "490 by 550" → width 490, length 550); convert only when the person names a different unit, and say so. GSM in g/m², micron in µm. Width and length are the bag\u2019s flat width and length. Bag quantity is "bagQuantity".',
   'Choose the construction from the list by what they say (layers, laminated or not, block bottom, stitched, valve, liner, pinch). An enum field takes one of its options exactly.',
   'Put in "inputs" only what was actually said, never a guess. List in "missing" each field of the chosen construction that is required but not said, with a short question to ask.',
-  'Answer ONLY with JSON: {"transcript": string, "construction": string or null, "inputs": {"FIELD KEY": number or string}, "bagQuantity": number or null, "missing": [{"key": string, "question": string}], "summary": string}.'
+  ANSWER_LINE + ' A question only: construction null, no inputs, no missing.',
+  'Answer ONLY with JSON: {"answer": string, "transcript": string, "construction": string or null, "inputs": {"FIELD KEY": number or string}, "bagQuantity": number or null, "missing": [{"key": string, "question": string}], "summary": string}.'
 ].join(' ');
 
 export async function fillCalc(companyId, payload, lang, fetchImpl) {
@@ -713,7 +731,7 @@ export async function fillCalc(companyId, payload, lang, fetchImpl) {
     (m.audio ? 'The bag is described in the attached recording.\n' : '') +
     (m.files ? 'The bag is also shown in the attached ' + m.files + ' photo(s) or document(s) — a drawing, a specification sheet or a sample bag: read its sizes and specification carefully; a size printed on a drawing is in the unit written beside it.\n' : '') +
     (p.text ? 'The person typed: ' + p.text + '\n' : '') +
-    'CONTEXT:\n' + JSON.stringify({ units: p.units, constructions: p.constructions, fields: p.fields, current: p.current });
+    'CONTEXT:\n' + JSON.stringify({ units: p.units, constructions: p.constructions, fields: p.fields, current: p.current }) + convoText(convoOf(payload));
   const a = await ask(companyId, FILL_SYSTEM, m.parts.concat([{ text: intro }]), fetchImpl, { kind: 'fill-calc' });
   if (a.fail) return a.fail;
   const j = a.json || {};
@@ -738,7 +756,8 @@ export async function fillCalc(companyId, payload, lang, fetchImpl) {
   const asked = {};
   list(j.missing, 20).forEach((m) => { if (m && fieldOf[m.key]) asked[m.key] = str(m.question, 200); });
   const missing = [];
-  if (!con) missing.push({ key: '__construction', question: lang === 'gu' ? 'કયું construction?' : lang === 'hi' ? 'कौन सा construction?' : 'Which construction is it?', type: 'enum', options: p.constructions.map((c) => c.name) });
+  const onlyAnswer = !!str(j.answer, 3000) && !con && !Object.keys(inputs).length;
+  if (!con && !onlyAnswer) missing.push({ key: '__construction', question: lang === 'gu' ? 'કયું construction?' : lang === 'hi' ? 'कौन सा construction?' : 'Which construction is it?', type: 'enum', options: p.constructions.map((c) => c.name) });
   (con ? con.fields : []).forEach((k) => {
     const f = fieldOf[k];
     if (!f || inputs[k] !== undefined || (p.current.inputs[k] !== undefined && p.current.structure === (con && con.name))) return;
@@ -746,7 +765,7 @@ export async function fillCalc(companyId, payload, lang, fetchImpl) {
   });
   const qty = Number(j.bagQuantity);
   return { httpStatus: 200, body: {
-    ok: true, model: a.model, left: a.left, transcript: str(j.transcript, 800), summary: str(j.summary, 400),
+    ok: true, model: a.model, left: a.left, answer: str(j.answer, 3000), transcript: str(j.transcript, 800), summary: str(j.summary, 400),
     construction: con ? con.name : null, inputs: inputs, bagQuantity: isFinite(qty) && qty > 0 ? Math.round(qty) : null,
     missing: missing, dropped: dropped
   } };
@@ -834,7 +853,8 @@ const EDIT_SYSTEM = [
   'A person tells you, by voice or in writing (English, Gujarati or Hindi), how to change the bill of materials whose STAGES are given (each with its recipe lines and waste). Turn it into changes.',
   'Changes you may make: {"op":"waste","stage":n,"value":percent}; {"op":"add","stage":n,"material":CODE,"basis":"PCT"|"PERBAG_G"|"PER1000"|"ABS","value":number}; {"op":"set","stage":n,"line":k,"value":number}; {"op":"remove","stage":n,"line":k}.',
   'Use only material CODES from the MATERIALS list (match by name or code, e.g. "LD" or "LD granule"), only stages and lines that exist. "percent" of a material is basis PCT (percent of the stage gross). Do not change anything that was not asked. Never invent a price.',
-  'Answer ONLY with JSON: {"summary": string, "transcript": string, "changes": [ ... ], "notes": [string]}.'
+  ANSWER_LINE + ' A question only: no changes (e.g. "is the recipe 100 % now?" — add the stage\u2019s PCT lines and say).',
+  'Answer ONLY with JSON: {"answer": string, "summary": string, "transcript": string, "changes": [ ... ], "notes": [string]}.'
 ].join(' ');
 export async function editBom(companyId, payload, lang, fetchImpl) {
   if (!aiConfigured()) return { httpStatus: 503, body: { error: 'AI_OFF', message: 'Nexora AI is not switched on at the service yet.' } };
@@ -844,7 +864,7 @@ export async function editBom(companyId, payload, lang, fetchImpl) {
   if (!p.stages.length) return { httpStatus: 400, body: { error: 'NOTHING', message: 'There is no route on this BOM to change.' } };
   if (!p.text && !m.parts.length) return { httpStatus: 400, body: { error: 'NOTHING', message: 'Say or type the change first.' } };
   const intro = langLine(lang, 'summary and notes') + (m.audio ? 'The change is said in the attached recording.' + (p.text ? ' Also typed: ' + p.text : '') : 'The change, typed: ' + p.text) +
-    '\nBOM:\n' + JSON.stringify({ stages: p.stages, materials: p.materials });
+    '\nBOM:\n' + JSON.stringify({ stages: p.stages, materials: p.materials }) + convoText(convoOf(payload));
   const a = await ask(companyId, EDIT_SYSTEM, m.parts.concat([{ text: intro }]), fetchImpl, { kind: 'edit-bom' });
   if (a.fail) return a.fail;
   const j = a.json || {};
@@ -870,7 +890,7 @@ export async function editBom(companyId, payload, lang, fetchImpl) {
     }
     refused.push(String(c.op) + ' ' + (c.line || ''));
   });
-  return { httpStatus: 200, body: { ok: true, model: a.model, left: a.left, summary: str(j.summary, 400), transcript: str(j.transcript, 600),
+  return { httpStatus: 200, body: { ok: true, model: a.model, left: a.left, answer: str(j.answer, 3000), summary: str(j.summary, 400), transcript: str(j.transcript, 600),
     changes: changes, notes: list(j.notes, 6).map((n) => str(n, 300)).filter(Boolean).concat(refused.length ? ['Not understood or not allowed: ' + refused.join(', ')] : []) } };
 }
 
@@ -897,7 +917,9 @@ const QUOTE_SYSTEM = [
   'You are Nexora AI, inside Nexora, writing for a PP/PE woven sack manufacturer to its buyer.',
   'From the QUOTATION given, write a short, courteous covering letter (with a subject line) and a WhatsApp message. Use the figures exactly as given; do not add, round or invent any figure, term or promise.',
   'Address the buyer as {{CUSTOMER}} (the application puts the name in); sign as the seller given, or {{SELLER}} if none.',
-  'Answer ONLY with JSON: {"subject": string, "letter": string, "whatsapp": string}.'
+  'The person may ask for the letter again with a change ("make it shorter", "add early delivery"): write it again, whole, from the QUOTATION and the conversation.',
+  ANSWER_LINE + ' A question only: subject, letter and whatsapp "".',
+  'Answer ONLY with JSON: {"answer": string, "subject": string, "letter": string, "whatsapp": string}.'
 ].join(' ');
 export async function quoteLetter(companyId, payload, lang, fetchImpl) {
   if (!aiConfigured()) return { httpStatus: 503, body: { error: 'AI_OFF', message: 'Nexora AI is not switched on at the service yet.' } };
@@ -906,11 +928,11 @@ export async function quoteLetter(companyId, payload, lang, fetchImpl) {
   if (m.error) return m.error;
   if (!p.quote.items.length) return { httpStatus: 400, body: { error: 'NOTHING', message: 'This quotation has no items yet.' } };
   const intro = langLine(lang, 'the letter and the message') + (m.audio ? 'The person also said what to stress, in the attached recording.' : '') +
-    (p.text ? ' The person asks: ' + p.text : '') + '\nQUOTATION:\n' + JSON.stringify(p.quote);
+    (p.text ? ' The person asks: ' + p.text : '') + '\nQUOTATION:\n' + JSON.stringify(p.quote) + convoText(convoOf(payload));
   const a = await ask(companyId, QUOTE_SYSTEM, m.parts.concat([{ text: intro }]), fetchImpl, { kind: 'quote-letter' });
   if (a.fail) return a.fail;
   const j = a.json || {};
-  return { httpStatus: 200, body: { ok: true, model: a.model, left: a.left, subject: str(j.subject, 200), letter: str(j.letter, 4000), whatsapp: str(j.whatsapp, 1500) } };
+  return { httpStatus: 200, body: { ok: true, model: a.model, left: a.left, answer: str(j.answer, 3000), subject: str(j.subject, 200), letter: str(j.letter, 4000), whatsapp: str(j.whatsapp, 1500) } };
 }
 
 /* ---- the helper: how do I…, what is… — from Nexora's own help ------------ */
@@ -935,7 +957,7 @@ export async function help(companyId, payload, lang, fetchImpl) {
   if (m.error) return m.error;
   if (!p.text && !m.parts.length) return { httpStatus: 400, body: { error: 'NOTHING', message: 'Say or type the question first.' } };
   const intro = langLine(lang, 'the answer') + (m.audio ? 'The question is in the attached recording.' + (p.text ? ' Also typed: ' + p.text : '') : 'The question: ' + p.text) +
-    (p.screen ? '\nThe person is on the ' + p.screen + ' window.' : '') + '\nHELP:\n' + JSON.stringify({ topics: p.topics, glossary: p.glossary });
+    (p.screen ? '\nThe person is on the ' + p.screen + ' window.' : '') + '\nHELP:\n' + JSON.stringify({ topics: p.topics, glossary: p.glossary }) + convoText(convoOf(payload));
   const a = await ask(companyId, HELP_SYSTEM, m.parts.concat([{ text: intro }]), fetchImpl, { kind: 'help' });
   if (a.fail) return a.fail;
   const j = a.json || {};
