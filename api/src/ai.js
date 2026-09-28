@@ -329,7 +329,11 @@ async function tryModel(name, base, fetchImpl, ms, kind, cancel) {
   return first;
 }
 async function tryModelOnce(name, base, fetchImpl, ms, kind, cancel) {
-  const payload = payloadFor(base, name);
+  const payload = base.classic
+    /* 4.67.17 A/B — the request exactly as it went to Google before this evening's update */
+    ? JSON.stringify({ systemInstruction: base.systemInstruction, contents: base.contents,
+        generationConfig: { temperature: 0.2, responseMimeType: 'application/json', maxOutputTokens: base.generationConfig.maxOutputTokens } })
+    : payloadFor(base, name);
   const t0 = Date.now();
   const rec = { at: new Date(t0).toISOString(), kind: kind, model: name };
   let r;
@@ -458,6 +462,33 @@ function race(first, payload, fetchImpl, kind, deadline, skip) {
     run(first);
   });
 }
+/* 4.67.17 A/B — owner: "AA PROBLEM AAJ SANJ NA UPDATE PASI J AAVI che" (the trouble came only after this evening's
+   update). To tell our change from Google's, the questions go to Google EXACTLY as before the update — the same
+   request (temperature 0.2, 2048 words' room unless the question asks more, no thinking setting) and the same order
+   (the stronger model for 12 s, then the usual one; one at a time, no second model, no rounds) — while every call
+   is still noted on /health. If this answers where the new way did not, the new way was the cause and this stays. */
+let classicMode = true;
+export function _setClassic(on) { classicMode = on; }
+async function askClassic(companyId, t, name, payload, fetchImpl, opts, kind) {
+  let strongTried = null;
+  const strong = opts.strong && Date.now() > strongRestUntil ? strongOf(model.available || []) : null;
+  if (strong && strong !== name) {
+    strongTried = strong;
+    const rs = await tryModel(strong, payload, fetchImpl, STRONG_MS, kind + '/strong');
+    if (rs.ok) return { json: rs.json, model: strong, left: t.left };
+    strongRestUntil = Date.now() + STRONG_REST_MS;
+  }
+  let res = await tryModel(name, payload, fetchImpl, strongTried ? 58000 : TIMEOUT_MS, kind + '/classic');
+  /* 4.67.1 — a retired model: the one Google names is asked, as before */
+  if (!res.ok && res.why === 'retired') {
+    const next = res.named || await resolveModel(true, fetchImpl);
+    if (next && next !== name && !blocked.has(next)) {
+      res = await tryModel(next, payload, fetchImpl, 30000, kind + '/classic');
+      if (res.ok) model = Object.assign({}, model, { name: next, at: Date.now(), error: 'switched to ' + next + ' (Google retired the one before)' });
+    }
+  }
+  return res.ok ? { json: res.json, model: res.name, left: t.left } : res;
+}
 async function ask(companyId, system, prompt, fetchImpl, opts) {
   opts = opts || {};
   if (!aiConfigured()) return { fail: { httpStatus: 503, body: { error: 'AI_OFF', message: 'Nexora AI is not switched on at the service yet.' } } };
@@ -472,16 +503,23 @@ async function ask(companyId, system, prompt, fetchImpl, opts) {
   const payload = {
     systemInstruction: { parts: [{ text: system }] },
     contents: (prompt && prompt.contents) ? prompt.contents : [{ role: 'user', parts: Array.isArray(prompt) ? prompt : [{ text: prompt }] }],   /* text, parts (a recording + text), or a whole conversation */
-    generationConfig: { responseMimeType: 'application/json', maxOutputTokens: opts.maxTokens || 8192 }
+    generationConfig: { responseMimeType: 'application/json', maxOutputTokens: opts.maxTokens || (classicMode ? 2048 : 8192) }
   };
-  /* the stronger model first (12 s), then the usual one with what is left */
-  const strong = opts.strong && Date.now() > strongRestUntil ? strongOf(genNames.length ? genNames : model.available || []) : null;
-  if (strong && strong !== name) {
-    const rs = await tryModel(strong, payload, fetchImpl, STRONG_MS, kind + '/strong');
-    if (rs.ok) return { json: rs.json, model: strong, left: t.left };
-    strongRestUntil = Date.now() + STRONG_REST_MS;
+  if (classicMode) payload.classic = true;
+  let res;
+  if (classicMode) {
+    res = await askClassic(companyId, t, name, payload, fetchImpl, opts, kind);
+    if (res.json && !res.why) return res;
+  } else {
+    /* the stronger model first (12 s), then the usual one with what is left */
+    const strong = opts.strong && Date.now() > strongRestUntil ? strongOf(genNames.length ? genNames : model.available || []) : null;
+    if (strong && strong !== name) {
+      const rs = await tryModel(strong, payload, fetchImpl, STRONG_MS, kind + '/strong');
+      if (rs.ok) return { json: rs.json, model: strong, left: t.left };
+      strongRestUntil = Date.now() + STRONG_REST_MS;
+    }
+    res = await race(name, payload, fetchImpl, kind, deadline, strong ? [strong] : []);
   }
-  const res = await race(name, payload, fetchImpl, kind, deadline, strong ? [strong] : []);
   if (res.ok) {
     /* 4.67.1 — the usual model was retired on the way: the one that answered is the usual one now */
     if (blocked.has(name) && res.name !== name) model = Object.assign({}, model, { name: res.name, at: Date.now(), error: 'switched to ' + res.name + ' (Google retired the one before)' });
