@@ -352,7 +352,8 @@ async function tryModelOnce(name, base, fetchImpl, ms, kind, cancel) {
     /* 4.67.17 — only a 404 or "no longer available" retires a model; a 400 about a file type is not the model's fault */
     const gone = r.status === 404 || /no longer available|deprecated/i.test(msg);
     rec.outcome = gone ? 'retired' : r.status === 429 ? 'busy' : 'http';
-    rec.code = scrub(msg).slice(0, 80);
+    /* a quota refusal names its metric and limit (tokens or requests, per minute or per day): kept whole */
+    rec.code = r.status === 429 ? scrub(msg).replace(/s+/g, ' ').slice(0, 300) : scrub(msg).slice(0, 80);
     noteCall(rec);
     if (gone) blocked.add(name);
     /* 4.67.1 — Google names the model to use instead: that one is asked next */
