@@ -579,6 +579,18 @@ function errCode(e) {
 /** The request for one model: Gemini 3 keeps its own temperature (Google: below 1.0 it may loop), the
     older ones 0.2; the least thinking (thinkingFor); room for 8192 tokens (Gujarati and Hindi need many). */
 export function payloadFor(base, name) {
+  /* 4.67.17 — GEMMA, THE LAST RESORT. Measured live 2026-09-28 22:20: Google answered 503 "high demand" for
+     every Gemini model on both keys for over an hour; the Gemma models on the same key are served apart.
+     Gemma takes no system instruction, no JSON mode and no thinking setting: the instructions go first in
+     the person's first turn, and the answer's JSON is cut out of its words. */
+  if (/^gemma-/.test(String(name || ''))) {
+    const contents = JSON.parse(JSON.stringify(base.contents || []));
+    const sys = ((base.systemInstruction && base.systemInstruction.parts) || []).map((p) => p.text || '').join('\n');
+    const first = contents.filter((c) => c.role === 'user')[0];
+    const lead = { text: 'INSTRUCTIONS (follow them exactly; answer with the JSON asked for and nothing else):\n' + sys + '\n\n' };
+    if (first) first.parts = [lead].concat(first.parts || []); else contents.unshift({ role: 'user', parts: [lead] });
+    return JSON.stringify({ contents: contents, generationConfig: { maxOutputTokens: (base.generationConfig && base.generationConfig.maxOutputTokens) || 8192 } });
+  }
   const g = Object.assign({}, base.generationConfig);
   const v = /^gemini-(\d+)/.exec(String(name || ''));
   if (!v || Number(v[1]) < 3) g.temperature = 0.2;
@@ -635,12 +647,17 @@ async function tryModel(name, base, fetchImpl, ms, kind, cancel) {
 /** Every model a question may go to, in order: the usual one, the other Flash-Lites (newest first), then the
     Flashes (newest first). 4.67.17 — measured live 22:05: every model said 503 "high demand" except
     gemini-3.6-flash, which the retry never reached (it went round two models only). Now it goes down the list. */
-export function candidatesOf(first, names, skip) {
+/** 'gemma-4-31b-it' → newer first, then bigger */
+function gemmaRank(n) { const m = /^gemma-(\d+)(?:\.(\d+))?-(\d+)b/.exec(n); return m ? Number(m[1]) * 1e4 + Number(m[2] || 0) * 100 + Number(m[3]) : 0; }
+export function candidatesOf(first, names, skip, base) {
   const not = [first].concat(skip || []);
-  const pool = (names || []).filter((n) => not.indexOf(n) < 0 && !blocked.has(n) && rankOf(n) !== null);
+  const pool = (names || []).filter((n) => not.indexOf(n) < 0 && !blocked.has(n) && (rankOf(n) !== null || /^gemma-\d/.test(n)));
   const lites = pool.filter((n) => /flash-lite(?:-\d{3})?$/.test(n)).sort((a, b) => rankOf(b) - rankOf(a));
   const flashes = pool.filter((n) => /-flash(?:-\d{3})?$/.test(n) && !(resting.get(n) > Date.now())).sort((a, b) => flashRank(b) - flashRank(a));
-  return [first].concat(lites, flashes);
+  /* Gemma last — only where nothing but words goes (it hears no recording and reads no file) */
+  const words = !JSON.stringify(base || {}).includes('"inlineData"');
+  const gemma = words ? pool.filter((n) => /^gemma-\d/.test(n)).sort((a, b) => gemmaRank(b) - gemmaRank(a)) : [];
+  return [first].concat(lites, flashes, gemma);
 }
 /** The second model for a slow or failing question. */
 export function backupOf(name, names, skip) { return candidatesOf(name, names, skip)[1] || null; }
@@ -659,7 +676,7 @@ const handsOver = (res) => res.why === 'timeout' || res.why === 'network' || res
 function race(first, payload, fetchImpl, kind, deadline, skip) {
   return new Promise((resolve) => {
     let done = false, running = 0, last = null, tries = 0, round = 0, timer = null;
-    const order = candidatesOf(first, model.available || [], skip);
+    const order = candidatesOf(first, model.available || [], skip, payload);
     let nextAt = 1;                              /* the next model down the list this round */
     const ctrls = [];
     const left = () => deadline - Date.now();
