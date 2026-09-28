@@ -118,7 +118,7 @@ export async function resolveModel(force, fetchImpl) {
 /** For /health — cached, never waits on Google. */
 export function aiStatus() {
   if (aiConfigured() && (!model.at || Date.now() - model.at > MODEL_TTL_MS)) resolveModel(false).catch(() => {});
-  return { configured: aiConfigured(), keyFrom: keySource(), model: model.name, strong: strongModel(), ear: earModel(), voice: voiceModel(), note: model.error || null };
+  return { configured: aiConfigured(), keyFrom: keySource(), model: model.name, strong: strongModel(), ear: earModel(), voice: voiceModel(), note: model.error || null, lastAudio: lastAudio };
 }
 
 /* ---- the ear and the voice (2.0.3) ------------------------------------------
@@ -212,6 +212,44 @@ const MEDIA_TYPES = {
   'image/jpeg': 1, 'image/png': 1, 'image/webp': 1, 'image/heic': 1, 'application/pdf': 1
 };
 const MAX_MEDIA_B64 = 8 * 1024 * 1024;
+/* 2.1.1 — as the weight calculator's service (4.67.13): what a 16-bit WAV holds is measured — its
+   seconds and how loud it is. A recording that is all but silent is the microphone's doing, not
+   Google's; it is said so, and nothing is planned. Never the sound, never the words, are kept. */
+export function wavLevel(b64) {
+  try {
+    const buf = Buffer.from(String(b64 || ''), 'base64');
+    if (buf.length < 44 || buf.toString('ascii', 0, 4) !== 'RIFF' || buf.toString('ascii', 8, 12) !== 'WAVE') return null;
+    const rate = buf.readUInt32LE(24), bits = buf.readUInt16LE(34);
+    let off = 12, dataAt = -1, dataLen = 0;
+    while (off + 8 <= buf.length) { const id = buf.toString('ascii', off, off + 4), len = buf.readUInt32LE(off + 4); if (id === 'data') { dataAt = off + 8; dataLen = Math.min(len, buf.length - off - 8); break; } off += 8 + len; }
+    if (dataAt < 0 || bits !== 16 || !rate) return null;
+    const n = Math.floor(dataLen / 2);
+    let sum = 0, peak = 0;
+    for (let i = 0; i < n; i++) { const v = buf.readInt16LE(dataAt + i * 2) / 32768; sum += v * v; if (Math.abs(v) > peak) peak = Math.abs(v); }
+    return { seconds: Math.round(n / rate * 10) / 10, rms: n ? Math.round(Math.sqrt(sum / n) * 10000) / 10000 : 0, peak: Math.round(peak * 1000) / 1000 };
+  } catch (e) { return null; }
+}
+let lastAudio = null;
+export function audioStatus() { return lastAudio; }
+function noteAudio(m, where) {
+  lastAudio = { at: new Date().toISOString(), where: where, bytes: m.audioBytes, seconds: m.level ? m.level.seconds : null,
+    rms: m.level ? m.level.rms : null, peak: m.level ? m.level.peak : null, transcriptChars: null, verdict: null };
+  if (m.level && m.level.peak < 0.01) { lastAudio.verdict = 'silent'; return true; }
+  return false;
+}
+const NOTHING_SAID = {
+  silent: { en: 'The recording came through silent — check the microphone (Windows → Settings → Privacy → Microphone), then say it again or type it. Nothing was done.',
+    gu: 'રેકોર્ડિંગમાં અવાજ જ નથી આવ્યો — microphone તપાસો (Windows → Settings → Privacy → Microphone), પછી ફરી બોલો કે લખો. કશું કર્યું નથી.',
+    hi: 'रिकॉर्डिंग में आवाज़ ही नहीं आई — microphone जाँचें, फिर से बोलें या लिखें। कुछ नहीं किया।' },
+  unheard: { en: 'I could not hear that — please say it again, or type it. Nothing was done.',
+    gu: 'હું સાંભળી ન શક્યો — ફરી બોલો કે લખો. કશું કર્યું નથી.',
+    hi: 'मैं सुन नहीं पाया — फिर से बोलें या लिखें। कुछ नहीं किया।' }
+};
+function nothingHeard(why, lang) {
+  const lg = lang === 'gu' || lang === 'hi' ? lang : 'en';
+  return { httpStatus: 200, body: { ok: true, model: null, transcript: '', lang: lg, heard: false, silent: why === 'silent',
+    answer: NOTHING_SAID[why][lg], speech: '', speechEn: NOTHING_SAID[why].en, remember: null, forget: [], next: [], run: false, steps: [], dropped: [], tables: [] } };
+}
 export function mediaParts(payload) {
   const x = payload && typeof payload === 'object' ? payload : {};
   const all = [].concat(x.audio && typeof x.audio === 'object' ? [x.audio] : [], Array.isArray(x.attachments) ? x.attachments.slice(0, 4) : []);
@@ -225,7 +263,9 @@ export function mediaParts(payload) {
     if (total > MAX_MEDIA_B64) return { error: { httpStatus: 413, body: { error: 'MEDIA_BIG', message: 'That is too much to send at once — a minute of speech, or a few photos.' } } };
     parts.push({ inlineData: { mimeType: mime, data: data } });
   }
-  return { parts: parts, audio: all.some((m) => /^audio\//.test(String(m && m.mime))), files: all.filter((m) => !/^audio\//.test(String(m && m.mime))).length };
+  const au = all.filter((m) => /^audio\//.test(String(m && m.mime)))[0];
+  return { parts: parts, audio: !!au, files: all.filter((m) => !/^audio\//.test(String(m && m.mime))).length,
+    level: au ? wavLevel(au.data) : null, audioBytes: au ? Math.round(String(au.data || '').length * 3 / 4) : 0 };
 }
 
 /* ---- what may be sent ---------------------------------------------------- */
@@ -584,6 +624,7 @@ export async function transcribe(device, payload, fetchImpl) {
   const m = mediaParts(payload);
   if (m.error) return m.error;
   if (!m.audio) return { httpStatus: 400, body: { error: 'NOTHING', message: 'No recording came.' } };
+  if (noteAudio(m, 'ear')) return { httpStatus: 200, body: { ok: true, model: null, text: '', lang: 'en', silent: true } };
   const t = takeMinute();
   if (t.busy) return { httpStatus: 429, body: { error: 'AI_BUSY', retryAfter: t.busy, message: 'Nexora AI is busy \u2014 try again in ' + t.busy + ' seconds.' } };
   await resolveModel(false, fetchImpl);
@@ -614,7 +655,9 @@ export async function transcribe(device, payload, fetchImpl) {
   if (!r.ok) return { httpStatus: r.status === 429 ? 429 : 502, body: { error: r.status === 429 ? 'AI_BUSY' : 'AI_FAILED', message: r.status === 429 ? 'Nexora AI is busy (Google\u2019s limit) \u2014 try again in a minute.' : 'Nexora AI could not hear it (' + r.status + ').' } };
   const j = readJsonAnswer(r.body) || {};
   const l = String(j.lang || '').toLowerCase();
-  return { httpStatus: 200, body: { ok: true, model: name, text: text(j.text, 1500).trim(), lang: l === 'gu' || l === 'hi' ? l : 'en' } };
+  const heardText = text(j.text, 1500).trim();
+  if (lastAudio) { lastAudio.transcriptChars = heardText.length; lastAudio.verdict = heardText.length < 2 ? 'no-words' : 'heard'; }
+  return { httpStatus: 200, body: { ok: true, model: name, text: heardText, lang: l === 'gu' || l === 'hi' ? l : 'en' } };
 }
 
 /* ---- POST /v1/ai/speak — the answer read aloud (a WAV) -------------------------- */
@@ -662,6 +705,7 @@ export async function assist(device, payload, lang, fetchImpl) {
   const m = mediaParts(payload);
   if (m.error) return m.error;
   if (!p.text && !m.parts.length) return { httpStatus: 400, body: { error: 'NOTHING', message: 'Say or type something first.' } };
+  if (m.audio && noteAudio(m, 'assist') && !p.text) return nothingHeard('silent', lang);
   const ctx = { SCREEN: p.screen, ROLE: p.role, ALLOWED: p.allowed, RULES: p.rules, SCREEN_TEXT: p.screenText, ATTENTION: p.attention, TODAY: p.today, VOICE: !!(payload && payload.voice), NOW: p.now, PARTIES: p.parties, ITEMS: p.items, GROUPS: p.groups, WAREHOUSES: p.warehouses,
     PROCESSES: p.processes, ROUTES: p.routes, PLANS: p.plans, ORDERS: p.orders, STOCK: p.stock, PENDING: p.pending, HELP_TOPICS: p.topics };
   const contents = [{ role: 'user', parts: [{ text: 'CONTEXT:\n' + JSON.stringify(ctx) }] },
@@ -672,6 +716,10 @@ export async function assist(device, payload, lang, fetchImpl) {
   const a = await ask(device, SYSTEM, { contents: contents }, fetchImpl, { strong: !(payload && payload.voice) });
   if (a.fail) return a.fail;
   const j = a.json || {};
+  if (m.audio && lastAudio) lastAudio.transcriptChars = String(j.transcript || '').trim().length;
+  /* spoken, and no words came back: nothing is planned on a guess from the conversation before */
+  if (m.audio && !p.text && String(j.transcript || '').trim().length < 2) { if (lastAudio) lastAudio.verdict = 'no-words'; return nothingHeard('unheard', lang); }
+  if (m.audio && lastAudio) lastAudio.verdict = 'heard';
   const checked = checkSteps(p, j.steps);
   /* 2.0.4 — seen live: asked for stock by material group, the model sent the worked-out table AND one of its
      own, typed from the summary, with a different total (3,456.75 against the book's 3,904.75). Where the book

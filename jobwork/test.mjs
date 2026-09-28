@@ -154,11 +154,41 @@ await t('limits: per device a day, then tomorrow', async () => {
 
 await t('a recording goes as audio; a wrong file type is refused', async () => {
   _resetLimits(); sent.length = 0;
-  const ok = await call('POST', '/v1/ai/assist', { device: 'dev-12345678', assist: { audio: { mime: 'audio/webm;codecs=opus', data: 'AAAA' } } }, fakeGoogle({ lang: 'gu', transcript: 'x', answer: 'y', steps: [] }));
+  const ok = await call('POST', '/v1/ai/assist', { device: 'dev-12345678', assist: { audio: { mime: 'audio/webm;codecs=opus', data: 'AAAA' } } }, fakeGoogle({ lang: 'gu', transcript: 'stock ketlo che', answer: 'y', steps: [] }));
   assert.equal(ok.status, 200); assert.equal(ok.json.lang, 'gu');
   assert.ok(sent.some((s) => /inlineData/.test(s.body) && /audio\/webm/.test(s.body)));
   const bad = await call('POST', '/v1/ai/assist', { device: 'dev-12345678', assist: { attachments: [{ mime: 'application/x-msdownload', data: 'AAAA' }] } }, fakeGoogle({}));
   assert.equal(bad.status, 400);
+});
+
+/* 2.1.1 — as the weight calculator's service 4.67.13: the microphone that is off */
+function wavB64(seconds, amp) {
+  const rate = 16000, n = Math.round(seconds * rate), buf = Buffer.alloc(44 + n * 2);
+  buf.write('RIFF', 0); buf.writeUInt32LE(36 + n * 2, 4); buf.write('WAVE', 8); buf.write('fmt ', 12);
+  buf.writeUInt32LE(16, 16); buf.writeUInt16LE(1, 20); buf.writeUInt16LE(1, 22); buf.writeUInt32LE(rate, 24);
+  buf.writeUInt32LE(rate * 2, 28); buf.writeUInt16LE(2, 32); buf.writeUInt16LE(16, 34); buf.write('data', 36); buf.writeUInt32LE(n * 2, 40);
+  for (let i = 0; i < n; i++) buf.writeInt16LE(Math.round(Math.sin(i / 8) * amp * 32767), 44 + i * 2);
+  return buf.toString('base64');
+}
+await t('a silent recording goes nowhere: the ear and the question both say "check the microphone", Google is not asked', async () => {
+  _resetLimits(); sent.length = 0;
+  const silent = { mime: 'audio/wav', data: wavB64(2, 0) };
+  const e = await call('POST', '/v1/ai/transcribe', { device: 'dev-12345678', audio: silent }, fakeGoogle({ text: 'open stock', lang: 'en' }));
+  const a = await call('POST', '/v1/ai/assist', { device: 'dev-12345678', lang: 'gu', assist: { audio: silent } }, fakeGoogle({ lang: 'en', transcript: 'open stock', answer: 'x', steps: [{ do: 'open', view: 'stock' }] }));
+  assert.equal(sent.length, 0, 'nothing went to Google');
+  assert.equal(a.status, 200); assert.deepEqual(a.json.steps, []); assert.equal(a.json.silent, true);
+  assert.ok(/microphone/.test(a.json.answer), a.json.answer);
+  assert.equal(e.status, 200); assert.equal(e.json.text, ''); assert.equal(e.json.silent, true);
+  const h = await call('GET', '/health');
+  assert.equal(h.json.ai.lastAudio.verdict, 'silent');
+  assert.equal(h.json.ai.lastAudio.seconds, 2);
+});
+await t('spoken, and no words heard: nothing is planned from the conversation before', async () => {
+  _resetLimits(); sent.length = 0;
+  const r = await call('POST', '/v1/ai/assist', { device: 'dev-12345678', assist: { audio: { mime: 'audio/wav', data: wavB64(1.5, 0.3) } } },
+    fakeGoogle({ lang: 'en', transcript: '', answer: 'Opening the stock', steps: [{ do: 'open', view: 'stock' }] }));
+  assert.equal(sent.length, 1);
+  assert.deepEqual(r.json.steps, []); assert.ok(/could not hear/.test(r.json.answer), r.json.answer);
 });
 
 await t('Gujarati asked for by name is said to Gemini', async () => {
