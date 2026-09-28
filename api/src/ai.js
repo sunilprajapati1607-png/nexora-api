@@ -467,7 +467,9 @@ function race(first, payload, fetchImpl, kind, deadline, skip) {
    request (temperature 0.2, 2048 words' room unless the question asks more, no thinking setting) and the same order
    (the stronger model for 12 s, then the usual one; one at a time, no second model, no rounds) — while every call
    is still noted on /health. If this answers where the new way did not, the new way was the cause and this stays. */
-let classicMode = true;
+/* the A/B answered (2026-09-28 22:46-22:47 IST): the classic request got the same 503 "high demand" from Google —
+   the trouble is Google's free tier, not the update — so the new way (more models, rounds, Gemma) is back on */
+let classicMode = false;
 export function _setClassic(on) { classicMode = on; }
 async function askClassic(companyId, t, name, payload, fetchImpl, opts, kind) {
   let strongTried = null;
