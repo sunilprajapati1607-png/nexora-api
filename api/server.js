@@ -35,11 +35,20 @@ function toRequest(req) {
   if (method === 'GET' || method === 'HEAD') return new Request(url, { method, headers });
   return new Promise((resolve, reject) => {
     const chunks = [];
-    req.on('data', (c) => chunks.push(c));
+    /* 4.67.17 — a request is at most 64 MB (a sync push of 200 records, or a minute of speech and four photos, is well under it):
+       a larger one is refused before it is held in memory */
+    let size = 0;
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > MAX_BODY) { chunks.length = 0; req.pause(); reject(Object.assign(new Error('too big'), { tooBig: true })); return; }
+      chunks.push(c);
+    });
     req.on('end', () => resolve(new Request(url, { method, headers, body: Buffer.concat(chunks) })));
     req.on('error', reject);
   });
 }
+
+const MAX_BODY = 64 * 1024 * 1024;
 
 createServer(async (req, res) => {
   try {
@@ -51,6 +60,12 @@ createServer(async (req, res) => {
     const body = Buffer.from(await response.arrayBuffer());
     res.end(body);
   } catch (e) {
+    if (e && e.tooBig) {
+      res.writeHead(413, { 'content-type': 'application/json', connection: 'close' });
+      res.end(JSON.stringify({ error: 'TOO_BIG', message: 'That is too much to send at once.' }));
+      try { req.destroy(); } catch (x) { /* gone */ }
+      return;
+    }
     /* Rule #35 again: never a bare 500. */
     res.writeHead(500, { 'content-type': 'application/json' });
     res.end(JSON.stringify({

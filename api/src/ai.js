@@ -35,7 +35,16 @@ const API = 'https://generativelanguage.googleapis.com/v1beta';
    (then Flash) the key lists — a model Google refuses is set aside and
    the one it names is tried in the same request. */
 export const DEFAULT_MODEL = 'gemini-3.5-flash-lite';
-const blocked = new Set();                       // models Google has refused this run
+/* 4.67.17 — a model Google refused is set aside for an HOUR, not until the next restart (pg_cron keeps the
+   service up all day, and one odd 404 must not leave every company without Nexora AI) */
+const BLOCK_MS = 60 * 60 * 1000;
+const blockedAt = new Map();                     // model -> when Google refused it
+const blocked = {
+  has: (n) => { const t = blockedAt.get(n); if (t === undefined) return false; if (Date.now() - t > BLOCK_MS) { blockedAt.delete(n); return false; } return true; },
+  add: (n) => { blockedAt.set(n, Date.now()); return blocked; },
+  clear: () => blockedAt.clear(),
+  get size() { return blockedAt.size; }
+};
 /** 'gemini-3.5-flash-lite' → a sort key: flash-lite before flash, newer first */
 function rankOf(n) {
   const m = /^gemini-(\d+)(?:\.(\d+))?-(flash-lite|flash)(?:-(\d{3}))?$/.exec(n);
@@ -71,12 +80,18 @@ function scrub(s) {
 /* ---- the model ---------------------------------------------------------- */
 let model = { name: null, at: 0, error: null, available: [] };
 let allNames = [];                   /* 4.67.8 — every model the key lists, the voice ones too */
+let genNames = [];                   /* 4.67.17 — every model that can answer (the list shown on /health is cut at 40) */
+const LIST_MS = 8000;                /* the list of models: a question never waits long on it */
 let resolving = null;
 
-async function gfetch(url, opts, fetchImpl, ms) {
+async function gfetch(url, opts, fetchImpl, ms, cancel) {
   const f = fetchImpl || globalThis.fetch;
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), ms || TIMEOUT_MS);
+  let timedOut = false;
+  const timer = setTimeout(() => { timedOut = true; ctrl.abort(); }, ms || TIMEOUT_MS);
+  /* 4.67.17 — a question answered by another model stops this one */
+  const stop = () => ctrl.abort();
+  if (cancel) { if (cancel.aborted) ctrl.abort(); else cancel.addEventListener('abort', stop, { once: true }); }
   try {
     const r = await f(url, Object.assign({}, opts, { signal: ctrl.signal,
       headers: Object.assign({ 'content-type': 'application/json', 'x-goog-api-key': key() }, (opts && opts.headers) || {}) }));
@@ -84,7 +99,12 @@ async function gfetch(url, opts, fetchImpl, ms) {
     let body = {};
     try { body = text ? JSON.parse(text) : {}; } catch (e) { body = { raw: text.slice(0, 200) }; }
     return { ok: r.ok, status: r.status, body };
-  } finally { clearTimeout(timer); }
+  } catch (e) {
+    /* what kind of failure: our clock ran out, another model answered first, or Google could not be reached */
+    const err = (e && typeof e === 'object') ? e : new Error(String(e));
+    try { err.nxKind = timedOut ? 'timeout' : (cancel && cancel.aborted) ? 'cancelled' : 'network'; } catch (x) { /* frozen */ }
+    throw err;
+  } finally { clearTimeout(timer); if (cancel) cancel.removeEventListener('abort', stop); }
 }
 
 /** Which model to use: the one asked for if the key has it, else a Flash that it has. */
@@ -95,12 +115,13 @@ export async function resolveModel(force, fetchImpl) {
   resolving = (async () => {
     const wanted = String(process.env.GEMINI_MODEL || DEFAULT_MODEL).trim().replace(/^models\//, '');
     try {
-      const r = await gfetch(API + '/models?pageSize=200', { method: 'GET' }, fetchImpl);
+      const r = await gfetch(API + '/models?pageSize=200', { method: 'GET' }, fetchImpl, LIST_MS);
       if (!r.ok) throw new Error('models list ' + r.status + ': ' + scrub(r.body && r.body.error && r.body.error.message));
       const names = ((r.body && r.body.models) || [])
         .filter((m) => (m.supportedGenerationMethods || []).indexOf('generateContent') > -1)
         .map((m) => String(m.name || '').replace(/^models\//, ''));
       allNames = ((r.body && r.body.models) || []).map((m) => String(m.name || '').replace(/^models\//, ''));
+      genNames = names.slice();
       const pick = (names.indexOf(wanted) > -1 && !blocked.has(wanted)) ? wanted : bestOf(names);
       model = { name: pick, at: Date.now(), error: pick ? (pick === wanted ? null : 'asked for ' + wanted + ', using ' + pick) : 'no usable model on this key', available: names.slice(0, 40) };
     } catch (e) {
@@ -115,7 +136,7 @@ export async function resolveModel(force, fetchImpl) {
 /** For /health — cached, never waits on Google. */
 export function aiStatus() {
   if (aiConfigured() && (!model.at || Date.now() - model.at > MODEL_TTL_MS)) resolveModel(false).catch(() => {});
-  return { configured: aiConfigured(), model: model.name, note: model.error || null, lastAudio: lastAudio };
+  return { configured: aiConfigured(), model: model.name, note: model.error || null, lastAudio: lastAudio, recent: recentCalls.slice(-12) };
 }
 
 /* ---- limits ------------------------------------------------------------- */
@@ -123,7 +144,8 @@ const perCompany = new Map();        // companyId -> { day, n }
 let recent = [];                     // times of the last minute's calls
 const daily = () => Math.max(1, parseInt(process.env.AI_DAILY_PER_COMPANY, 10) || 60);
 const perMinute = () => Math.max(1, parseInt(process.env.AI_PER_MINUTE, 10) || 10);
-function today() { return new Date().toISOString().slice(0, 10); }
+/* 4.67.17 — the day is India's (the plants' own midnight, not 05:30 in the morning) */
+function today() { return new Date(Date.now() + 330 * 60000).toISOString().slice(0, 10); }
 function take(companyId) {
   const now = Date.now();
   recent = recent.filter((t) => now - t < 60000);
@@ -138,6 +160,11 @@ function take(companyId) {
   return { left: daily() - used - 1 };
 }
 export function _resetLimits() { perCompany.clear(); recent = []; }
+/* 4.67.17 — a question that Google did not answer (slow, busy, unreachable) is not counted against the company's day */
+function giveBack(companyId) {
+  const c = perCompany.get(String(companyId || 'none'));
+  if (c && c.day === today() && c.n > 0) c.n--;
+}
 
 /* ---- what may be sent ---------------------------------------------------- */
 const str = (v, n) => String(v == null ? '' : v).replace(/[\u0000-\u001f]/g, ' ').slice(0, n || 80);
@@ -214,6 +241,32 @@ const STRONG_MS = 12000;
 const STRONG_REST_MS = 15 * 60 * 1000;
 let strongRestUntil = 0;
 export function _resetStrong() { strongRestUntil = 0; }
+/* 4.67.17 — "didnt got answered": the same help question was answered in about 20 s once and not in
+   60 s the next — Google's free Flash-Lite is sometimes slow, not Nexora. Now:
+   - the whole question has 68 s (the application waits 75 s), whatever is tried inside it;
+   - a question the usual model has not answered in HEDGE_MS is ALSO asked of a second model (another
+     Flash-Lite the key lists, else the Flash), and the first answer wins; a model that is busy (429),
+     overloaded (5xx), unreachable, retired or unreadable hands over to it at once;
+   - every call is noted — when, which kind of question, which model, how long, how it ended; never
+     what was asked or answered — and /health shows the last ones, so a slow day is seen, not guessed. */
+let deadlineMs = 68000;
+export function _setDeadline(ms) { deadlineMs = ms; }
+let hedgeMs = 15000;
+export function _setHedge(ms) { hedgeMs = ms; }
+const recentCalls = [];
+export function aiRecent() { return recentCalls.slice(); }
+function noteCall(rec) {
+  recentCalls.push(rec);
+  while (recentCalls.length > 25) recentCalls.shift();
+  if (process.env.RENDER) {
+    try { console.log('[ai] ' + rec.kind + ' ' + rec.model + ' ' + rec.outcome + (rec.status ? ' ' + rec.status : '') + ' ' + rec.ms + 'ms' +
+      (rec.inTok ? ' in=' + rec.inTok : '') + (rec.outTok ? ' out=' + rec.outTok : '') + (rec.code ? ' ' + rec.code : '')); } catch (e) { /* no log */ }
+  }
+}
+function errCode(e) {
+  const c = e && e.cause;
+  return String((c && (c.code || c.name)) || (e && (e.code || e.name)) || 'error');
+}
 function readJson(r) {
   const parts = (((r.body && r.body.candidates) || [])[0] || {}).content;
   /* a thinking model may send its thought as a part of its own: only the answer's text is read */
@@ -221,58 +274,144 @@ function readJson(r) {
     .replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '');
   try { return text ? JSON.parse(text) : null; } catch (e) { return null; }
 }
+/** The request for one model. 4.67.17 — Google's advice for Gemini 3 and later is to leave the temperature
+    at its own 1.0 (below it the model may loop until its words run out); the older ones keep 0.2. The
+    stronger Flash thinks at "medium" unless told — "low" lets it answer inside its 12 s. */
+export function payloadFor(base, name) {
+  const g = Object.assign({}, base.generationConfig);
+  const v = /^gemini-(\d+)/.exec(String(name || ''));
+  const gen = v ? Number(v[1]) : 0;
+  if (gen < 3) g.temperature = 0.2;
+  if (gen >= 3 && /-flash$/.test(name)) g.thinkingConfig = { thinkingLevel: 'low' };
+  return JSON.stringify(Object.assign({}, base, { generationConfig: g }));
+}
+/** One model, asked once. → {ok:true, json, name} or {ok:false, why, status, r, name, named} */
+async function tryModel(name, base, fetchImpl, ms, kind, cancel) {
+  const payload = payloadFor(base, name);
+  const t0 = Date.now();
+  const rec = { at: new Date(t0).toISOString(), kind: kind, model: name };
+  let r;
+  try {
+    r = await gfetch(API + '/models/' + encodeURIComponent(name) + ':generateContent', { method: 'POST', body: payload }, fetchImpl, ms, cancel);
+  } catch (e) {
+    rec.ms = Date.now() - t0; rec.outcome = (e && e.nxKind) || 'network'; rec.code = scrub(errCode(e)).slice(0, 60);
+    noteCall(rec);
+    return { ok: false, why: rec.outcome, name: name };
+  }
+  rec.ms = Date.now() - t0; rec.status = r.status;
+  const cand = ((r.body && r.body.candidates) || [])[0] || {};
+  const use = (r.body && r.body.usageMetadata) || {};
+  if (cand.finishReason) rec.finish = String(cand.finishReason).slice(0, 30);
+  if (use.promptTokenCount) rec.inTok = use.promptTokenCount;
+  if (use.candidatesTokenCount) rec.outTok = use.candidatesTokenCount;
+  if (use.thoughtsTokenCount) rec.thinkTok = use.thoughtsTokenCount;
+  if (!r.ok) {
+    const msg = String((r.body && r.body.error && r.body.error.message) || '');
+    /* 4.67.17 — only a 404 or "no longer available" retires a model; a 400 about a file type is not the model's fault */
+    const gone = r.status === 404 || /no longer available|deprecated/i.test(msg);
+    rec.outcome = gone ? 'retired' : r.status === 429 ? 'busy' : 'http';
+    rec.code = scrub(msg).slice(0, 80);
+    noteCall(rec);
+    if (gone) blocked.add(name);
+    /* 4.67.1 — Google names the model to use instead: that one is asked next */
+    const named = gone ? ((msg.match(/models\/(gemini-[\w.\-]+)/g) || []).map((x) => x.replace(/^models\//, '')).filter((n) => n !== name && !blocked.has(n))[0] || null) : null;
+    return { ok: false, why: rec.outcome, status: r.status, r: r, name: name, named: named };
+  }
+  const json = readJson(r);
+  const refused = (r.body && r.body.promptFeedback && r.body.promptFeedback.blockReason) ||
+    (/^(SAFETY|PROHIBITED_CONTENT|BLOCKLIST|SPII|RECITATION)$/.test(rec.finish || '') ? rec.finish : null);
+  rec.outcome = json ? 'ok' : refused ? 'refused' : 'unreadable';
+  if (refused && !json) rec.code = String(refused).slice(0, 30);
+  noteCall(rec);
+  if (!json && refused) return { ok: false, why: 'refused', status: r.status, r: r, name: name };
+  if (!json) return { ok: false, why: 'unreadable', status: r.status, r: r, name: name, finish: rec.finish };
+  return { ok: true, json: json, name: name };
+}
+/** The second model for a slow or failing question: another Flash-Lite the key lists (newest first), else the Flash. */
+export function backupOf(name, names, skip) {
+  const not = [name].concat(skip || []);
+  const pool = (names || []).filter((n) => not.indexOf(n) < 0 && !blocked.has(n) && rankOf(n) !== null);
+  const lite = pool.filter((n) => /flash-lite(?:-\d{3})?$/.test(n)).sort((a, b) => rankOf(b) - rankOf(a))[0];
+  if (lite) return lite;
+  const s = strongOf(pool);
+  return s && not.indexOf(s) < 0 ? s : null;
+}
+const handsOver = (res) => res.why === 'timeout' || res.why === 'network' || res.why === 'busy' || res.why === 'retired' || res.why === 'unreadable' ||
+  (res.why === 'http' && res.status >= 500);
+/** The usual model, and — when it is slow or fails — a second one; the first answer wins. */
+function race(first, payload, fetchImpl, kind, deadline, skip) {
+  return new Promise((resolve) => {
+    let done = false, running = 0, backups = 0, last = null;
+    const tried = [first].concat(skip || []);
+    const ctrls = [];
+    const left = () => deadline - Date.now();
+    let timer = null;
+    const finish = (res) => {
+      if (done) return;
+      done = true; clearTimeout(timer);
+      ctrls.forEach((c) => { try { c.abort(); } catch (e) { /* gone */ } });
+      resolve(res);
+    };
+    const hedge = (prefer) => {
+      if (done || backups >= 2 || left() < 8000) return;
+      const next = (prefer && !blocked.has(prefer) && tried.indexOf(prefer) < 0) ? prefer : backupOf(first, genNames.length ? genNames : model.available || [], tried);
+      if (!next) return;
+      backups++; tried.push(next); run(next);
+    };
+    const run = (name) => {
+      running++;
+      const c = new AbortController(); ctrls.push(c);
+      tryModel(name, payload, fetchImpl, Math.max(1000, left()), kind + (name === first ? '' : '/backup'), c.signal).then((res) => {
+        running--;
+        if (done) return;
+        if (res.ok) { finish(res); return; }
+        /* what is said when nothing answers: the usual model's failure, unless it was only retired */
+        if (!last || (name === first && res.why !== 'retired') || last.why === 'retired') last = res;
+        if (handsOver(res)) hedge(res.named);
+        if (!running) finish(last);
+      });
+    };
+    timer = setTimeout(() => { if (!backups) hedge(null); }, hedgeMs);
+    run(first);
+  });
+}
 async function ask(companyId, system, prompt, fetchImpl, opts) {
   opts = opts || {};
   if (!aiConfigured()) return { fail: { httpStatus: 503, body: { error: 'AI_OFF', message: 'Nexora AI is not switched on at the service yet.' } } };
   const t = take(companyId);
   if (t.busy) return { fail: { httpStatus: 429, body: { error: 'AI_BUSY', retryAfter: t.busy, message: 'Nexora AI is busy — try again in ' + t.busy + ' seconds.' } } };
   if (t.spent) return { fail: { httpStatus: 429, body: { error: 'AI_DAILY', message: 'This company has used today’s ' + daily() + ' Nexora AI checks. They come back tomorrow.' } } };
-  let name = await resolveModel(false, fetchImpl);
-  if (!name) return { fail: { httpStatus: 503, body: { error: 'AI_MODEL', message: 'Nexora AI has no model it can use right now.' } } };
-  const payload = JSON.stringify({
+  const deadline = Date.now() + deadlineMs;
+  const name = await resolveModel(false, fetchImpl);
+  if (!name) { giveBack(companyId); return { fail: { httpStatus: 503, body: { error: 'AI_MODEL', message: 'Nexora AI has no model it can use right now.' } } }; }
+  const kind = opts.kind || 'ask';
+  /* 4.67.17 — 8192 words' room: a Gujarati or Hindi answer takes many more of them than English */
+  const payload = {
     systemInstruction: { parts: [{ text: system }] },
-    contents: (prompt && prompt.contents) ? prompt.contents : [{ role: 'user', parts: Array.isArray(prompt) ? prompt : [{ text: prompt }] }],   /* text, parts (a recording + text), or a whole conversation */   /* text, or parts (a recording + text) */
-    generationConfig: { temperature: 0.2, responseMimeType: 'application/json', maxOutputTokens: opts.maxTokens || 2048 }
-  });
-  let r;
-  /* the stronger model first (45 s), then the usual one (the rest of the minute) */
-  const strong = opts.strong && Date.now() > strongRestUntil ? strongOf(model.available || []) : null;
+    contents: (prompt && prompt.contents) ? prompt.contents : [{ role: 'user', parts: Array.isArray(prompt) ? prompt : [{ text: prompt }] }],   /* text, parts (a recording + text), or a whole conversation */
+    generationConfig: { responseMimeType: 'application/json', maxOutputTokens: opts.maxTokens || 8192 }
+  };
+  /* the stronger model first (12 s), then the usual one with what is left */
+  const strong = opts.strong && Date.now() > strongRestUntil ? strongOf(genNames.length ? genNames : model.available || []) : null;
   if (strong && strong !== name) {
-    let rs = null;
-    try { rs = await gfetch(API + '/models/' + encodeURIComponent(strong) + ':generateContent', { method: 'POST', body: payload }, fetchImpl, STRONG_MS); } catch (e) { rs = null; }
-    if (rs && rs.ok) { const got = readJson(rs); if (got) return { json: got, model: strong, left: t.left }; }
-    const sm = String((rs && rs.body && rs.body.error && rs.body.error.message) || '');
-    if (rs && !rs.ok && (rs.status === 404 || /no longer available|not found|is not supported|deprecated/i.test(sm))) blocked.add(strong);
+    const rs = await tryModel(strong, payload, fetchImpl, STRONG_MS, kind + '/strong');
+    if (rs.ok) return { json: rs.json, model: strong, left: t.left };
     strongRestUntil = Date.now() + STRONG_REST_MS;
   }
-  /* 4.67.1 — a model Google has retired is set aside and the request is
-     asked again, of the model Google names (or the newest the key lists),
-     at most twice — the person never sees "no longer available" */
-  for (let attempt = 0; ; attempt++) {
-    try {
-      /* after the stronger model had its 45 s, the usual one gets what is left of the application's 75 s */
-      r = await gfetch(API + '/models/' + encodeURIComponent(name) + ':generateContent', { method: 'POST', body: payload }, fetchImpl, strong && strong !== name ? 58000 : TIMEOUT_MS);
-    } catch (e) {
-      return { fail: { httpStatus: 504, body: { error: 'AI_TIMEOUT', message: 'Nexora AI did not answer in time. Try again.' } } };
-    }
-    const msg = String((r.body && r.body.error && r.body.error.message) || '');
-    const gone = !r.ok && (r.status === 404 || /no longer available|not found|is not supported|deprecated/i.test(msg));
-    if (!gone || attempt >= 2) break;
-    blocked.add(name);
-    const named = (msg.match(/models\/(gemini-[\w.\-]+)/g) || []).map((x) => x.replace(/^models\//, '')).filter((n) => n !== name && !blocked.has(n))[0];
-    const next = named || await resolveModel(true, fetchImpl);
-    if (!next || blocked.has(next)) break;
-    name = next;
-    model = Object.assign({}, model, { name: next, at: Date.now(), error: 'switched to ' + next + ' (Google retired the one before)' });
+  const res = await race(name, payload, fetchImpl, kind, deadline, strong ? [strong] : []);
+  if (res.ok) {
+    /* 4.67.1 — the usual model was retired on the way: the one that answered is the usual one now */
+    if (blocked.has(name) && res.name !== name) model = Object.assign({}, model, { name: res.name, at: Date.now(), error: 'switched to ' + res.name + ' (Google retired the one before)' });
+    return { json: res.json, model: res.name, left: t.left };
   }
-  if (!r.ok) {
-    const busy = r.status === 429;
-    return { fail: { httpStatus: busy ? 429 : 502, body: { error: busy ? 'AI_BUSY' : 'AI_FAILED', retryAfter: busy ? 60 : undefined,
-      message: busy ? 'Nexora AI is busy (Google’s limit) — try again in a minute.' : 'Nexora AI could not answer (' + r.status + '): ' + scrub(r.body && r.body.error && r.body.error.message) } } };
-  }
-  const json = readJson(r);
-  if (!json) return { fail: { httpStatus: 502, body: { error: 'AI_UNREADABLE', message: 'Nexora AI answered in a form Nexora could not read. Try again.' } } };
-  return { json: json, model: name, left: t.left };
+  if (res.why !== 'refused' && !(res.why === 'http' && res.status < 500)) giveBack(companyId);
+  if (res.why === 'refused') return { fail: { httpStatus: 422, body: { error: 'AI_REFUSED', message: 'Google declined to answer that question — put it another way.' } } };
+  if (res.why === 'timeout' || res.why === 'cancelled') return { fail: { httpStatus: 504, body: { error: 'AI_TIMEOUT', message: 'Nexora AI did not answer in time — Google was slow just now. Try again.' } } };
+  if (res.why === 'network') return { fail: { httpStatus: 502, body: { error: 'AI_UNREACHABLE', message: 'Nexora AI could not reach Google just now. Try again in a moment.' } } };
+  if (res.why === 'unreadable') return { fail: { httpStatus: 502, body: { error: 'AI_UNREADABLE', message: res.finish === 'MAX_TOKENS' ? 'Nexora AI’s answer ran too long and was cut off. Ask a narrower question.' : 'Nexora AI answered in a form Nexora could not read. Try again.' } } };
+  const busy = res.why === 'busy';
+  return { fail: { httpStatus: busy ? 429 : 502, body: { error: busy ? 'AI_BUSY' : 'AI_FAILED', retryAfter: busy ? 60 : undefined,
+    message: busy ? 'Nexora AI is busy (Google’s limit) — try again in a minute.' : 'Nexora AI could not answer (' + res.status + '): ' + scrub(res.r && res.r.body && res.r.body.error && res.r.body.error.message) } } };
 }
 
 /** POST /v1/ai/check-bom — phase 1 */
@@ -280,7 +419,7 @@ export async function checkBom(companyId, payload, lang, fetchImpl) {
   if (!aiConfigured()) return { httpStatus: 503, body: { error: 'AI_OFF', message: 'Nexora AI is not switched on at the service yet.' } };
   const p = clean(payload);
   if (!p.stages.length) return { httpStatus: 400, body: { error: 'NOTHING', message: 'There is no route on this BOM to check yet.' } };
-  const a = await ask(companyId, SYSTEM, promptFor(p, lang), fetchImpl);
+  const a = await ask(companyId, SYSTEM, promptFor(p, lang), fetchImpl, { kind: 'check-bom' });
   if (a.fail) return a.fail;
   const ans = readAnswer({ candidates: [{ content: { parts: [{ text: JSON.stringify(a.json) }] } }] });
   if (!ans) return { httpStatus: 502, body: { error: 'AI_UNREADABLE', message: 'Nexora AI answered in a form Nexora could not read. Try again.' } };
@@ -331,7 +470,7 @@ export async function planRoute(companyId, payload, lang, fetchImpl) {
   if (m.error) return m.error;
   const prompt = langLine(lang, 'summary, why and notes') +
     (m.audio ? 'The person describes the bag in the attached recording.\n' : '') + 'INPUT:\n' + JSON.stringify(p);
-  const a = await ask(companyId, PLAN_SYSTEM, m.parts.concat([{ text: prompt }]), fetchImpl);
+  const a = await ask(companyId, PLAN_SYSTEM, m.parts.concat([{ text: prompt }]), fetchImpl, { kind: 'plan-route' });
   if (a.fail) return a.fail;
   const j = a.json || {};
   const codes = {};
@@ -416,7 +555,7 @@ export async function fillCalc(companyId, payload, lang, fetchImpl) {
     (m.files ? 'The bag is also shown in the attached ' + m.files + ' photo(s) or document(s) — a drawing, a specification sheet or a sample bag: read its sizes and specification carefully; a size printed on a drawing is in the unit written beside it.\n' : '') +
     (p.text ? 'The person typed: ' + p.text + '\n' : '') +
     'CONTEXT:\n' + JSON.stringify({ units: p.units, constructions: p.constructions, fields: p.fields, current: p.current });
-  const a = await ask(companyId, FILL_SYSTEM, m.parts.concat([{ text: intro }]), fetchImpl);
+  const a = await ask(companyId, FILL_SYSTEM, m.parts.concat([{ text: intro }]), fetchImpl, { kind: 'fill-calc' });
   if (a.fail) return a.fail;
   const j = a.json || {};
   /* checked against what was sent */
@@ -547,7 +686,7 @@ export async function editBom(companyId, payload, lang, fetchImpl) {
   if (!p.text && !m.parts.length) return { httpStatus: 400, body: { error: 'NOTHING', message: 'Say or type the change first.' } };
   const intro = langLine(lang, 'summary and notes') + (m.audio ? 'The change is said in the attached recording.' + (p.text ? ' Also typed: ' + p.text : '') : 'The change, typed: ' + p.text) +
     '\nBOM:\n' + JSON.stringify({ stages: p.stages, materials: p.materials });
-  const a = await ask(companyId, EDIT_SYSTEM, m.parts.concat([{ text: intro }]), fetchImpl);
+  const a = await ask(companyId, EDIT_SYSTEM, m.parts.concat([{ text: intro }]), fetchImpl, { kind: 'edit-bom' });
   if (a.fail) return a.fail;
   const j = a.json || {};
   const stageOf = {}; p.stages.forEach((s) => { stageOf[s.n] = s; });
@@ -609,7 +748,7 @@ export async function quoteLetter(companyId, payload, lang, fetchImpl) {
   if (!p.quote.items.length) return { httpStatus: 400, body: { error: 'NOTHING', message: 'This quotation has no items yet.' } };
   const intro = langLine(lang, 'the letter and the message') + (m.audio ? 'The person also said what to stress, in the attached recording.' : '') +
     (p.text ? ' The person asks: ' + p.text : '') + '\nQUOTATION:\n' + JSON.stringify(p.quote);
-  const a = await ask(companyId, QUOTE_SYSTEM, m.parts.concat([{ text: intro }]), fetchImpl);
+  const a = await ask(companyId, QUOTE_SYSTEM, m.parts.concat([{ text: intro }]), fetchImpl, { kind: 'quote-letter' });
   if (a.fail) return a.fail;
   const j = a.json || {};
   return { httpStatus: 200, body: { ok: true, model: a.model, left: a.left, subject: str(j.subject, 200), letter: str(j.letter, 4000), whatsapp: str(j.whatsapp, 1500) } };
@@ -638,7 +777,7 @@ export async function help(companyId, payload, lang, fetchImpl) {
   if (!p.text && !m.parts.length) return { httpStatus: 400, body: { error: 'NOTHING', message: 'Say or type the question first.' } };
   const intro = langLine(lang, 'the answer') + (m.audio ? 'The question is in the attached recording.' + (p.text ? ' Also typed: ' + p.text : '') : 'The question: ' + p.text) +
     (p.screen ? '\nThe person is on the ' + p.screen + ' window.' : '') + '\nHELP:\n' + JSON.stringify({ topics: p.topics, glossary: p.glossary });
-  const a = await ask(companyId, HELP_SYSTEM, m.parts.concat([{ text: intro }]), fetchImpl);
+  const a = await ask(companyId, HELP_SYSTEM, m.parts.concat([{ text: intro }]), fetchImpl, { kind: 'help' });
   if (a.fail) return a.fail;
   const j = a.json || {};
   const titles = {}; p.topics.forEach((t) => { titles[t.title] = true; });
@@ -677,12 +816,12 @@ const CHAT_SYSTEM = [
 ].join(' ');
 export function cleanChat(p) {
   const x = p && typeof p === 'object' ? p : {};
-  const kind = CHAT_KINDS[x.kind] ? x.kind : 'help';
+  const kind = (typeof x.kind === 'string' && Object.prototype.hasOwnProperty.call(CHAT_KINDS, x.kind)) ? x.kind : 'help';
   return {
     kind: kind,
     text: str(x.text, 800),
     context: CHAT_KINDS[kind](x.context || {}),
-    history: list(x.history, 16).map((h) => ({ role: h && h.role === 'model' ? 'model' : 'user', text: str(h && h.text, 1500) })).filter((h) => h.text)
+    history: list(Array.isArray(x.history) ? x.history.slice(-16) : [], 16).map((h) => ({ role: h && h.role === 'model' ? 'model' : 'user', text: str(h && h.text, 1500) })).filter((h) => h.text)
   };
 }
 export async function chat(companyId, payload, lang, fetchImpl) {
@@ -695,7 +834,7 @@ export async function chat(companyId, payload, lang, fetchImpl) {
     { role: 'model', parts: [{ text: '{"transcript":"","answer":"Understood. Ask me."}' }] }];
   p.history.forEach((h) => contents.push({ role: h.role, parts: [{ text: h.role === 'model' ? JSON.stringify({ transcript: '', answer: h.text }) : h.text }] }));
   contents.push({ role: 'user', parts: m.parts.concat([{ text: langLine(lang, 'the answer') + (m.audio ? 'The question is in the attached recording.' + (p.text ? ' Also typed: ' + p.text : '') : p.text) }]) });
-  const a = await ask(companyId, CHAT_SYSTEM, { contents: contents }, fetchImpl);
+  const a = await ask(companyId, CHAT_SYSTEM, { contents: contents }, fetchImpl, { kind: 'chat' });
   if (a.fail) return a.fail;
   const j = a.json || {};
   return { httpStatus: 200, body: { ok: true, model: a.model, left: a.left, transcript: str(j.transcript, 800), answer: str(j.answer, 3000) } };
@@ -737,6 +876,15 @@ function cleanView(v) {
   });
   return o;
 }
+/* 4.67.17 — a records window's search box also takes an item or a buyer's name (an older application
+   sent it as it was typed): only a record number or a construction's name goes on */
+function safeSearch(view, constructions) {
+  if (!view || typeof view.search !== 'string' || !view.search.trim()) return view;
+  const t = view.search.trim();
+  const con = (constructions || []).filter((c) => String(c.name || '').toUpperCase() === t.toUpperCase())[0];
+  view.search = /^(?:[A-Z]{2,5}-)?\d{1,4}(?:-\d*)?$/i.test(t) ? t : con ? con.name : '(a search is typed)';
+  return view;
+}
 const ALLOWED = ['cost', 'calc', 'bom', 'route', 'rm', 'price', 'constants', 'quote', 'compare', 'targetcost', 'priceimpact', 'notes'];
 const cleanSecs = (a) => list(a, 20).map((s) => ({ process: str(s && s.process, 30), wastePct: nr(s && s.wastePct),
       lines: list(s && s.lines, 12).map((l) => ({ material: str(l && l.material, 60), basis: str(l && l.basis, 10), value: nr(l && l.value), figure: str(l && l.figure, 30) })) })).filter((s) => s.process);
@@ -748,7 +896,7 @@ export function cleanAssist(p) {
   return {
     screen: ASSIST_VIEWS.indexOf(x.screen) > -1 ? x.screen : 'dashboard',
     text: str(x.text, 1200),
-    history: list(x.history, 20).map((h) => ({ role: h && h.role === 'model' ? 'model' : 'user', text: str(h && h.text, 2500) })).filter((h) => h.text),
+    history: list(Array.isArray(x.history) ? x.history.slice(-20) : [], 20).map((h) => ({ role: h && h.role === 'model' ? 'model' : 'user', text: str(h && h.text, 2500) })).filter((h) => h.text),
     units: fill.units,
     constructions: fill.constructions.map((c) => Object.assign({}, c, { needs: needsOf(c) })),
     fields: fill.fields,
@@ -817,7 +965,7 @@ export function cleanAssist(p) {
       },
       bom: n.bom ? clean(n.bom) : null,
       note: str(n.note, 300),
-      view: cleanView(n.view)
+      view: safeSearch(cleanView(n.view), fill.constructions)
     }
   };
 }
@@ -914,15 +1062,19 @@ function routeNeeds(needs, procCodes) {
   const want = [];
   const pick = (codes) => codes.filter((c) => procCodes.indexOf(c) > -1)[0];
   if (needs.bopp) { const bp = pick(['BOPP_PRINTING']); if (bp) want.push({ code: bp, why: 'a BOPP bag is printed on its film', after: 'WEAVING' }); }
-  if (needs.coating || needs.bopp) { const l = pick(['LAMINATION', 'COATING']); if (l) want.push({ code: l, why: needs.bopp ? 'the film is laminated to the fabric' : 'this construction has a coating layer', after: 'WEAVING' }); }
+  if (needs.coating || needs.bopp) { const l = pick(['LAMINATION', 'COATING']); if (l) want.push({ code: l, why: needs.bopp ? 'the film is laminated to the fabric' : 'this construction has a coating layer', after: ['WEAVING', 'BOPP_PRINTING', 'SLITTING'] }); }
   if (needs.backseam) { const b = pick(['BACKSEAM']); if (b) want.push({ code: b, why: 'the construction is backseamed', after: 'LAMINATION' }); }
   if (needs.blockBottom) { const b = pick(['BLOCK_BOTTOM']); if (b) want.push({ code: b, why: 'patches and a valve make a block bottom', after: 'FINISHING' }); }
   if (needs.pinch) { const b = pick(['PINCH_BOTTOM']); if (b) want.push({ code: b, why: 'a pinch bottom bag', after: 'FINISHING' }); }
   return want;
 }
 /** Every number the person said — in this request, earlier in the conversation, in a recording\u2019s transcript. */
+/* 4.67.17 — ૭૦ and ७० are 70 */
+export function asciiDigits(t) {
+  return String(t || '').replace(/[\u0ae6-\u0aef]/g, (d) => String(d.charCodeAt(0) - 0x0ae6)).replace(/[\u0966-\u096f]/g, (d) => String(d.charCodeAt(0) - 0x0966));
+}
 function saidNumbers(p) {
-  const txt = [p.text, p.transcript || ''].concat(p.history.filter((h) => h.role === 'user').map((h) => h.text)).join(' ');
+  const txt = asciiDigits([p.text, p.transcript || ''].concat(p.history.filter((h) => h.role === 'user').map((h) => h.text)).join(' '));
   return (txt.replace(/,/g, '').match(/\d+(?:\.\d+)?/g) || []).map(Number).filter((n) => isFinite(n));
 }
 /* 4.67.12 — what the person's own words say about the bag: its layers, and its kind of bottom.
@@ -951,14 +1103,15 @@ function bagMismatch(said, conName) {
 /** The steps Nexora AI proposed, checked against what was sent. */
 export function checkSteps(p, raw) {
   const out = [], dropped = [], missing = [], notes = [];
+  let bagHeld = false;
   const conOf = {}; p.constructions.forEach((c) => { conOf[c.name.toUpperCase()] = c; });
   const fieldOf = {}; p.fields.forEach((f) => { fieldOf[f.key] = f; });
   const procOf = {}; p.processes.forEach((q) => { procOf[q.code.toUpperCase()] = q; });
   const routeOf = {}; p.routes.forEach((r) => { routeOf[r.name.toUpperCase()] = r; });
   const matOf = {}; p.materials.forEach((m) => { matOf[m.code.toUpperCase()] = m; });
-  const matFind = (v) => { const k = String(v || '').trim().toUpperCase(); if (matOf[k]) return matOf[k];
+  const matFind = (v) => { const k = String(v || '').trim().toUpperCase(); if (!k) return null; if (matOf[k]) return matOf[k];
     return p.materials.filter((m) => m.name.toUpperCase() === k)[0] || null; };
-  const procFind = (v) => { const k = String(v || '').trim().toUpperCase(); if (procOf[k]) return procOf[k];
+  const procFind = (v) => { const k = String(v || '').trim().toUpperCase(); if (!k) return null; if (procOf[k]) return procOf[k];
     return p.processes.filter((q) => q.name.toUpperCase() === k)[0] || null; };
   const num = (v) => { if (v === null || v === undefined || v === '') return null; const x = Number(String(v).replace(/,/g, '')); return isFinite(x) ? Math.round(x * 1000) / 1000 : null; };
   const BASES = { PCT: 1, PERBAG_G: 1, PER1000: 1, ABS: 1 };
@@ -972,6 +1125,7 @@ export function checkSteps(p, raw) {
         const why = bagMismatch(saidBag(p.text + ' ' + (p.transcript || '')), named.name);
         if (why.length) {
           dropped.push('construction ' + named.name + ' (you said ' + why.join(', ') + ')');
+          bagHeld = true;
           missing.push({ key: '__construction', label: 'Construction \u2014 you said ' + why.join(', '), type: 'enum', required: true,
             options: p.constructions.map((c) => c.name).filter((c) => !bagMismatch(saidBag(p.text + ' ' + (p.transcript || '')), c).length).concat(p.constructions.map((c) => c.name)).filter((c, i, a) => a.indexOf(c) === i) });
           return;
@@ -1092,7 +1246,7 @@ export function checkSteps(p, raw) {
       const hit = routeOf[String(s.name || '').trim().toUpperCase()];
       const asked = list(s.steps, 30);
       if (hit && !asked.length) { out.push({ do: 'route', name: hit.name }); return; }
-      const steps = asked.map(procFind);
+      const steps = asked.map((x) => procFind(x && typeof x === 'object' ? x.code : x));
       if (steps.length && steps.every(Boolean)) {
         /* "according to structure ai is not making route": what the construction's layers and parts need is put in */
         const codes = steps.map((q) => q.code);
@@ -1101,7 +1255,8 @@ export function checkSteps(p, raw) {
         const con = conOf[String(conName || '').toUpperCase()];
         if (con) routeNeeds(needsOf(con), p.processes.map((q) => q.code)).forEach((w) => {
           if (codes.indexOf(w.code) > -1) return;
-          let at = codes.indexOf(w.after);
+          /* 4.67.17 — lamination comes after BOTH lines (the fabric, and the printed film), never between them */
+          let at = Array.isArray(w.after) ? Math.max.apply(null, w.after.map((c) => codes.indexOf(c))) : codes.indexOf(w.after);
           if (at < 0) at = codes.indexOf('WEAVING');
           if (at < 0) at = Math.max(0, codes.length - 2);
           const packing = codes.indexOf('PACKING');
@@ -1268,13 +1423,28 @@ export function checkSteps(p, raw) {
     }
     if (d) dropped.push(str(d, 20));
   });
+  /* 4.67.17 — the bag was not planned (the words said another one): the steps that would work on "the bag"
+     — save, route, BOM, recipes, cost… — would work on the one on screen instead, so they wait too */
+  if (bagHeld) {
+    const FREE = { open: 1, guide: 1, find: 1, note: 1, price: 1, constant: 1, material: 1, priceimpact: 1 };
+    const held = out.filter((x) => !FREE[x.do]).map((x) => x.do);
+    for (let i = out.length - 1; i >= 0; i--) if (!FREE[out[i].do]) out.splice(i, 1);
+    if (held.length) dropped.push(held.filter((x, i, a) => a.indexOf(x) === i).join(', ') + ' (after the construction is chosen)');
+  }
   return { steps: out, dropped: dropped, missing: missing, notes: notes };
 }
 
 /** POST /v1/ai/assist */
-export async function assist(companyId, payload, lang, fetchImpl) {
+export async function assist(companyId, payload, lang, fetchImpl, who) {
   if (!aiConfigured()) return { httpStatus: 503, body: { error: 'AI_OFF', message: 'Nexora AI is not switched on at the service yet.' } };
   const p = cleanAssist(payload);
+  /* 4.67.17 — the service knows who asks: a person the administrator has not given "costs and prices"
+     sends no rates, whatever the application sent, and is offered no cost or price steps */
+  if (who && who.canCost === false) {
+    p.allowed.cost = false; p.allowed.price = false;
+    p.materials.forEach((x) => { delete x.rate; });
+    p.processes.forEach((q) => (q.resources || []).forEach((r) => { delete r.rate; }));
+  }
   const m = mediaParts(payload);
   if (m.error) return m.error;
   if (!p.text && !m.parts.length) return { httpStatus: 400, body: { error: 'NOTHING', message: 'Say or type something first.' } };
@@ -1304,10 +1474,11 @@ export async function assist(companyId, payload, lang, fetchImpl) {
   const said = (lang === 'gu' || lang === 'hi') ? langLine(lang, 'the answer') : '';
   contents.push({ role: 'user', parts: m.parts.concat([{ text: said + (m.audio ? 'The person speaks in the attached recording.' + (p.text ? ' Also typed: ' + p.text : '') : p.text) +
     (m.files ? '\nAlso attached: ' + m.files + ' photo(s)/document(s) of the bag — read its sizes and specification from them.' : '') }]) });
-  const a = await ask(companyId, ASSIST_SYSTEM, { contents: contents }, fetchImpl, { strong: !p.voice && !m.audio, maxTokens: 8192 });
+  const a = await ask(companyId, ASSIST_SYSTEM, { contents: contents }, fetchImpl, { strong: !p.voice && !m.audio, maxTokens: 8192, kind: m.audio ? 'assist/voice' : 'assist' });
   if (a.fail) return a.fail;
   const j = a.json || {};
-  if (j.transcript) p.transcript = str(j.transcript, 1200);
+  /* what the model "heard" counts as said only for a recording — for typed words the words themselves are what was said */
+  if (m.audio && j.transcript) p.transcript = str(j.transcript, 1200);
   if (m.audio && lastAudio) { lastAudio.transcriptChars = String(j.transcript || '').trim().length; lastAudio.model = a.model; }
   /* spoken, and no words came back: nothing is planned on a guess */
   if (m.audio && !p.text && String(j.transcript || '').trim().length < 2) { if (lastAudio) lastAudio.verdict = 'no-words'; return nothing('unheard'); }
@@ -1394,14 +1565,15 @@ export async function speak(companyId, payload, lang, fetchImpl) {
   let r = null;
   try {
     r = await gfetch(API + '/interactions', { method: 'POST', body: JSON.stringify({ model: name, input: [{ type: 'user_input', content: say }],
-      response_format: { type: 'audio' }, generation_config: { speech_config: [{ voice: voice }] } }) }, fetchImpl, 30000);
+      response_format: { type: 'audio' }, generation_config: { speech_config: [{ voice: voice }] } }) }, fetchImpl, 25000);
   } catch (e) { r = null; }
   let a = r && r.ok ? audioOf(r.body) : null;
+  if (!a && r && r.status === 429) return { httpStatus: 429, body: { error: 'AI_BUSY', message: 'The voice is busy — the answer is on the screen.' } };
   if (!a) {
     /* the older way of asking the same model */
     try {
       r = await gfetch(API + '/models/' + encodeURIComponent(name) + ':generateContent', { method: 'POST', body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: text }] }],
-        generationConfig: { responseModalities: ['AUDIO'], speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voice } } } } }) }, fetchImpl, 30000);
+        generationConfig: { responseModalities: ['AUDIO'], speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voice } } } } }) }, fetchImpl, 25000);
     } catch (e) { return { httpStatus: 504, body: { error: 'AI_TIMEOUT', message: 'The voice did not come in time — the answer is on the screen.' } }; }
     a = r && r.ok ? audioOf(r.body) : null;
   }

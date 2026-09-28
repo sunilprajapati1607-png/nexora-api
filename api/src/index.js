@@ -44,8 +44,17 @@ function json(body, status) {
     headers: Object.assign({ 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' }, CORS)
   });
 }
+/* 4.67.17 — "costs and prices (Rs)": the administrator, and whoever the administrator gave VIEW_COST (the same rule as the application) */
+function canSeeCost(u) {
+  if (!u) return false;
+  if (u.role === 'ADMIN') return true;
+  let p = u.permissions;
+  if (typeof p === 'string') { try { p = JSON.parse(p); } catch (e) { p = null; } }
+  return !!(p && typeof p === 'object' && p.VIEW_COST === true);
+}
 async function readJson(request) {
-  try { return await request.json(); } catch (e) { return {}; }
+  /* 4.67.17 — a body of null, a number or a list is read as an empty object, never a crash */
+  try { const v = await request.json(); return v && typeof v === 'object' && !Array.isArray(v) ? v : {}; } catch (e) { return {}; }
 }
 
 export default {
@@ -376,7 +385,7 @@ export default {
         if (!a.ok) return json(a.error, a.httpStatus);
         if (!a.user) return json({ error: 'SIGN_IN', message: 'Sign in to use Nexora AI.' }, 401);
         const body = await readJson(request);
-        const out = await aiAssist(a.companyId || a.row.device_id, body.assist, pickLang(body.lang));
+        const out = await aiAssist(a.companyId || a.row.device_id, body.assist, pickLang(body.lang), undefined, { canCost: canSeeCost(a.user) });
         return json(out.body, out.httpStatus);
       }
       /* 4.67.8 — an answer read aloud (Gujarati, when this computer has no Gujarati voice) */
