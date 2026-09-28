@@ -297,9 +297,9 @@ export function payloadFor(base, name) {
     return JSON.stringify({ contents: contents, generationConfig: { maxOutputTokens: (base.generationConfig && base.generationConfig.maxOutputTokens) || 8192 } });
   }
   const g = Object.assign({}, base.generationConfig);
-  const v = /^gemini-(\d+)/.exec(String(name || ''));
-  const gen = v ? Number(v[1]) : 0;
-  if (gen < 3) g.temperature = 0.2;
+  /* 4.67.17 — owner: "got response but inrelevant". Back to the settings that answered well for days (26 Sep):
+     temperature 0.2 for every Gemini model, and no thinking setting unless GEMINI_THINKING asks for one */
+  g.temperature = 0.2;
   const th = thinkingFor(name);
   if (th) g.thinkingConfig = th;
   return JSON.stringify(Object.assign({}, base, { generationConfig: g }));
@@ -313,7 +313,7 @@ export function payloadFor(base, name) {
 const noThinking = new Set();
 export function _noThinking() { return noThinking; }
 export function thinkingFor(name) {
-  if (String(process.env.GEMINI_THINKING || '').toLowerCase() === 'off' || noThinking.has(name)) return null;
+  if (String(process.env.GEMINI_THINKING || '').toLowerCase() !== 'low' || noThinking.has(name)) return null;
   if (/^gemini-[3-9]/.test(String(name || ''))) return { thinkingLevel: 'low' };
   if (/^gemini-2\.5/.test(String(name || ''))) return { thinkingBudget: 0 };
   return null;
@@ -956,7 +956,7 @@ export async function chat(companyId, payload, lang, fetchImpl) {
   if (!p.text && !m.parts.length) return { httpStatus: 400, body: { error: 'NOTHING', message: 'Say or type the question first.' } };
   const contents = [{ role: 'user', parts: [{ text: 'CONTEXT — ' + CHAT_WHAT[p.kind] + ':\n' + JSON.stringify(p.context) }] },
     { role: 'model', parts: [{ text: '{"transcript":"","answer":"Understood. Ask me."}' }] }];
-  p.history.forEach((h) => contents.push({ role: h.role, parts: [{ text: h.role === 'model' ? JSON.stringify({ transcript: '', answer: h.text }) : h.text }] }));
+  answeredOnly(p.history).forEach((h) => contents.push({ role: h.role, parts: [{ text: h.role === 'model' ? JSON.stringify({ transcript: '', answer: h.text }) : h.text }] }));
   contents.push({ role: 'user', parts: m.parts.concat([{ text: langLine(lang, 'the answer') + (m.audio ? 'The question is in the attached recording.' + (p.text ? ' Also typed: ' + p.text : '') : p.text) }]) });
   const a = await ask(companyId, CHAT_SYSTEM, { contents: contents }, fetchImpl, { kind: 'chat' });
   if (a.fail) return a.fail;
@@ -1558,6 +1558,18 @@ export function checkSteps(p, raw) {
   return { steps: out, dropped: dropped, missing: missing, notes: notes };
 }
 
+/* 4.67.17 — owner: "got response but inrelevant". Tonight Google left five questions in a row unanswered; the
+   application keeps a question and drops its failure, so the conversation sent ended in five questions with no
+   answers between them, and the model answered an old one. A question that got no answer now stays out. */
+export function answeredOnly(history) {
+  const out = [];
+  (history || []).forEach((h, i, a) => {
+    if (h.role === 'user') { const next = a[i + 1]; if (next && next.role === 'model') out.push(h); }
+    else if (out.length && out[out.length - 1].role === 'user') out.push(h);
+  });
+  return out;
+}
+
 /** POST /v1/ai/assist */
 export async function assist(companyId, payload, lang, fetchImpl, who) {
   if (!aiConfigured()) return { httpStatus: 503, body: { error: 'AI_OFF', message: 'Nexora AI is not switched on at the service yet.' } };
@@ -1592,7 +1604,7 @@ export async function assist(companyId, payload, lang, fetchImpl, who) {
     WORKFLOWLIST: p.workflowList, LEARNED: p.learned, HELP_TOPICS: p.topics };
   const contents = [{ role: 'user', parts: [{ text: 'CONTEXT:\n' + JSON.stringify(ctx) }] },
     { role: 'model', parts: [{ text: '{"transcript":"","lang":"en","answer":"Ready.","steps":[]}' }] }];
-  p.history.forEach((h) => contents.push({ role: h.role, parts: [{ text: h.text }] }));
+  answeredOnly(p.history).forEach((h) => contents.push({ role: h.role, parts: [{ text: h.text }] }));
   /* no language switch: Nexora AI answers in the language the person used,
      unless a language was asked for by name */
   const said = (lang === 'gu' || lang === 'hi') ? langLine(lang, 'the answer') : '';
