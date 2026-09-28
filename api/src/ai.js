@@ -137,7 +137,7 @@ export async function resolveModel(force, fetchImpl) {
 export function aiStatus() {
   if (aiConfigured() && (!model.at || Date.now() - model.at > MODEL_TTL_MS)) resolveModel(false).catch(() => {});
   /* 4.67.17 — which models this key can use (their public names only), so a busy day can be read */
-  return { configured: aiConfigured(), model: model.name, note: model.error || null, lastAudio: lastAudio, recent: recentCalls.slice(-12),
+  return { configured: aiConfigured(), model: model.name, note: model.error || null, lastAudio: lastAudio, lastContext: lastContext, recent: recentCalls.slice(-12),
     models: (genNames.length ? genNames : model.available || []).filter((n) => /gemini|gemma/i.test(n) && !/tts|embedding|image|audio|live|native/i.test(n)).slice(0, 60) };
 }
 
@@ -262,7 +262,7 @@ function noteCall(rec) {
   while (recentCalls.length > 25) recentCalls.shift();
   if (process.env.RENDER) {
     try { console.log('[ai] ' + rec.kind + ' ' + rec.model + ' ' + rec.outcome + (rec.status ? ' ' + rec.status : '') + ' ' + rec.ms + 'ms' +
-      (rec.inTok ? ' in=' + rec.inTok : '') + (rec.outTok ? ' out=' + rec.outTok : '') + (rec.code ? ' ' + rec.code : '')); } catch (e) { /* no log */ }
+      (rec.inTok ? ' in=' + rec.inTok : '') + (rec.cacheTok ? ' cached=' + rec.cacheTok : '') + (rec.outTok ? ' out=' + rec.outTok : '') + (rec.code ? ' ' + rec.code : '')); } catch (e) { /* no log */ }
   }
 }
 function errCode(e) {
@@ -351,13 +351,15 @@ async function tryModelOnce(name, base, fetchImpl, ms, kind, cancel) {
   if (use.promptTokenCount) rec.inTok = use.promptTokenCount;
   if (use.candidatesTokenCount) rec.outTok = use.candidatesTokenCount;
   if (use.thoughtsTokenCount) rec.thinkTok = use.thoughtsTokenCount;
+  /* 4.67.18 — the part of the question Google had seen minutes before and charges a tenth for */
+  if (use.cachedContentTokenCount) rec.cacheTok = use.cachedContentTokenCount;
   if (!r.ok) {
     const msg = String((r.body && r.body.error && r.body.error.message) || '');
     /* 4.67.17 — only a 404 or "no longer available" retires a model; a 400 about a file type is not the model's fault */
     const gone = r.status === 404 || /no longer available|deprecated/i.test(msg);
     rec.outcome = gone ? 'retired' : r.status === 429 ? 'busy' : 'http';
     /* a quota refusal names its metric and limit (tokens or requests, per minute or per day): kept whole */
-    rec.code = r.status === 429 ? scrub(msg).replace(/\s+/g, ' ').slice(0, 300) : scrub(msg).slice(0, 80);
+    rec.code = r.status === 429 ? scrub(msg).replace(/\s+/g, ' ').slice(0, 600) : scrub(msg).slice(0, 80);
     noteCall(rec);
     if (gone) blocked.add(name);
     /* 4.67.1 — Google names the model to use instead: that one is asked next */
@@ -1160,6 +1162,7 @@ const ASSIST_SYSTEM = [
   'NEXT: give "next" — up to 3 short follow-ups the person is likely to want now, in THEIR language, each a complete request Nexora AI could do (e.g. "Save it and open the BOM", "Compare it with CAL-2026-000012").',
   'BY VOICE (4.67.8): when VOICE is true the answer is SPOKEN to the person — two or three short spoken sentences, no table, no list, no symbols; the plan still carries every step. When the person asks to go ahead with the plan already shown and adds nothing new ("run", "run karo", "chalavo", "haa, karo", "kari do", "go ahead", "चलाओ", "कर दो"), answer "run": true with no steps. A voice transcript may mishear a number: repeat the figures you understood in the answer.',
   'A RECORDING: put in "transcript" exactly the words you heard, in the script they were spoken. Take a NEW bag only from what this recording (or these typed words) says — never carry a construction, a size or a weight over from earlier in the conversation unless the person points to it ("the same bag", "that one", "it"). When the recording is unclear or seems cut short, say what you heard and ask — no calculation step.',
+  'READING THE CONTEXT: a list written {"cols": [...], "rows": [[...]]} is a table — each row gives its values in the order of "cols" (null = not set). A value, a list or a flag that is not there is empty or false: CONSTRUCTIONS[].needs names only what the construction has, FIELDS[] carry "required"/"optional" only when true.',
   'Answer ONLY with JSON: {"transcript": string, "lang": "en"|"gu"|"hi", "answer": string, "steps": [ ... ], "remember": string or null, "forget": [string], "next": [string], "run": true|false}.'
 ].join('\n');
 
@@ -1570,6 +1573,51 @@ export function answeredOnly(history) {
   return out;
 }
 
+/* 4.67.18 — owner: "its too much billing … we will take max 25000 yearly charge from customer so how can we
+   afford" / "1, 2, 3, 4 do all if we get perfection". The same facts, in fewer words, in an order Google
+   charges less for — nothing the model saw before is left out:
+   1. ORDER. Google charges a tenth for the beginning of a question it saw a few minutes before (implicit
+      caching). The parts that stay the same from one question to the next (constructions, fields,
+      processes, materials, constants …) go first; what changes (the screen, what is on it) goes last.
+   2. NOTHING THAT SAYS NOTHING. An empty value, an empty list and a "no" flag are not written: a
+      construction's needs carry only what it has, a field only the flags it has ("required": true).
+   3. TABLES. Long lists of like rows (materials, constants, saved calculations, BOMs, quotations) go as
+      {"cols": [...], "rows": [[...]]} — the names once, not on every row. */
+let lastContext = null;
+function emptyish(v) { return v === null || v === undefined || v === '' || (Array.isArray(v) && !v.length) || (typeof v === 'object' && v && !Array.isArray(v) && !Object.keys(v).length); }
+export function lean(v) {
+  if (Array.isArray(v)) return v.map(lean);   /* places in a list stay (a table row's cells go by place) */
+  if (!v || typeof v !== 'object') return v;
+  const o = {};
+  Object.keys(v).forEach((k) => { const x = lean(v[k]); if (!emptyish(x)) o[k] = x; });
+  return o;
+}
+export function asTable(rows) {
+  if (!Array.isArray(rows) || rows.length < 3 || !rows.every((r) => r && typeof r === 'object' && !Array.isArray(r))) return rows;
+  const cols = [];
+  rows.forEach((r) => Object.keys(r).forEach((k) => { if (cols.indexOf(k) < 0) cols.push(k); }));
+  return { cols: cols, rows: rows.map((r) => cols.map((k) => (r[k] === undefined ? null : r[k]))) };
+}
+function onlyYes(o) { const x = {}; Object.keys(o || {}).forEach((k) => { if (o[k] !== false) x[k] = o[k]; }); return x; }
+export function assistContext(p, routesSent) {
+  const ctx = {
+    UNITS: p.units,
+    CONSTRUCTIONS: p.constructions.map((c) => Object.assign({}, c, { needs: onlyYes(c.needs) })),
+    FIELDS: p.fields.map((x) => { const o = Object.assign({}, x); ['required', 'optional'].forEach((k) => { if (o[k] === false) delete o[k]; }); return o; }),
+    FIGURES: p.figures, GROUPS: p.groups, CONSTANTS: p.constants, HELP_TOPICS: p.topics, WORKFLOWLIST: p.workflowList,
+    PROCESSES: p.processes, MATERIALS: p.materials, ALLOWED: p.allowed, RULES: p.rules, LEARNED: p.learned,
+    ROUTES: routesSent, RECORDS: p.records, BOMS: p.boms, QUOTES: p.quotes,
+    SCREEN: p.screen, VOICE: p.voice, NOW: p.now };
+  const out = {};
+  Object.keys(ctx).forEach((k) => {
+    if (k === 'ALLOWED' || k === 'VOICE' || k === 'SCREEN') { out[k] = ctx[k]; return; }   /* every yes and no of ALLOWED is said */
+    let v = lean(ctx[k]);
+    if (['MATERIALS', 'CONSTANTS', 'RECORDS', 'BOMS', 'QUOTES'].indexOf(k) > -1) v = asTable(v);
+    out[k] = emptyish(v) ? [] : v;
+  });
+  return out;
+}
+
 /** POST /v1/ai/assist */
 export async function assist(companyId, payload, lang, fetchImpl, who) {
   if (!aiConfigured()) return { httpStatus: 503, body: { error: 'AI_OFF', message: 'Nexora AI is not switched on at the service yet.' } };
@@ -1599,10 +1647,11 @@ export async function assist(companyId, payload, lang, fetchImpl, who) {
     lastAudio = { at: new Date().toISOString(), bytes: m.audioBytes, seconds: m.level ? m.level.seconds : null, rms: m.level ? m.level.rms : null, peak: m.level ? m.level.peak : null, transcriptChars: null, model: null };
     if (m.level && m.level.peak < 0.01 && !p.text) { lastAudio.verdict = 'silent'; return nothing('silent'); }
   }
-  const ctx = { SCREEN: p.screen, VOICE: p.voice, UNITS: p.units, RULES: p.rules, ALLOWED: p.allowed, NOW: p.now, CONSTRUCTIONS: p.constructions, FIELDS: p.fields, PROCESSES: p.processes,
-    ROUTES: routesSent, MATERIALS: p.materials, GROUPS: p.groups, CONSTANTS: p.constants, FIGURES: p.figures, RECORDS: p.records, BOMS: p.boms, QUOTES: p.quotes,
-    WORKFLOWLIST: p.workflowList, LEARNED: p.learned, HELP_TOPICS: p.topics };
-  const contents = [{ role: 'user', parts: [{ text: 'CONTEXT:\n' + JSON.stringify(ctx) }] },
+  const ctx = assistContext(p, routesSent);
+  const ctxText = JSON.stringify(ctx);
+  lastContext = { at: new Date().toISOString(), chars: ctxText.length, parts: {} };
+  Object.keys(ctx).forEach((k) => { lastContext.parts[k] = JSON.stringify(ctx[k]).length; });
+  const contents = [{ role: 'user', parts: [{ text: 'CONTEXT:\n' + ctxText }] },
     { role: 'model', parts: [{ text: '{"transcript":"","lang":"en","answer":"Ready.","steps":[]}' }] }];
   answeredOnly(p.history).forEach((h) => contents.push({ role: h.role, parts: [{ text: h.text }] }));
   /* no language switch: Nexora AI answers in the language the person used,
