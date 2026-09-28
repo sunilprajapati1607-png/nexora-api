@@ -19,18 +19,24 @@
  * The number series is the company's (4.67.14: a shared master only the
  * administrator sets), so the next calculation number and item code are
  * minted here by the desktop's own docSeries.js over every number the
- * company has used. Units are still each computer's own setting, so the
- * phone works in millimetres and mesh per inch — the engine's own units.
+ * company has used. The units are the company's too (4.67.15): the phone
+ * shows and takes lengths and mesh in them, and they are turned into
+ * millimetres and tapes per inch here, by the desktop's own units.js,
+ * before the engine sees them — exactly as the computer's form does.
  */
 import vm from 'node:vm';
 import { readFileSync } from 'node:fs';
 import { q } from './db.js';
 
-const FILES = ['constants.js', 'constructions.js', 'fieldDefs.js', 'constantsStore.js', 'structureStore.js', 'calculationEngine.js', 'docSeries.js'];
+const FILES = ['constants.js', 'constructions.js', 'fieldDefs.js', 'constantsStore.js', 'structureStore.js', 'calculationEngine.js', 'docSeries.js', 'units.js'];
 const SCRIPTS = FILES.map((f) => new vm.Script(readFileSync(new URL('../vendor/' + f, import.meta.url), 'utf8'), { filename: 'vendor/' + f }));
 export const WEIGH_MASTERS = ['nexora.constants.v1', 'nexora.constants.custom.v1', 'nexora.constants.links.v1', 'nexora.structures.v1',
   /* 4.67.14 — the company's document series, set by its administrator (owner 2026-09-28) */
-  'nexora.docseries.v1'];
+  'nexora.docseries.v1',
+  /* 4.67.15 — and its units ("unit will be one sided from company not base on user") */
+  'nexora.units.v1', 'nexora.meshunit.v1'];
+/* the fields counted in tapes (app.js AI_MESH_KEYS); every field defined in mm is a length */
+const MESH_KEYS = { 'M.WARP': 1, 'M.WEFT': 1 };
 
 /** The desktop's modules, over one company's masters. Fresh each time: nothing leaks between companies. */
 export function desktopOver(masters) {
@@ -50,7 +56,7 @@ export function desktopOver(masters) {
 }
 
 async function mastersOf(companyId) {
-  const rows = await q(`SELECT id, body FROM sync_records WHERE company_id = $1 AND kind = 'master' AND deleted = false AND id IN ($2, $3, $4, $5, $6)`,
+  const rows = await q(`SELECT id, body FROM sync_records WHERE company_id = $1 AND kind = 'master' AND deleted = false AND id IN ($2, $3, $4, $5, $6, $7, $8)`,
     [companyId].concat(WEIGH_MASTERS));
   const out = {};
   rows.forEach((r) => { out[r.id] = r.body; });
@@ -60,20 +66,26 @@ async function mastersOf(companyId) {
 /** What the phone's form needs: every construction with its active fields, and the fields themselves. */
 export function formOf(d) {
   const lookup = d.NexoraConstantsStore.getLookup(d.NexoraConstants.SEED_CONSTANTS);
+  const U = d.NexoraUnits;
   const fields = d.NexoraFieldDefs.FIELDS.map((f) => {
     const link = d.NexoraConstantsStore.getLinkForField(f.key);
+    const linked = link && lookup[link] !== undefined ? lookup[link] : null;
+    const isLen = f.unit === 'mm', isMesh = !!MESH_KEYS[f.key];
     return {
-      key: f.key, label: f.label, unit: f.unit || '', type: f.type === 'enum' ? 'enum' : 'number', tab: f.tab,
+      key: f.key, label: f.label, type: f.type === 'enum' ? 'enum' : 'number', tab: f.tab,
+      /* in the company's units, as its computers show them */
+      unit: isMesh ? 'tapes ' + U.meshLabel() : isLen ? U.label() : (f.unit || ''),
       options: Array.isArray(f.options) ? f.options : [], required: !!f.required, always: f.flagKey === null,
-      /* a blank field takes its linked constant's value, as on the computer */
-      linked: link && lookup[link] !== undefined ? lookup[link] : null
+      /* a blank field takes its linked constant's value, as on the computer (shown in the company's unit) */
+      linked: linked == null ? null : isLen ? U.forInput(linked) : isMesh ? U.meshForInput(linked) : linked
     };
   });
   const constructions = d.NexoraStructureStore.getAll().map((c) => ({
     name: c.name, description: c.description || '',
     fields: d.NexoraFieldDefs.FIELDS.filter((f) => f.flagKey === null || (c.fields && c.fields[f.flagKey])).map((f) => f.key)
   }));
-  return { tabs: d.NexoraFieldDefs.TABS, fields, constructions };
+  return { tabs: d.NexoraFieldDefs.TABS, fields, constructions,
+    units: { length: U.label(), lengthName: U.current().plural, mesh: U.meshLabel() } };
 }
 
 /** app.js engineInputFor(), the same lines: blank fields take their linked constant; the tolerance goes in. */
@@ -96,10 +108,17 @@ export function weighWith(d, calc) {
   /* only the fields this construction shows, as the computer's form only offers those */
   const active = {};
   d.NexoraFieldDefs.FIELDS.forEach((f) => { if (f.flagKey === null || construction.fields[f.flagKey]) active[f.key] = true; });
+  /* typed in the company's units: into millimetres and tapes per inch, as the computer's form stores them */
+  const isLen = {}; d.NexoraFieldDefs.FIELDS.forEach((f) => { if (f.unit === 'mm') isLen[f.key] = true; });
   const inputs = {};
   Object.keys(c.inputs || {}).forEach((k) => {
     const v = c.inputs[k];
-    if (active[k] && v !== null && v !== undefined && v !== '') inputs[k] = typeof v === 'number' ? v : String(v).slice(0, 40);
+    if (!active[k] || v === null || v === undefined || v === '') return;
+    if (typeof v === 'number' && c.units !== 'stored') {
+      if (MESH_KEYS[k]) { const m = d.NexoraUnits.meshToInch(v); inputs[k] = m === undefined ? v : m; return; }
+      if (isLen[k]) { const l = d.NexoraUnits.toMm(v); inputs[k] = l === null ? v : l; return; }
+    }
+    inputs[k] = typeof v === 'number' ? v : String(v).slice(0, 40);
   });
   const rec = { inputs, targetWeight: c.targetWeight, downsidePct: c.downsidePct, upsidePct: c.upsidePct };
   const r = d.NexoraEngine.calculate(engineInput(d, rec), { constants: d.NexoraConstantsStore.getLookup(d.NexoraConstants.SEED_CONSTANTS), construction });
