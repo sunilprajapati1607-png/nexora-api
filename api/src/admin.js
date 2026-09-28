@@ -532,6 +532,15 @@ export async function licenceAction(body) {
               WHERE device_id = $1`, [deviceId]);
     await logEvent(deviceId, 'ADMIN_RESETUSAGE', {});
 
+  } else if (action === 'approve') {
+    /* Nexora Mobile — a phone waiting for its company's yes, given here by Nexora (the company's own
+       administrator gives it from the desktop or another phone through /v1/devices/approve) */
+    const row = (await q(`SELECT platform FROM licences WHERE device_id = $1`, [deviceId]))[0];
+    if (!row) return { error: 'No such installation.' };
+    if (row.platform !== 'mobile') return { error: 'Only a phone waits for approval.' };
+    await q(`UPDATE licences SET approved_at = COALESCE(approved_at, now()), approved_by = COALESCE(approved_by, 'Nexora (console)')
+              WHERE device_id = $1`, [deviceId]);
+    await logEvent(deviceId, 'ADMIN_PHONE_APPROVE', {});
   } else if (action === 'revoke') {
     await q(`UPDATE licences SET state = 'REVOKED' WHERE device_id = $1`, [deviceId]);
     await logEvent(deviceId, 'ADMIN_REVOKE', {});
@@ -1979,6 +1988,7 @@ function render(){
       '<td><b>'+(+l.txn_count||0)+'</b>'+(l.usage_reset_at?'<br><code>reset '+fmt(l.usage_reset_at)+'</code>':'')+'</td>'+
       '<td>'+hoursText(l.usage_minutes)+'</td>'+
       '<td><div class="acts">'+
+        (l.platform==='mobile'&&!l.approved_at&&l.state!=='REVOKED'?'<button class="small primary" data-device="'+esc(l.device_id)+'" data-action="approve" onclick="act(this)" title="Let this phone sign in (Nexora Mobile)">Approve phone</button>':'')+
         '<button class="small" data-device="'+esc(l.device_id)+'" data-action="resetusage" onclick="act(this)">Reset usage</button>'+
         (l.state==='REVOKED'
           ?'<button class="small" data-device="'+esc(l.device_id)+'" data-action="restore" onclick="act(this)">Restore</button>'
