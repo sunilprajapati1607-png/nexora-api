@@ -18,6 +18,7 @@ import { runBom } from './engine.js';
 import { adminAuthorised, listLicences, licenceAction, companyAction, saveSettings, recentEvents, ADMIN_HTML } from './admin.js';
 import { login, listUsers, userAction, pull, push, describeUser, userCap, setCompanyPasscode, releaseSession, maxSeq, listDevices, deviceAction } from './sync.js';
 import { waitFor, wakeCompany, endSessionOn, WAIT_MS } from './waiters.js';
+import { calcForm, calcWeigh, calcNumbers } from './weigh.js';
 import { checkBom as aiCheckBom, planRoute as aiPlanRoute, fillCalc as aiFillCalc, editBom as aiEditBom, quoteLetter as aiQuoteLetter, help as aiHelp, chat as aiChat, assist as aiAssist, speak as aiSpeak, pickLang, aiStatus } from './ai.js';
 import { send as chatSend, since as chatSince, remove as chatRemove, clearBy as chatClearBy, listBroadcasts, broadcastAction } from './chat.js';
 import { ensureInkSchema, getModel, listModels, train as inkTrain, estimate as inkEstimate, reset as inkReset } from './inkstore.js';
@@ -275,6 +276,36 @@ export default {
         /* 4.66.6 — every other machine of the company pulls now */
         if (pushed && pushed.applied && pushed.applied.length) wakeCompany(a.companyId, a.row.device_id);
         return json(pushed);
+      }
+      /* Nexora Mobile — a calculation made on the phone: the form (constructions and fields, the
+         company's own), and the bag weighed by the desktop's own engine on the service (weigh.js).
+         Saving is the ordinary /v1/sync/push, exactly as a computer saves. */
+      if (path === '/v1/calc/form' && method === 'GET') {
+        await ensureSchema();
+        const a = await authorise(request);
+        if (!a.ok) return json(a.error, a.httpStatus);
+        if (!a.user) return json({ error: 'SIGN_IN', message: 'Sign in to make a calculation.' }, 401);
+        const out = await calcForm(a.companyId);
+        return json(out.body, out.httpStatus);
+      }
+      if (path === '/v1/calc/weigh' && method === 'POST') {
+        await ensureSchema();
+        const a = await authorise(request);
+        if (!a.ok) return json(a.error, a.httpStatus);
+        if (!a.user) return json({ error: 'SIGN_IN', message: 'Sign in to make a calculation.' }, 401);
+        if (!a.licence.canCalculate) return json({ error: 'LICENCE_REQUIRED', licence: a.licence, message: a.licence.message || 'This licence has ended — saved work can be opened, but new calculations need a licence.' }, 402);
+        const body = await readJson(request);
+        const out = await calcWeigh(a.companyId, body.calc);
+        return json(out.body, out.httpStatus);
+      }
+      /* 4.67.14 — the next number in the company's own series, for a calculation saved on the phone */
+      if (path === '/v1/calc/numbers' && method === 'GET') {
+        await ensureSchema();
+        const a = await authorise(request);
+        if (!a.ok) return json(a.error, a.httpStatus);
+        if (!a.user) return json({ error: 'SIGN_IN', message: 'Sign in to make a calculation.' }, 401);
+        const out = await calcNumbers(a.companyId);
+        return json(out.body, out.httpStatus);
       }
       /* Nexora AI, phase 1 — the shape of a BOM checked in plain words.
          Signed-in people only; ai.js keeps only the technical fields and
