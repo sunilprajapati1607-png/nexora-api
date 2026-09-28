@@ -19,6 +19,7 @@ import { adminAuthorised, listLicences, licenceAction, companyAction, saveSettin
 import { login, listUsers, userAction, pull, push, describeUser, userCap, setCompanyPasscode, releaseSession, maxSeq, listDevices, deviceAction } from './sync.js';
 import { waitFor, wakeCompany, endSessionOn, WAIT_MS } from './waiters.js';
 import { calcForm, calcWeigh, calcNumbers } from './weigh.js';
+import { quoteForm, quoteSheet } from './quoteSheet.js';
 import { checkBom as aiCheckBom, planRoute as aiPlanRoute, fillCalc as aiFillCalc, editBom as aiEditBom, quoteLetter as aiQuoteLetter, help as aiHelp, chat as aiChat, assist as aiAssist, speak as aiSpeak, pickLang, aiStatus } from './ai.js';
 import { send as chatSend, since as chatSince, remove as chatRemove, clearBy as chatClearBy, listBroadcasts, broadcastAction } from './chat.js';
 import { ensureInkSchema, getModel, listModels, train as inkTrain, estimate as inkEstimate, reset as inkReset } from './inkstore.js';
@@ -299,6 +300,25 @@ export default {
         return json(out.body, out.httpStatus);
       }
       /* 4.67.14 — the next number in the company's own series, for a calculation saved on the phone */
+      /* 4.67.16 — a quotation made on the phone: what its form offers, and its number, totals and page */
+      if (path === '/v1/quote/form' && method === 'GET') {
+        await ensureSchema();
+        const a = await authorise(request);
+        if (!a.ok) return json(a.error, a.httpStatus);
+        if (!a.user) return json({ error: 'SIGN_IN', message: 'Sign in to make a quotation.' }, 401);
+        const out = await quoteForm(a.companyId);
+        return json(out.body, out.httpStatus);
+      }
+      if (path === '/v1/quote/sheet' && method === 'POST') {
+        await ensureSchema();
+        const a = await authorise(request);
+        if (!a.ok) return json(a.error, a.httpStatus);
+        if (!a.user) return json({ error: 'SIGN_IN', message: 'Sign in to make a quotation.' }, 401);
+        if (!a.licence.canCalculate) return json({ error: 'LICENCE_REQUIRED', licence: a.licence, message: a.licence.message || 'This licence has ended — saved quotations can be opened, but new ones need a licence.' }, 402);
+        const body = await readJson(request);
+        const out = await quoteSheet(a.companyId, a.user, body.quote);
+        return json(out.body, out.httpStatus);
+      }
       if (path === '/v1/calc/numbers' && method === 'GET') {
         await ensureSchema();
         const a = await authorise(request);

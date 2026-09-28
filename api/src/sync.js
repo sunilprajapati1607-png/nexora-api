@@ -395,7 +395,7 @@ export async function userAction(companyId, actor, body) {
               everyone's, and another person's arrives as a STUB.
    Every write takes a fresh seq, so "everything since seq N" is exact. */
 /* 4.66.3 — masters only an administrator may write (see push) */
-const ADMIN_ONLY_MASTERS = { 'nexora.rm.price.v1': 1, 'nexora.constants.v1': 1, 'nexora.constants.custom.v1': 1, 'nexora.docseries.v1': 1, 'nexora.units.v1': 1, 'nexora.meshunit.v1': 1,
+const ADMIN_ONLY_MASTERS = { 'nexora.rm.price.v1': 1, 'nexora.constants.v1': 1, 'nexora.constants.custom.v1': 1, 'nexora.docseries.v1': 1, 'nexora.units.v1': 1, 'nexora.meshunit.v1': 1, 'nexora.quote.terms.v1': 1,
   'nexora.constants.links.v1': 1, 'nexora.org.v1': 1 };
 const KINDS = { master: true, calc: true, bom: true, quote: true };
 const PAGE = 200;

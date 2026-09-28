@@ -28,7 +28,9 @@ import vm from 'node:vm';
 import { readFileSync } from 'node:fs';
 import { q } from './db.js';
 
-const FILES = ['constants.js', 'constructions.js', 'fieldDefs.js', 'constantsStore.js', 'structureStore.js', 'calculationEngine.js', 'docSeries.js', 'units.js'];
+const FILES = ['constants.js', 'constructions.js', 'fieldDefs.js', 'constantsStore.js', 'structureStore.js', 'calculationEngine.js', 'docSeries.js', 'units.js',
+  /* 4.67.16 — a quotation's arithmetic, for the quotations made on the phone (quoteSheet.js) */
+  'quoteMath.js'];
 const SCRIPTS = FILES.map((f) => new vm.Script(readFileSync(new URL('../vendor/' + f, import.meta.url), 'utf8'), { filename: 'vendor/' + f }));
 export const WEIGH_MASTERS = ['nexora.constants.v1', 'nexora.constants.custom.v1', 'nexora.constants.links.v1', 'nexora.structures.v1',
   /* 4.67.14 — the company's document series, set by its administrator (owner 2026-09-28) */
