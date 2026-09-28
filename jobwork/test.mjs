@@ -3,10 +3,11 @@
    party's name, an item's name and money never leave this service. */
 import assert from 'node:assert/strict';
 import { handle } from './server.js';
-import { _resting, strongModel, _blocked as _blockedSet, cleanAssist, checkSteps, cleanTables, _resetLimits, resolveModel, thinkingFor, _noThinking, readJsonAnswer, earModel, voiceModel, _setHedge, _setDeadline, aiRecent, backupOf, payloadFor } from './src/ai.js';
+import { _resting, strongModel, _blocked as _blockedSet, cleanAssist, checkSteps, cleanTables, _resetLimits, resolveModel, thinkingFor, _noThinking, readJsonAnswer, earModel, voiceModel, _setHedge, _setDeadline, aiRecent, backupOf, payloadFor, _setRetryPause } from './src/ai.js';
 
 let pass = 0;
 process.env.GEMINI_MODEL_STRONG = 'off';
+_setRetryPause(5);   /* 2.1.2 — the pause before asking a busy Google again, short here */
 const _blockedReset = () => { try { _blockedSet().clear(); } catch (e) {} };
 const t = async (name, fn) => { try { await fn(); pass++; console.log('ok   ' + name); } catch (e) { console.error('FAIL ' + name + '\n', e); process.exitCode = 1; } };
 
@@ -457,6 +458,19 @@ await t('a 400 about a file is not a retired model; Gemini 3 keeps its own tempe
   assert.equal(backupOf('gemini-3.5-flash-lite', ['gemini-3.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-3.5-flash']), 'gemini-3.1-flash-lite');
   assert.equal(backupOf('gemini-3.5-flash-lite', ['gemini-3.5-flash-lite', 'gemini-3.5-flash']), 'gemini-3.5-flash');
   assert.equal(backupOf('gemini-3.5-flash-lite', ['gemini-3.5-flash-lite']), null);
+});
+
+await t('Google says high demand (503) for every model, then lets it through: asked again after a pause, round the models', async () => {
+  _resetLimits(); _blockedReset();
+  let n = 0;
+  const g = threeModels((who, good) => (++n <= 4 ? new Response(JSON.stringify({ error: { message: 'This model is currently experiencing high demand.' } }), { status: 503 }) : good()));
+  await resolveModel(true, threeModels((who, good) => good()));
+  const r = await call('POST', '/v1/ai/assist', { device: 'dev-hedge006', assist: { text: 'why' } }, g);
+  assert.equal(r.status, 200, JSON.stringify(r.json)); assert.equal(n, 5);
+  let m = 0;
+  const always = threeModels(() => { m++; return new Response(JSON.stringify({ error: { message: 'high demand' } }), { status: 503 }); });
+  const f = await call('POST', '/v1/ai/assist', { device: 'dev-hedge007', assist: { text: 'why' } }, always);
+  assert.equal(f.status, 503); assert.equal(f.json.error, 'AI_OVERLOADED'); assert.ok(m >= 3 && m <= 8, String(m));
 });
 
 await t('a body of null is not a crash', async () => {

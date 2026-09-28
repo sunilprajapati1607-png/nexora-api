@@ -360,12 +360,20 @@ export function backupOf(name, names, skip) {
   const s = strongOf(pool);
   return s && not.indexOf(s) < 0 ? s : null;
 }
+/* 4.67.17 / 2.1.2 — measured live 2026-09-28 21:14: Google answered 503 "This model is currently experiencing
+   high demand" for 3.8-flash, 3.5-flash-lite AND 3.1-flash-lite within seconds of each other; a question a
+   minute later went through. So when every model has said busy/overloaded and time is left, the question
+   waits a moment (1.5 s, 3 s, 4.5 s …) and is asked again, round the models, at most MAX_TRIES times. */
+const MAX_TRIES = 8;
+let retryPause = 1500;
+export function _setRetryPause(ms) { retryPause = ms; }
+const retryable = (res) => res && (res.why === 'busy' || res.why === 'network' || res.why === 'unreadable' || (res.why === 'http' && res.status >= 500));
 const handsOver = (res) => res.why === 'timeout' || res.why === 'network' || res.why === 'busy' || res.why === 'retired' || res.why === 'unreadable' ||
   (res.why === 'http' && res.status >= 500);
 /** The usual model, and — when it is slow or fails — a second one; the first answer wins. */
 function race(first, payload, fetchImpl, kind, deadline, skip) {
   return new Promise((resolve) => {
-    let done = false, running = 0, backups = 0, last = null;
+    let done = false, running = 0, backups = 0, last = null, tries = 0, round = 0;
     const tried = [first].concat(skip || []);
     const ctrls = [];
     const left = () => deadline - Date.now();
@@ -382,8 +390,20 @@ function race(first, payload, fetchImpl, kind, deadline, skip) {
       if (!next) return;
       backups++; tried.push(next); run(next);
     };
+    /* every model tried has failed for a passing reason: a pause, and round the models again */
+    const again = () => {
+      if (done) return;
+      if (tries >= MAX_TRIES || left() < 10000 || !retryable(last)) { finish(last); return; }
+      round++;
+      setTimeout(() => {
+        if (done) return;
+        const pool = tried.filter((n) => !blocked.has(n) && (skip || []).indexOf(n) < 0);
+        if (!pool.length) { finish(last); return; }
+        run(pool[(round - 1) % pool.length]);
+      }, Math.min(retryPause * round, 6000));
+    };
     const run = (name) => {
-      running++;
+      running++; tries++;
       const c = new AbortController(); ctrls.push(c);
       tryModel(name, payload, fetchImpl, Math.max(1000, left()), kind + (name === first ? '' : '/backup'), c.signal).then((res) => {
         running--;
@@ -392,7 +412,7 @@ function race(first, payload, fetchImpl, kind, deadline, skip) {
         /* what is said when nothing answers: the usual model's failure, unless it was only retired */
         if (!last || (name === first && res.why !== 'retired') || last.why === 'retired') last = res;
         if (handsOver(res)) hedge(res.named);
-        if (!running) finish(last);
+        if (!running) again();
       });
     };
     timer = setTimeout(() => { if (!backups) hedge(null); }, hedgeMs);
@@ -432,6 +452,7 @@ async function ask(companyId, system, prompt, fetchImpl, opts) {
   if (res.why === 'refused') return { fail: { httpStatus: 422, body: { error: 'AI_REFUSED', message: 'Google declined to answer that question — put it another way.' } } };
   if (res.why === 'timeout' || res.why === 'cancelled') return { fail: { httpStatus: 504, body: { error: 'AI_TIMEOUT', message: 'Nexora AI did not answer in time — Google was slow just now. Try again.' } } };
   if (res.why === 'network') return { fail: { httpStatus: 502, body: { error: 'AI_UNREACHABLE', message: 'Nexora AI could not reach Google just now. Try again in a moment.' } } };
+  if (res.why === 'http' && res.status >= 500) return { fail: { httpStatus: 503, body: { error: 'AI_OVERLOADED', retryAfter: 60, message: 'Google’s AI is overloaded just now (it says “high demand”) — Nexora AI asked it several times. Try again in a minute.' } } };
   if (res.why === 'unreadable') return { fail: { httpStatus: 502, body: { error: 'AI_UNREADABLE', message: res.finish === 'MAX_TOKENS' ? 'Nexora AI’s answer ran too long and was cut off. Ask a narrower question.' : 'Nexora AI answered in a form Nexora could not read. Try again.' } } };
   const busy = res.why === 'busy';
   return { fail: { httpStatus: busy ? 429 : 502, body: { error: busy ? 'AI_BUSY' : 'AI_FAILED', retryAfter: busy ? 60 : undefined,
