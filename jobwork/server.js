@@ -44,7 +44,8 @@ function readJson(req) {
     req.on('data', (c) => { size += c.length; if (size > MAX_BODY) { over = true; return; } chunks.push(c); });
     req.on('end', () => {
       if (over) return resolve({ __big: true });
-      try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')); } catch (e) { resolve({ __bad: true }); }
+      /* 2.1.2 — a body of null, a number or a list is read as an empty object, never a crash */
+      try { const v = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}'); resolve(v && typeof v === 'object' && !Array.isArray(v) ? v : {}); } catch (e) { resolve({ __bad: true }); }
     });
     req.on('error', () => resolve({ __bad: true }));
   });

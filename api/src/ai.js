@@ -282,11 +282,35 @@ export function payloadFor(base, name) {
   const v = /^gemini-(\d+)/.exec(String(name || ''));
   const gen = v ? Number(v[1]) : 0;
   if (gen < 3) g.temperature = 0.2;
-  if (gen >= 3 && /-flash$/.test(name)) g.thinkingConfig = { thinkingLevel: 'low' };
+  const th = thinkingFor(name);
+  if (th) g.thinkingConfig = th;
   return JSON.stringify(Object.assign({}, base, { generationConfig: g }));
+}
+/* 4.67.17 — THE LEAST THINKING, FOR EVERY MODEL. Measured in Nexora Jobwork (2.0.1, same key family): the
+   same small question took 8 s, then 42 s an hour later — the newer Flash-Lite models think before they
+   answer, and a longer prompt (the help's 25 KB of topics) makes them think longer; with thinkingLevel
+   "low" it was 1.5–4 s. Gemini 3: thinkingLevel low; 2.5: a budget of 0. A model that does not take the
+   setting says so with a 400 and is asked again without it, and remembered. GEMINI_THINKING=off leaves
+   every model to itself. */
+const noThinking = new Set();
+export function _noThinking() { return noThinking; }
+export function thinkingFor(name) {
+  if (String(process.env.GEMINI_THINKING || '').toLowerCase() === 'off' || noThinking.has(name)) return null;
+  if (/^gemini-[3-9]/.test(String(name || ''))) return { thinkingLevel: 'low' };
+  if (/^gemini-2\.5/.test(String(name || ''))) return { thinkingBudget: 0 };
+  return null;
 }
 /** One model, asked once. → {ok:true, json, name} or {ok:false, why, status, r, name, named} */
 async function tryModel(name, base, fetchImpl, ms, kind, cancel) {
+  const first = await tryModelOnce(name, base, fetchImpl, ms, kind, cancel);
+  /* a model that does not take the thinking setting: asked again at once without it */
+  if (!first.ok && first.status === 400 && thinkingFor(name) && /think/i.test(String((first.r && first.r.body && first.r.body.error && first.r.body.error.message) || ''))) {
+    noThinking.add(name);
+    return tryModelOnce(name, base, fetchImpl, ms, kind, cancel);
+  }
+  return first;
+}
+async function tryModelOnce(name, base, fetchImpl, ms, kind, cancel) {
   const payload = payloadFor(base, name);
   const t0 = Date.now();
   const rec = { at: new Date(t0).toISOString(), kind: kind, model: name };

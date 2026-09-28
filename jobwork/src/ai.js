@@ -30,7 +30,15 @@
 
 const API = 'https://generativelanguage.googleapis.com/v1beta';
 export const DEFAULT_MODEL = 'gemini-3.5-flash-lite';
-const blocked = new Set();                       // models Google has refused this run
+/* 2.1.2 — a model Google refused is set aside for an HOUR, not until the next restart */
+const BLOCK_MS = 60 * 60 * 1000;
+const blockedAt = new Map();                     // model -> when Google refused it
+const blocked = {
+  has: (n) => { const t = blockedAt.get(n); if (t === undefined) return false; if (Date.now() - t > BLOCK_MS) { blockedAt.delete(n); return false; } return true; },
+  add: (n) => { blockedAt.set(n, Date.now()); return blocked; },
+  clear: () => blockedAt.clear(),
+  get size() { return blockedAt.size; }
+};
 export function _blocked() { return blocked; }
 /** 'gemini-3.5-flash-lite' → a sort key: flash-lite before flash, newer first */
 function rankOf(n) {
@@ -79,10 +87,14 @@ function scrub(s) {
 let model = { name: null, at: 0, error: null };
 let resolving = null;
 
-async function gfetch(url, opts, fetchImpl, ms) {
+async function gfetch(url, opts, fetchImpl, ms, cancel) {
   const f = fetchImpl || globalThis.fetch;
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), ms || TIMEOUT_MS);
+  let timedOut = false;
+  const timer = setTimeout(() => { timedOut = true; ctrl.abort(); }, ms || TIMEOUT_MS);
+  /* 2.1.2 — a question answered by another model stops this one */
+  const stop = () => ctrl.abort();
+  if (cancel) { if (cancel.aborted) ctrl.abort(); else cancel.addEventListener('abort', stop, { once: true }); }
   try {
     const r = await f(url, Object.assign({}, opts, { signal: ctrl.signal,
       headers: Object.assign({ 'content-type': 'application/json', 'x-goog-api-key': key() }, (opts && opts.headers) || {}) }));
@@ -90,7 +102,12 @@ async function gfetch(url, opts, fetchImpl, ms) {
     let body = {};
     try { body = text ? JSON.parse(text) : {}; } catch (e) { body = { raw: text.slice(0, 200) }; }
     return { ok: r.ok, status: r.status, body };
-  } finally { clearTimeout(timer); }
+  } catch (e) {
+    /* what kind of failure: our clock ran out, another model answered first, or Google could not be reached */
+    const err = (e && typeof e === 'object') ? e : new Error(String(e));
+    try { err.nxKind = timedOut ? 'timeout' : (cancel && cancel.aborted) ? 'cancelled' : 'network'; } catch (x) { /* frozen */ }
+    throw err;
+  } finally { clearTimeout(timer); if (cancel) cancel.removeEventListener('abort', stop); }
 }
 
 export async function resolveModel(force, fetchImpl) {
@@ -100,7 +117,7 @@ export async function resolveModel(force, fetchImpl) {
   resolving = (async () => {
     const wanted = String(process.env.GEMINI_MODEL || DEFAULT_MODEL).trim().replace(/^models\//, '');
     try {
-      const r = await gfetch(API + '/models?pageSize=200', { method: 'GET' }, fetchImpl);
+      const r = await gfetch(API + '/models?pageSize=200', { method: 'GET' }, fetchImpl, 8000);   /* 2.1.2 — a question never waits long on the list */
       if (!r.ok) throw new Error('models list ' + r.status + ': ' + scrub(r.body && r.body.error && r.body.error.message));
       const names = ((r.body && r.body.models) || [])
         .filter((m) => (m.supportedGenerationMethods || []).indexOf('generateContent') > -1)
@@ -118,7 +135,7 @@ export async function resolveModel(force, fetchImpl) {
 /** For /health — cached, never waits on Google. */
 export function aiStatus() {
   if (aiConfigured() && (!model.at || Date.now() - model.at > MODEL_TTL_MS)) resolveModel(false).catch(() => {});
-  return { configured: aiConfigured(), keyFrom: keySource(), model: model.name, strong: strongModel(), ear: earModel(), voice: voiceModel(), note: model.error || null, lastAudio: lastAudio };
+  return { configured: aiConfigured(), keyFrom: keySource(), model: model.name, strong: strongModel(), ear: earModel(), voice: voiceModel(), note: model.error || null, lastAudio: lastAudio, recent: recentCalls.slice(-12) };
 }
 
 /* ---- the ear and the voice (2.0.3) ------------------------------------------
@@ -180,7 +197,8 @@ const perDevice = new Map();         // device -> { day, n }
 let recent = [];
 const daily = () => Math.max(1, parseInt(process.env.AI_DAILY_PER_DEVICE, 10) || 150);
 const perMinute = () => Math.max(1, parseInt(process.env.AI_PER_MINUTE, 10) || 10);
-function today() { return new Date().toISOString().slice(0, 10); }
+/* 2.1.2 — the day is India's (the plants' own midnight, not 05:30 in the morning) */
+function today() { return new Date(Date.now() + 330 * 60000).toISOString().slice(0, 10); }
 function take(device) {
   const now = Date.now();
   recent = recent.filter((t) => now - t < 60000);
@@ -530,17 +548,175 @@ export function thinkingFor(name) {
 export function _noThinking() { return noThinking; }
 
 /* ---- one call to Gemini --------------------------------------------------- */
+/* 2.1.2 — as the weight calculator's service 4.67.17 ("didnt got answered" there: Google's free
+   Flash-Lite answered one question in 20 s and not the next in 60 s). Now:
+   - a question has DEADLINE in all (the application waits 120 s), whatever is tried inside it;
+   - a question the usual model has not answered in HEDGE is ALSO asked of a second model the key lists
+     (another Flash-Lite, else a Flash that is not resting); the first answer wins and the other is
+     stopped. A busy (429), overloaded (5xx), unreachable, retired or unreadable model hands over at once;
+   - "did not answer in time" means Google was slow; "could not reach Google" is its own message;
+   - a question Google did not answer is not counted against the device's day;
+   - every call is noted (when, which question, which model, how long, how it ended, tokens — never what
+     was asked or answered) for /health, and on Render in the log. */
+let deadlineMs = 100000;
+export function _setDeadline(ms) { deadlineMs = ms; }
+let hedgeMs = 15000;
+export function _setHedge(ms) { hedgeMs = ms; }
+const recentCalls = [];
+export function aiRecent() { return recentCalls.slice(); }
+function noteCall(rec) {
+  recentCalls.push(rec);
+  while (recentCalls.length > 25) recentCalls.shift();
+  if (process.env.RENDER) {
+    try { console.log('ai ' + rec.kind + ' ' + rec.model + ' ' + rec.outcome + (rec.status ? ' ' + rec.status : '') + ' ' + rec.ms + ' ms' +
+      (rec.inTok ? ' in=' + rec.inTok : '') + (rec.outTok ? ' out=' + rec.outTok : '') + (rec.thinkTok ? ' think=' + rec.thinkTok : '') + (rec.code ? ' ' + rec.code : '')); } catch (e) { /* no log */ }
+  }
+}
+function errCode(e) {
+  const c = e && e.cause;
+  return String((c && (c.code || c.name)) || (e && (e.code || e.name)) || 'error');
+}
+/** The request for one model: Gemini 3 keeps its own temperature (Google: below 1.0 it may loop), the
+    older ones 0.2; the least thinking (thinkingFor); room for 8192 tokens (Gujarati and Hindi need many). */
+export function payloadFor(base, name) {
+  const g = Object.assign({}, base.generationConfig);
+  const v = /^gemini-(\d+)/.exec(String(name || ''));
+  if (!v || Number(v[1]) < 3) g.temperature = 0.2;
+  const th = thinkingFor(name);
+  if (th) g.thinkingConfig = th;
+  return JSON.stringify(Object.assign({}, base, { generationConfig: g }));
+}
+/** One model, asked once (twice when it refuses the thinking setting). → {ok:true, json, name} or {ok:false, why, status, r, name, named} */
+async function tryModel(name, base, fetchImpl, ms, kind, cancel) {
+  const t0 = Date.now();
+  let r = null;
+  for (let pass = 0; pass < 2; pass++) {
+    const rec = { at: new Date().toISOString(), kind: kind, model: name };
+    const ts = Date.now();
+    try {
+      r = await gfetch(API + '/models/' + encodeURIComponent(name) + ':generateContent', { method: 'POST', body: payloadFor(base, name) }, fetchImpl, Math.max(1000, ms - (Date.now() - t0)), cancel);
+    } catch (e) {
+      rec.ms = Date.now() - ts; rec.outcome = (e && e.nxKind) || 'network'; rec.code = scrub(errCode(e)).slice(0, 60);
+      noteCall(rec);
+      return { ok: false, why: rec.outcome, name: name };
+    }
+    rec.ms = Date.now() - ts; rec.status = r.status;
+    const cand = ((r.body && r.body.candidates) || [])[0] || {};
+    const use = (r.body && r.body.usageMetadata) || {};
+    if (cand.finishReason) rec.finish = String(cand.finishReason).slice(0, 30);
+    if (use.promptTokenCount) rec.inTok = use.promptTokenCount;
+    if (use.candidatesTokenCount) rec.outTok = use.candidatesTokenCount;
+    if (use.thoughtsTokenCount) rec.thinkTok = use.thoughtsTokenCount;
+    const msg = String((r.body && r.body.error && r.body.error.message) || '');
+    /* a model that does not take the thinking setting: asked again without it, and remembered */
+    if (r.status === 400 && /think/i.test(msg) && thinkingFor(name) && pass === 0) { rec.outcome = 'no-thinking'; noteCall(rec); noThinking.add(name); continue; }
+    if (!r.ok) {
+      /* only a 404 or "no longer available" retires a model — a 400 about a file type is not its fault */
+      const gone = r.status === 404 || /no longer available|deprecated/i.test(msg);
+      rec.outcome = gone ? 'retired' : r.status === 429 ? 'busy' : 'http';
+      rec.code = scrub(msg).slice(0, 80);
+      noteCall(rec);
+      if (gone) blocked.add(name);
+      const named = gone ? ((msg.match(/models\/(gemini-[\w.\-]+)/g) || []).map((x) => x.replace(/^models\//, '')).filter((n) => n !== name && !blocked.has(n))[0] || null) : null;
+      return { ok: false, why: rec.outcome, status: r.status, r: r, name: name, named: named };
+    }
+    const json = readJsonAnswer(r.body);
+    const refused = (r.body && r.body.promptFeedback && r.body.promptFeedback.blockReason) ||
+      (/^(SAFETY|PROHIBITED_CONTENT|BLOCKLIST|SPII|RECITATION)$/.test(rec.finish || '') ? rec.finish : null);
+    rec.outcome = json ? 'ok' : refused ? 'refused' : 'unreadable';
+    if (refused && !json) rec.code = String(refused).slice(0, 30);
+    noteCall(rec);
+    if (!json && refused) return { ok: false, why: 'refused', status: r.status, r: r, name: name };
+    if (!json) return { ok: false, why: 'unreadable', status: r.status, r: r, name: name, finish: rec.finish };
+    return { ok: true, json: json, name: name };
+  }
+  return { ok: false, why: 'http', status: r ? r.status : 0, r: r, name: name };
+}
+/** The second model for a slow or failing question: another Flash-Lite the key lists (newest first), else a Flash that is not resting. */
+export function backupOf(name, names, skip) {
+  const not = [name].concat(skip || []);
+  const pool = (names || []).filter((n) => not.indexOf(n) < 0 && !blocked.has(n) && rankOf(n) !== null);
+  const lite = pool.filter((n) => /flash-lite(?:-\d{3})?$/.test(n)).sort((a, b) => rankOf(b) - rankOf(a))[0];
+  if (lite) return lite;
+  const flash = pool.filter((n) => flashRank(n) !== null && !(resting.get(n) > Date.now())).sort((a, b) => flashRank(b) - flashRank(a))[0];
+  return flash || null;
+}
+const handsOver = (res) => res.why === 'timeout' || res.why === 'network' || res.why === 'busy' || res.why === 'retired' || res.why === 'unreadable' ||
+  (res.why === 'http' && res.status >= 500);
+/** The usual model, and — when it is slow or fails — a second one; the first answer wins. */
+function race(first, base, fetchImpl, kind, deadline, skip) {
+  return new Promise((resolve) => {
+    let done = false, running = 0, backups = 0, last = null, timer = null;
+    const tried = [first].concat(skip || []);
+    const ctrls = [];
+    const left = () => deadline - Date.now();
+    const finish = (res) => {
+      if (done) return;
+      done = true; clearTimeout(timer);
+      ctrls.forEach((c) => { try { c.abort(); } catch (e) { /* gone */ } });
+      resolve(res);
+    };
+    const hedge = (prefer) => {
+      if (done || backups >= 2 || left() < 8000) return;
+      const next = (prefer && !blocked.has(prefer) && tried.indexOf(prefer) < 0) ? prefer : backupOf(first, model.available || [], tried);
+      if (!next) return;
+      backups++; tried.push(next); run(next);
+    };
+    const run = (name) => {
+      running++;
+      const c = new AbortController(); ctrls.push(c);
+      tryModel(name, base, fetchImpl, Math.max(1000, left()), kind + (name === first ? '' : '/backup'), c.signal).then((res) => {
+        running--;
+        if (done) return;
+        if (res.ok) { finish(res); return; }
+        if (!last || (name === first && res.why !== 'retired') || last.why === 'retired') last = res;
+        if (handsOver(res)) hedge(res.named);
+        if (!running) finish(last);
+      });
+    };
+    timer = setTimeout(() => { if (!backups) hedge(null); }, hedgeMs);
+    run(first);
+  });
+}
+/* a question Google did not answer is given back to the device's day */
+function giveBack(device) {
+  const c = perDevice.get(String(device || 'none'));
+  if (c && c.day === today() && c.n > 0) c.n--;
+}
 async function ask(device, system, prompt, fetchImpl, opts) {
+  opts = opts || {};
   const t0 = Date.now();
   const done = (out, what) => { console.log('ai ' + what + ' ' + (Date.now() - t0) + ' ms' + (out && out.model ? ' ' + out.model : '')); return out; };
-  let r0 = await askOnce(device, system, prompt, fetchImpl, false, opts);
-  /* an answer that could not be read is asked for once more (not counted
-     again) — the person should not press Send twice for Google's slip */
-  if (r0.fail && r0.fail.body && r0.fail.body.error === 'AI_UNREADABLE') {
-    console.log('ai AI_UNREADABLE, asking again');
-    r0 = await askOnce(device, system, prompt, fetchImpl, true);
+  if (!aiConfigured()) return { fail: { httpStatus: 503, body: { error: 'AI_OFF', message: 'Nexora AI is not switched on at the service yet.' } } };
+  const t = take(device);
+  if (t.busy) return { fail: { httpStatus: 429, body: { error: 'AI_BUSY', retryAfter: t.busy, message: 'Nexora AI is busy — try again in ' + t.busy + ' seconds.' } } };
+  if (t.spent) return { fail: { httpStatus: 429, body: { error: 'AI_DAILY', message: 'This computer has used today’s ' + daily() + ' Nexora AI questions. They come back tomorrow.' } } };
+  const deadline = Date.now() + deadlineMs;
+  const name = await resolveModel(false, fetchImpl);
+  if (!name) { giveBack(device); return { fail: { httpStatus: 503, body: { error: 'AI_MODEL', message: 'Nexora AI has no model it can use right now.' } } }; }
+  const kind = opts.kind || 'assist';
+  const base = { systemInstruction: { parts: [{ text: system }] }, contents: prompt.contents, generationConfig: { responseMimeType: 'application/json', maxOutputTokens: 8192 } };
+  /* the stronger model first, within its budget; the usual one answers when it cannot */
+  const strong = opts.strong ? strongModel() : null;
+  if (strong && strong !== name) {
+    const rs = await tryModel(strong, base, fetchImpl, Math.min(STRONG_MS, deadline - Date.now() - 20000), kind + '/strong');
+    if (rs.ok) return done({ json: rs.json, model: strong, left: t.left }, 'ok');
+    /* busy, out of allowance or out of time: it rests, so the next question does not wait on it again */
+    if (rs.why !== 'http' || rs.status >= 500) resting.set(strong, Date.now() + 15 * 60 * 1000);
   }
-  return done(r0, r0.fail ? (r0.fail.body && r0.fail.body.error) : 'ok');
+  const res = await race(name, base, fetchImpl, kind, deadline, strong ? [strong] : []);
+  if (res.ok) {
+    if (blocked.has(name) && res.name !== name) model = Object.assign({}, model, { name: res.name, at: Date.now(), error: 'switched to ' + res.name + ' (Google retired the one before)' });
+    return done({ json: res.json, model: res.name, left: t.left }, 'ok');
+  }
+  if (res.why !== 'refused' && !(res.why === 'http' && res.status < 500)) giveBack(device);
+  const fail = (httpStatus, error, message, extra) => done({ fail: { httpStatus: httpStatus, body: Object.assign({ error: error, message: message }, extra || {}) } }, error);
+  if (res.why === 'refused') return fail(422, 'AI_REFUSED', 'Google declined to answer that question — put it another way.');
+  if (res.why === 'timeout' || res.why === 'cancelled') return fail(504, 'AI_TIMEOUT', 'Nexora AI did not answer in time — Google was slow just now. Try again.');
+  if (res.why === 'network') return fail(502, 'AI_UNREACHABLE', 'Nexora AI could not reach Google just now. Try again in a moment.');
+  if (res.why === 'unreadable') return fail(502, 'AI_UNREADABLE', res.finish === 'MAX_TOKENS' ? 'Nexora AI’s answer ran too long and was cut off. Ask a narrower question.' : 'Nexora AI answered in a form Nexora could not read. Try again.');
+  if (res.why === 'busy') return fail(429, 'AI_BUSY', 'Nexora AI is busy (Google’s limit) — try again in a minute.', { retryAfter: 60 });
+  return fail(502, 'AI_FAILED', 'Nexora AI could not answer (' + res.status + '): ' + scrub(res.r && res.r.body && res.r.body.error && res.r.body.error.message));
 }
 
 /* 2.0.1 — measured: AI_UNREADABLE in 2 s, twice in ten. A model that
@@ -556,61 +732,6 @@ export function readJsonAnswer(body) {
   const a = text.indexOf('{'), b = text.lastIndexOf('}');
   if (a < 0 || b <= a) return null;
   try { return JSON.parse(text.slice(a, b + 1)); } catch (e) { return null; }
-}
-
-async function askOnce(device, system, prompt, fetchImpl, again, opts) {
-  opts = opts || {};
-  if (!aiConfigured()) return { fail: { httpStatus: 503, body: { error: 'AI_OFF', message: 'Nexora AI is not switched on at the service yet.' } } };
-  const t = again ? { left: undefined } : take(device);
-  if (t.busy) return { fail: { httpStatus: 429, body: { error: 'AI_BUSY', retryAfter: t.busy, message: 'Nexora AI is busy — try again in ' + t.busy + ' seconds.' } } };
-  if (t.spent) return { fail: { httpStatus: 429, body: { error: 'AI_DAILY', message: 'This computer has used today’s ' + daily() + ' Nexora AI questions. They come back tomorrow.' } } };
-  let name = await resolveModel(false, fetchImpl);
-  if (!name) return { fail: { httpStatus: 503, body: { error: 'AI_MODEL', message: 'Nexora AI has no model it can use right now.' } } };
-  const payloadFor = (n) => {
-    const gc = { temperature: 0.2, responseMimeType: 'application/json', maxOutputTokens: 6144 };
-    const th = thinkingFor(n);
-    if (th) gc.thinkingConfig = th;
-    return JSON.stringify({ systemInstruction: { parts: [{ text: system }] }, contents: prompt.contents, generationConfig: gc });
-  };
-  let r;
-  /* the stronger model first, within its budget; Lite answers when it cannot */
-  const strong = opts.strong && !again ? strongModel() : null;
-  if (strong && strong !== name) {
-    const ts = Date.now();
-    let rs = null;
-    try { rs = await gfetch(API + '/models/' + encodeURIComponent(strong) + ':generateContent', { method: 'POST', body: payloadFor(strong) }, fetchImpl, STRONG_MS); } catch (e) { rs = null; }
-    if (rs && rs.status === 400 && /think/i.test(String((rs.body && rs.body.error && rs.body.error.message) || ''))) noThinking.add(strong);
-    /* busy, out of allowance or out of time: it rests, so the next question does not wait on it again */
-    if (!rs || rs.status === 429 || rs.status >= 500) resting.set(strong, Date.now() + 15 * 60 * 1000);
-    if (rs && rs.ok) { const got = readJsonAnswer(rs.body); if (got) return { json: got, model: strong, left: t.left }; }
-    console.log('ai strong ' + (rs ? rs.status : 'timeout') + ' after ' + (Date.now() - ts) + ' ms, Lite answers');
-  }
-  for (let attempt = 0; ; attempt++) {
-    try {
-      r = await gfetch(API + '/models/' + encodeURIComponent(name) + ':generateContent', { method: 'POST', body: payloadFor(name) }, fetchImpl);
-    } catch (e) {
-      return { fail: { httpStatus: 504, body: { error: 'AI_TIMEOUT', message: 'Nexora AI did not answer in time. Try again.' } } };
-    }
-    const msg = String((r.body && r.body.error && r.body.error.message) || '');
-    /* a model that does not take the thinking setting: ask again without it */
-    if (r.status === 400 && /think/i.test(msg) && thinkingFor(name) && attempt < 3) { noThinking.add(name); continue; }
-    const gone = !r.ok && (r.status === 404 || /no longer available|not found|is not supported|deprecated/i.test(msg));
-    if (!gone || attempt >= 2) break;
-    blocked.add(name);
-    const named = (msg.match(/models\/(gemini-[\w.\-]+)/g) || []).map((x) => x.replace(/^models\//, '')).filter((n) => n !== name && !blocked.has(n))[0];
-    const next = named || await resolveModel(true, fetchImpl);
-    if (!next || blocked.has(next)) break;
-    name = next;
-    model = Object.assign({}, model, { name: next, at: Date.now(), error: 'switched to ' + next + ' (Google retired the one before)' });
-  }
-  if (!r.ok) {
-    const busy = r.status === 429;
-    return { fail: { httpStatus: busy ? 429 : 502, body: { error: busy ? 'AI_BUSY' : 'AI_FAILED', retryAfter: busy ? 60 : undefined,
-      message: busy ? 'Nexora AI is busy (Google’s limit) — try again in a minute.' : 'Nexora AI could not answer (' + r.status + '): ' + scrub(r.body && r.body.error && r.body.error.message) } } };
-  }
-  const json = readJsonAnswer(r.body);
-  if (!json) return { fail: { httpStatus: 502, body: { error: 'AI_UNREADABLE', message: 'Nexora AI answered in a form Nexora could not read. Try again.' } } };
-  return { json: json, model: name, left: t.left };
 }
 
 /* ---- POST /v1/ai/transcribe — what the person said, faithfully ---------------- */
@@ -642,7 +763,8 @@ export async function transcribe(device, payload, fetchImpl) {
   let r;
   for (let attempt = 0; attempt < 3; attempt++) {
     try { r = await gfetch(API + '/models/' + encodeURIComponent(name) + ':generateContent', { method: 'POST', body: attempt && !thinkingFor(name) ? body.replace(/,"thinkingConfig":\{[^}]*\}/, '') : body }, fetchImpl); }
-    catch (e) { return { httpStatus: 504, body: { error: 'AI_TIMEOUT', message: 'Nexora AI did not hear it in time. Try again.' } }; }
+    catch (e) { return e && e.nxKind === 'network' ? { httpStatus: 502, body: { error: 'AI_UNREACHABLE', message: 'Nexora AI could not reach Google just now. Try again in a moment.' } }
+      : { httpStatus: 504, body: { error: 'AI_TIMEOUT', message: 'Nexora AI did not hear it in time. Try again.' } }; }
     const msg = String((r.body && r.body.error && r.body.error.message) || '');
     if (r.status === 400 && /think/i.test(msg)) { noThinking.add(name); continue; }
     if (!r.ok && (r.status === 404 || /no longer available|not found|not supported/i.test(msg)) && name !== model.name) { name = model.name; continue; }
@@ -713,7 +835,7 @@ export async function assist(device, payload, lang, fetchImpl) {
   p.history.forEach((h) => contents.push({ role: h.role, parts: [{ text: h.text }] }));
   contents.push({ role: 'user', parts: m.parts.concat([{ text: langLine(lang, 'the answer') + (m.audio ? 'The person speaks in the attached recording.' + (p.text ? ' Also typed: ' + p.text : '') : p.text) +
     (m.files ? '\nAlso attached: ' + m.files + ' photo(s)/document(s) — a challan, a slip or a list; read the quantities from them.' : '') }]) });
-  const a = await ask(device, SYSTEM, { contents: contents }, fetchImpl, { strong: !(payload && payload.voice) });
+  const a = await ask(device, SYSTEM, { contents: contents }, fetchImpl, { strong: !(payload && payload.voice), kind: m.audio ? 'assist/voice' : 'assist' });
   if (a.fail) return a.fail;
   const j = a.json || {};
   if (m.audio && lastAudio) lastAudio.transcriptChars = String(j.transcript || '').trim().length;

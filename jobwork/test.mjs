@@ -3,7 +3,7 @@
    party's name, an item's name and money never leave this service. */
 import assert from 'node:assert/strict';
 import { handle } from './server.js';
-import { _resting, strongModel, _blocked as _blockedSet, cleanAssist, checkSteps, cleanTables, _resetLimits, resolveModel, thinkingFor, _noThinking, readJsonAnswer, earModel, voiceModel } from './src/ai.js';
+import { _resting, strongModel, _blocked as _blockedSet, cleanAssist, checkSteps, cleanTables, _resetLimits, resolveModel, thinkingFor, _noThinking, readJsonAnswer, earModel, voiceModel, _setHedge, _setDeadline, aiRecent, backupOf, payloadFor } from './src/ai.js';
 
 let pass = 0;
 process.env.GEMINI_MODEL_STRONG = 'off';
@@ -385,6 +385,84 @@ await t('a typed table never goes beside a table worked out from the book', asyn
   const know = await call('POST', '/v1/ai/assist', { device: 'dev-typed002', assist: { text: 'ITC-04 as a table' } },
     fakeGoogle({ lang: 'en', answer: 'here', steps: [], tables: [{ title: 'ITC-04', columns: ['Table', 'What'], rows: [['4', 'sent']], total: false }] }));
   assert.equal(know.json.tables.length, 1);
+});
+
+/* ---- 2.1.2 — as the weight calculator 4.67.17: a slow or failing model hands over ---------------- */
+const late = (ms, make, signal) => new Promise((res, rej) => { const tm = setTimeout(() => res(make()), ms);
+  if (signal) signal.addEventListener('abort', () => { clearTimeout(tm); const e = new Error('aborted'); e.name = 'AbortError'; rej(e); }); });
+const threeModels = (behave) => async (url, init) => {
+  if (/\/models\?/.test(url)) return new Response(JSON.stringify({ models: ['gemini-3.1-flash-lite', 'gemini-3.5-flash-lite', 'gemini-3.5-flash'].map((n) => ({ name: 'models/' + n, supportedGenerationMethods: ['generateContent'] })) }), { status: 200 });
+  const who = decodeURIComponent((/models\/([^:]+):generateContent/.exec(String(url)) || [])[1] || '');
+  sent.push({ url: String(url), body: String((init && init.body) || '') });
+  const good = () => new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: JSON.stringify({ lang: 'en', answer: 'from ' + who, steps: [] }) }] }, finishReason: 'STOP' }], usageMetadata: { promptTokenCount: 7000, candidatesTokenCount: 90 } }), { status: 200 });
+  return behave(who, good, init && init.signal);
+};
+
+await t('slow usual model: after the hedge the same question goes to another Flash-Lite, whose answer comes at once; the slow one is stopped', async () => {
+  _resetLimits(); _blockedReset(); sent.length = 0; _setHedge(80);
+  const g = threeModels((who, good, signal) => who === 'gemini-3.5-flash-lite' ? late(3000, good, signal) : good());
+  await resolveModel(true, g);
+  const t0 = Date.now();
+  const r = await call('POST', '/v1/ai/assist', { device: 'dev-hedge001', assist: { text: 'stock ketlo che' } }, g);
+  assert.equal(r.status, 200, JSON.stringify(r.json));
+  assert.equal(r.json.model, 'gemini-3.1-flash-lite'); assert.ok(Date.now() - t0 < 2000);
+  const rec = aiRecent().slice(-2).map((x) => x.model + ':' + x.outcome).sort().join();
+  assert.ok(/gemini-3\.1-flash-lite:ok/.test(rec) && /gemini-3\.5-flash-lite:cancelled/.test(rec), rec);
+  assert.ok(!/stock ketlo/.test(JSON.stringify(aiRecent())), 'the question is never noted');
+  const h = await call('GET', '/health');
+  assert.ok(Array.isArray(h.json.ai.recent) && h.json.ai.recent.length > 0);
+  _setHedge(15000);
+});
+
+await t('overloaded usual model (503): the other model is asked at once', async () => {
+  _resetLimits(); _blockedReset(); sent.length = 0;
+  const g = threeModels((who, good) => who === 'gemini-3.5-flash-lite' ? new Response(JSON.stringify({ error: { message: 'overloaded' } }), { status: 503 }) : good());
+  await resolveModel(true, g);
+  const t0 = Date.now();
+  const r = await call('POST', '/v1/ai/assist', { device: 'dev-hedge002', assist: { text: 'why' } }, g);
+  assert.equal(r.json.model, 'gemini-3.1-flash-lite'); assert.ok(Date.now() - t0 < 2000);
+});
+
+await t('Google unreachable: "could not reach Google", not "did not answer in time"; the question is given back to the day', async () => {
+  _resetLimits(); _blockedReset();
+  const g = threeModels(() => { const e = new TypeError('fetch failed'); e.cause = { code: 'ECONNRESET' }; throw e; });
+  await resolveModel(true, threeModels((who, good) => good()));
+  const r = await call('POST', '/v1/ai/assist', { device: 'dev-hedge003', assist: { text: 'why' } }, g);
+  assert.equal(r.status, 502); assert.equal(r.json.error, 'AI_UNREACHABLE');
+  process.env.AI_DAILY_PER_DEVICE = '1';
+  const ok = await call('POST', '/v1/ai/assist', { device: 'dev-hedge003', assist: { text: 'why' } }, threeModels((who, good) => good()));
+  assert.equal(ok.status, 200, 'the failed question did not use up the day: ' + JSON.stringify(ok.json));
+  delete process.env.AI_DAILY_PER_DEVICE;
+});
+
+await t('nobody answers: the question ends at its deadline with "Google was slow"', async () => {
+  _resetLimits(); _blockedReset(); _setHedge(50); _setDeadline(400);
+  const g = threeModels((who, good, signal) => late(60000, good, signal));
+  await resolveModel(true, threeModels((who, good) => good()));
+  const t0 = Date.now();
+  const r = await call('POST', '/v1/ai/assist', { device: 'dev-hedge004', assist: { text: 'why' } }, g);
+  assert.equal(r.status, 504); assert.equal(r.json.error, 'AI_TIMEOUT'); assert.ok(/Google was slow/.test(r.json.message)); assert.ok(Date.now() - t0 < 1500);
+  _setDeadline(100000); _setHedge(15000);
+});
+
+await t('a 400 about a file is not a retired model; Gemini 3 keeps its own temperature; the second model is another Lite, else a Flash', async () => {
+  _resetLimits(); _blockedReset(); sent.length = 0;
+  const g = threeModels(() => new Response(JSON.stringify({ error: { message: 'Unsupported MIME type: image/heic is not supported' } }), { status: 400 }));
+  await resolveModel(true, threeModels((who, good) => good()));
+  const r = await call('POST', '/v1/ai/assist', { device: 'dev-hedge005', assist: { text: 'why' } }, g);
+  assert.equal(r.status, 502); assert.ok(!_blockedSet().has('gemini-3.5-flash-lite'));
+  const base = { contents: [], generationConfig: { responseMimeType: 'application/json', maxOutputTokens: 8192 } };
+  const p3 = JSON.parse(payloadFor(base, 'gemini-3.5-flash-lite')).generationConfig, p2 = JSON.parse(payloadFor(base, 'gemini-2.5-flash-lite')).generationConfig;
+  assert.ok(!('temperature' in p3) && p3.thinkingConfig.thinkingLevel === 'low' && p2.temperature === 0.2 && p2.thinkingConfig.thinkingBudget === 0);
+  assert.equal(backupOf('gemini-3.5-flash-lite', ['gemini-3.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-3.5-flash']), 'gemini-3.1-flash-lite');
+  assert.equal(backupOf('gemini-3.5-flash-lite', ['gemini-3.5-flash-lite', 'gemini-3.5-flash']), 'gemini-3.5-flash');
+  assert.equal(backupOf('gemini-3.5-flash-lite', ['gemini-3.5-flash-lite']), null);
+});
+
+await t('a body of null is not a crash', async () => {
+  const r = await call('POST', '/v1/ai/assist', 'null');
+  assert.equal(r.status, 400); assert.equal(r.json.error, 'DEVICE');
+  await resolveModel(true, fakeGoogle({}));
 });
 
 console.log(pass + ' passed');
