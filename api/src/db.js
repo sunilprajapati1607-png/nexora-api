@@ -161,6 +161,11 @@ export function ensureSchema() {
        starts refusing tomorrow. A metering feature must never be able to
        stop a plant that was never sold a cap. */
     await q(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS txn_limit INTEGER NOT NULL DEFAULT 0`);
+    /* 4.67.18 — a company's own Google Gemini key, kept locked (aikey.js): the sealed key, its last four
+       characters (all the application is ever shown) and when it was set. NULL = Nexora's own key answers. */
+    await q(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS ai_key_enc TEXT`);
+    await q(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS ai_key_last4 TEXT`);
+    await q(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS ai_key_set_at TIMESTAMPTZ`);
 
     /* Per device, because each machine reports its own. The company total
        is the SUM across its seats, computed when needed rather than

@@ -1,3 +1,5 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
+
 /**
  * Nexora service — Nexora AI (Google Gemini), phase 1: "check this BOM"
  * ======================================================================
@@ -66,15 +68,36 @@ export function strongOf(names) {
 const MODEL_TTL_MS = 6 * 60 * 60 * 1000;
 const TIMEOUT_MS = 60000;              /* 4.67.6 — a question with the plant's whole memory takes longer */
 
-const key = () => String(process.env.GEMINI_API_KEY || '').trim();
+/* 4.67.18 — owner: "if someone whant to use its own gemini api key then add this option in setting they can
+   change easyly api key". A company that has put its own Google Gemini key in Settings → Features has its
+   questions asked with that key (index.js runs them inside withKey): Google bills that company, and Nexora's
+   daily limit and per-minute limit do not apply to it. Everyone else is asked with Nexora's key. The key is
+   never written into a message, a log, /health or an answer. */
+const keyScope = new AsyncLocalStorage();
+export function withKey(k, fn) { const v = String(k || '').trim(); return v ? keyScope.run({ key: v }, fn) : fn(); }
+function ownKey() { const x = keyScope.getStore(); return x && x.key ? x.key : ''; }
+const nexoraKey = () => String(process.env.GEMINI_API_KEY || '').trim();
+const key = () => ownKey() || nexoraKey();
 export function aiConfigured() { return !!key(); }
 
-/* never let the key into a message, a log or an answer */
-function scrub(s) {
+/* never let a key into a message, a log or an answer */
+function scrub(s, max) {
   let t = String(s || '');
-  const k = key();
-  if (k) t = t.split(k).join('[key]');
-  return t.replace(/key=[A-Za-z0-9_\-]+/g, 'key=[key]').slice(0, 300);
+  [nexoraKey(), ownKey()].forEach((k) => { if (k) t = t.split(k).join('[key]'); });
+  return t.replace(/key=[A-Za-z0-9_\-]+/g, 'key=[key]').replace(/AIza[0-9A-Za-z_\-]{20,}/g, '[key]').slice(0, max || 300);
+}
+
+/** 4.67.18 — is this a Gemini key Google accepts? Asked once when an administrator saves it. → {ok} or {ok:false, why, message} */
+export async function checkKey(k, fetchImpl) {
+  const v = String(k || '').trim();
+  if (v.length < 20 || v.length > 200 || /\s/.test(v)) return { ok: false, why: 'shape', message: 'That does not look like a Gemini API key — copy it again from Google AI Studio (aistudio.google.com → Get API key).' };
+  let r;
+  try { r = await gfetch(API + '/models?pageSize=5', { method: 'GET', headers: { 'x-goog-api-key': v } }, fetchImpl, 12000); }
+  catch (e) { return { ok: false, why: 'unreachable', message: 'Google could not be reached to check the key just now — try again in a minute.' }; }
+  if (r.ok) return { ok: true };
+  const msg = String((r.body && r.body.error && r.body.error.message) || '').split(v).join('[key]');
+  if (r.status === 400 || r.status === 401 || r.status === 403) return { ok: false, why: 'refused', message: 'Google refused this key: ' + scrub(msg, 160) };
+  return { ok: false, why: 'http', message: 'Google could not check the key just now (' + r.status + ') — try again in a minute.' };
 }
 
 /* ---- the model ---------------------------------------------------------- */
@@ -115,7 +138,7 @@ export async function resolveModel(force, fetchImpl) {
   resolving = (async () => {
     const wanted = String(process.env.GEMINI_MODEL || DEFAULT_MODEL).trim().replace(/^models\//, '');
     try {
-      const r = await gfetch(API + '/models?pageSize=200', { method: 'GET' }, fetchImpl, LIST_MS);
+      const r = await gfetch(API + '/models?pageSize=200', nexoraKey() ? { method: 'GET', headers: { 'x-goog-api-key': nexoraKey() } } : { method: 'GET' }, fetchImpl, LIST_MS);
       if (!r.ok) throw new Error('models list ' + r.status + ': ' + scrub(r.body && r.body.error && r.body.error.message));
       const names = ((r.body && r.body.models) || [])
         .filter((m) => (m.supportedGenerationMethods || []).indexOf('generateContent') > -1)
@@ -149,6 +172,7 @@ const perMinute = () => Math.max(1, parseInt(process.env.AI_PER_MINUTE, 10) || 1
 /* 4.67.17 — the day is India's (the plants' own midnight, not 05:30 in the morning) */
 function today() { return new Date(Date.now() + 330 * 60000).toISOString().slice(0, 10); }
 function take(companyId) {
+  if (ownKey()) return { left: null, own: true };   /* 4.67.18 — the company's own key: Google's limits, not Nexora's */
   const now = Date.now();
   recent = recent.filter((t) => now - t < 60000);
   if (recent.length >= perMinute()) return { busy: Math.ceil((60000 - (now - recent[0])) / 1000) };
@@ -164,6 +188,7 @@ function take(companyId) {
 export function _resetLimits() { perCompany.clear(); recent = []; }
 /* 4.67.17 — a question that Google did not answer (slow, busy, unreachable) is not counted against the company's day */
 function giveBack(companyId) {
+  if (ownKey()) return;
   const c = perCompany.get(String(companyId || 'none'));
   if (c && c.day === today() && c.n > 0) c.n--;
 }
@@ -336,6 +361,7 @@ async function tryModelOnce(name, base, fetchImpl, ms, kind, cancel) {
     : payloadFor(base, name);
   const t0 = Date.now();
   const rec = { at: new Date(t0).toISOString(), kind: kind, model: name };
+  if (ownKey()) rec.own = true;   /* 4.67.18 — asked on the company's own key (never the key itself) */
   let r;
   try {
     r = await gfetch(API + '/models/' + encodeURIComponent(name) + ':generateContent', { method: 'POST', body: payload }, fetchImpl, ms, cancel);
@@ -359,7 +385,7 @@ async function tryModelOnce(name, base, fetchImpl, ms, kind, cancel) {
     const gone = r.status === 404 || /no longer available|deprecated/i.test(msg);
     rec.outcome = gone ? 'retired' : r.status === 429 ? 'busy' : 'http';
     /* a quota refusal names its metric and limit (tokens or requests, per minute or per day): kept whole */
-    rec.code = r.status === 429 ? scrub(msg).replace(/\s+/g, ' ').slice(0, 600) : scrub(msg).slice(0, 80);
+    rec.code = r.status === 429 ? scrub(msg, 600).replace(/\s+/g, ' ') : scrub(msg).slice(0, 80);
     noteCall(rec);
     if (gone) blocked.add(name);
     /* 4.67.1 — Google names the model to use instead: that one is asked next */
@@ -530,6 +556,13 @@ async function ask(companyId, system, prompt, fetchImpl, opts) {
     return { json: res.json, model: res.name, left: t.left };
   }
   if (res.why !== 'refused' && !(res.why === 'http' && res.status < 500)) giveBack(companyId);
+  if (ownKey()) {
+    const gm = String((res.r && res.r.body && res.r.body.error && res.r.body.error.message) || '');
+    if ((res.status === 400 || res.status === 401 || res.status === 403) && /api[ _]?key|permission|denied|billing/i.test(gm)) {
+      return { fail: { httpStatus: 502, body: { error: 'AI_KEY_BAD', message: 'Google refused your company’s own Gemini key (' + scrub(gm, 120) + '). An administrator can correct it in Settings → Features → Nexora AI key, or remove it to use Nexora’s.' } } };
+    }
+    if (res.why === 'busy') return { fail: { httpStatus: 429, body: { error: 'AI_KEY_QUOTA', retryAfter: 60, message: 'Your company’s own Gemini key has reached its Google limit (quota) for now. Try again later, or raise the limit in Google AI Studio (billing).' } } };
+  }
   if (res.why === 'refused') return { fail: { httpStatus: 422, body: { error: 'AI_REFUSED', message: 'Google declined to answer that question — put it another way.' } } };
   if (res.why === 'timeout' || res.why === 'cancelled') return { fail: { httpStatus: 504, body: { error: 'AI_TIMEOUT', message: 'Nexora AI did not answer in time — Google was slow just now. Try again.' } } };
   if (res.why === 'network') return { fail: { httpStatus: 502, body: { error: 'AI_UNREACHABLE', message: 'Nexora AI could not reach Google just now. Try again in a moment.' } } };
@@ -1696,6 +1729,7 @@ export async function assist(companyId, payload, lang, fetchImpl, who) {
 const speakRecent = [];
 const speakPerCompany = new Map();
 function takeSpeak(companyId) {
+  if (ownKey()) return {};   /* 4.67.18 — the company's own key: Google's limits */
   const now = Date.now();
   while (speakRecent.length && now - speakRecent[0] > 60000) speakRecent.shift();
   if (speakRecent.length >= (Math.max(1, parseInt(process.env.AI_SPEAK_PER_MINUTE, 10) || 12))) return { busy: true };

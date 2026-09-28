@@ -20,7 +20,8 @@ import { login, listUsers, userAction, pull, push, describeUser, userCap, setCom
 import { waitFor, wakeCompany, wakeChat, endSessionOn, WAIT_MS } from './waiters.js';
 import { calcForm, calcWeigh, calcNumbers } from './weigh.js';
 import { quoteForm, quoteSheet } from './quoteSheet.js';
-import { checkBom as aiCheckBom, planRoute as aiPlanRoute, fillCalc as aiFillCalc, editBom as aiEditBom, quoteLetter as aiQuoteLetter, help as aiHelp, chat as aiChat, assist as aiAssist, speak as aiSpeak, pickLang, aiStatus } from './ai.js';
+import { checkBom as aiCheckBom, planRoute as aiPlanRoute, fillCalc as aiFillCalc, editBom as aiEditBom, quoteLetter as aiQuoteLetter, help as aiHelp, chat as aiChat, assist as aiAssist, speak as aiSpeak, pickLang, aiStatus, withKey as aiWithKey, checkKey as aiCheckKey } from './ai.js';
+import { companyKey, keyInfo as aiKeyInfo, setKey as aiSetKey, clearKey as aiClearKey, canKeep as aiCanKeep } from './aikey.js';
 import { send as chatSend, since as chatSince, remove as chatRemove, clearBy as chatClearBy, listBroadcasts, broadcastAction } from './chat.js';
 import { ensureInkSchema, getModel, listModels, train as inkTrain, estimate as inkEstimate, reset as inkReset } from './inkstore.js';
 import { register, gstAction, remoteIp } from './register.js';
@@ -51,6 +52,12 @@ function canSeeCost(u) {
   let p = u.permissions;
   if (typeof p === 'string') { try { p = JSON.parse(p); } catch (e) { p = null; } }
   return !!(p && typeof p === 'object' && p.VIEW_COST === true);
+}
+/* 4.67.18 — a company that has put its own Google Gemini key in Settings has its Nexora AI questions asked
+   with it (aikey.js keeps it locked; ai.js never shows it) */
+async function runAi(a, fn) {
+  const k = a && a.companyId ? await companyKey(a.companyId) : '';
+  return aiWithKey(k, fn);
 }
 async function readJson(request) {
   /* 4.67.17 — a body of null, a number or a list is read as an empty object, never a crash */
@@ -85,7 +92,7 @@ export default {
       if (path === '/health' || path === '/') {
         await ensureSchema();
         /* ai: whether Nexora AI is switched on and which model — never the key */
-        return json({ ok: true, service: 'nexora-api', version: '1.0.0', time: new Date().toISOString(), ai: aiStatus() });
+        return json({ ok: true, service: 'nexora-api', version: '1.0.0', time: new Date().toISOString(), ai: Object.assign(aiStatus(), { ownKeys: aiCanKeep() }) });   /* 4.67.18 — ownKeys: a company's own Gemini key can be kept here (never a key) */
       }
 
       /* 4.42.0 — the website's contact and demo forms. Open by necessity:
@@ -338,6 +345,29 @@ export default {
         const out = await calcNumbers(a.companyId);
         return json(out.body, out.httpStatus);
       }
+      /* 4.67.18 — the company's own Google Gemini key ("if someone whant to use its own gemini api key then
+         add this option in setting"). GET: whether there is one, its last four characters and when it was set
+         — never the key. POST {action:'set', key}: checked with Google first, then kept locked. POST {action:'remove'}:
+         back to Nexora's key (POST, as every other call: the service's CORS lets GET and POST through).
+         Setting and removing it is for an administrator. */
+      if (path === '/v1/ai/key' && (method === 'GET' || method === 'POST')) {
+        await ensureSchema();
+        const a = await authorise(request);
+        if (!a.ok) return json(a.error, a.httpStatus);
+        if (!a.user) return json({ error: 'SIGN_IN', message: 'Sign in first.' }, 401);
+        if (!a.companyId) return json({ error: 'NO_COMPANY', message: 'Only a licensed company can use its own Gemini key.' }, 400);
+        const admin = a.user.role === 'ADMIN';
+        if (method === 'GET') return json(Object.assign({ ok: true, admin: admin }, await aiKeyInfo(a.companyId)));
+        if (!admin) return json({ error: 'ADMIN_ONLY', message: 'Only an administrator can change the Gemini key.' }, 403);
+        const body = await readJson(request);
+        if (body.action === 'remove') { await aiClearKey(a.companyId); return json(Object.assign({ ok: true, admin: true }, await aiKeyInfo(a.companyId))); }
+        if (body.action !== 'set') return json({ error: 'BAD_ACTION', message: 'Say set or remove.' }, 400);
+        if (!aiCanKeep()) return json({ error: 'AI_KEY_UNAVAILABLE', message: 'The Nexora service cannot keep a key just now — ask Nexora.' }, 503);
+        const chk = await aiCheckKey(body.key);
+        if (!chk.ok) return json({ error: 'AI_KEY_BAD', message: chk.message }, chk.why === 'unreachable' || chk.why === 'http' ? 502 : 400);
+        await aiSetKey(a.companyId, String(body.key).trim());
+        return json(Object.assign({ ok: true, admin: true }, await aiKeyInfo(a.companyId)));
+      }
       /* Nexora AI, phase 1 — the shape of a BOM checked in plain words.
          Signed-in people only; ai.js keeps only the technical fields and
          counts each company's checks. */
@@ -347,7 +377,7 @@ export default {
         if (!a.ok) return json(a.error, a.httpStatus);
         if (!a.user) return json({ error: 'SIGN_IN', message: 'Sign in to use Nexora AI.' }, 401);
         const body = await readJson(request);
-        const out = await aiCheckBom(a.companyId || a.row.device_id, body.bom, pickLang(body.lang));
+        const out = await runAi(a, () => aiCheckBom(a.companyId || a.row.device_id, body.bom, pickLang(body.lang)));
         return json(out.body, out.httpStatus);
       }
       /* Nexora AI — a BOM changed by what is said, the quotation letter, and the helper */
@@ -357,7 +387,7 @@ export default {
         if (!a.ok) return json(a.error, a.httpStatus);
         if (!a.user) return json({ error: 'SIGN_IN', message: 'Sign in to use Nexora AI.' }, 401);
         const body = await readJson(request);
-        const out = await aiEditBom(a.companyId || a.row.device_id, body.edit, pickLang(body.lang));
+        const out = await runAi(a, () => aiEditBom(a.companyId || a.row.device_id, body.edit, pickLang(body.lang)));
         return json(out.body, out.httpStatus);
       }
       if (path === '/v1/ai/quote-letter' && method === 'POST') {
@@ -366,7 +396,7 @@ export default {
         if (!a.ok) return json(a.error, a.httpStatus);
         if (!a.user) return json({ error: 'SIGN_IN', message: 'Sign in to use Nexora AI.' }, 401);
         const body = await readJson(request);
-        const out = await aiQuoteLetter(a.companyId || a.row.device_id, body.quote, pickLang(body.lang));
+        const out = await runAi(a, () => aiQuoteLetter(a.companyId || a.row.device_id, body.quote, pickLang(body.lang)));
         return json(out.body, out.httpStatus);
       }
       if (path === '/v1/ai/chat' && method === 'POST') {
@@ -375,7 +405,7 @@ export default {
         if (!a.ok) return json(a.error, a.httpStatus);
         if (!a.user) return json({ error: 'SIGN_IN', message: 'Sign in to use Nexora AI.' }, 401);
         const body = await readJson(request);
-        const out = await aiChat(a.companyId || a.row.device_id, body.chat, pickLang(body.lang));
+        const out = await runAi(a, () => aiChat(a.companyId || a.row.device_id, body.chat, pickLang(body.lang)));
         return json(out.body, out.httpStatus);
       }
       /* 4.67.3 — one Nexora AI on every window: an answer, and the steps to run */
@@ -385,7 +415,7 @@ export default {
         if (!a.ok) return json(a.error, a.httpStatus);
         if (!a.user) return json({ error: 'SIGN_IN', message: 'Sign in to use Nexora AI.' }, 401);
         const body = await readJson(request);
-        const out = await aiAssist(a.companyId || a.row.device_id, body.assist, pickLang(body.lang), undefined, { canCost: canSeeCost(a.user) });
+        const out = await runAi(a, () => aiAssist(a.companyId || a.row.device_id, body.assist, pickLang(body.lang), undefined, { canCost: canSeeCost(a.user) }));
         return json(out.body, out.httpStatus);
       }
       /* 4.67.8 — an answer read aloud (Gujarati, when this computer has no Gujarati voice) */
@@ -395,7 +425,7 @@ export default {
         if (!a.ok) return json(a.error, a.httpStatus);
         if (!a.user) return json({ error: 'SIGN_IN', message: 'Sign in to use Nexora AI.' }, 401);
         const body = await readJson(request);
-        const out = await aiSpeak(a.companyId || a.row.device_id, body.speak, pickLang(body.lang));
+        const out = await runAi(a, () => aiSpeak(a.companyId || a.row.device_id, body.speak, pickLang(body.lang)));
         return json(out.body, out.httpStatus);
       }
       if (path === '/v1/ai/help' && method === 'POST') {
@@ -404,7 +434,7 @@ export default {
         if (!a.ok) return json(a.error, a.httpStatus);
         if (!a.user) return json({ error: 'SIGN_IN', message: 'Sign in to use Nexora AI.' }, 401);
         const body = await readJson(request);
-        const out = await aiHelp(a.companyId || a.row.device_id, body.help, pickLang(body.lang));
+        const out = await runAi(a, () => aiHelp(a.companyId || a.row.device_id, body.help, pickLang(body.lang)));
         return json(out.body, out.httpStatus);
       }
       /* Nexora AI, phase 3 — the bag's specification, spoken or typed */
@@ -414,7 +444,7 @@ export default {
         if (!a.ok) return json(a.error, a.httpStatus);
         if (!a.user) return json({ error: 'SIGN_IN', message: 'Sign in to use Nexora AI.' }, 401);
         const body = await readJson(request);
-        const out = await aiFillCalc(a.companyId || a.row.device_id, body.fill, pickLang(body.lang));
+        const out = await runAi(a, () => aiFillCalc(a.companyId || a.row.device_id, body.fill, pickLang(body.lang)));
         return json(out.body, out.httpStatus);
       }
       /* Nexora AI, phase 2 — a route or a saved workflow proposed from plain words */
@@ -424,7 +454,7 @@ export default {
         if (!a.ok) return json(a.error, a.httpStatus);
         if (!a.user) return json({ error: 'SIGN_IN', message: 'Sign in to use Nexora AI.' }, 401);
         const body = await readJson(request);
-        const out = await aiPlanRoute(a.companyId || a.row.device_id, body.plan, pickLang(body.lang));
+        const out = await runAi(a, () => aiPlanRoute(a.companyId || a.row.device_id, body.plan, pickLang(body.lang)));
         return json(out.body, out.httpStatus);
       }
       /* 4.66.6 — "within 5 second ma sync thai javu joiye". A signed-in
