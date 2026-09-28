@@ -29,10 +29,12 @@ function remove(companyId, w) {
   if (!set.size) byCompany.delete(companyId);
 }
 
-/** Wait until something is said to this machine, or WAIT_MS passes. */
-export function waitFor(companyId, userId, deviceId, ms) {
+/** Wait until something is said to this machine, or WAIT_MS passes. A phone (opts.chat) is also
+ *  woken by a new message in the company chat — Nexora Mobile, 2026-09-28: instant instead of
+ *  asking every two seconds. */
+export function waitFor(companyId, userId, deviceId, ms, opts) {
   return new Promise((resolve) => {
-    const w = { userId: Number(userId), deviceId: String(deviceId || ''), done: null };
+    const w = { userId: Number(userId), deviceId: String(deviceId || ''), chat: !!(opts && opts.chat), done: null };
     const timer = setTimeout(() => w.done({ changed: false }), Math.max(1000, Math.min(ms || WAIT_MS, 55000)));
     w.done = (answer) => { clearTimeout(timer); remove(companyId, w); resolve(answer); };
     if (!byCompany.has(companyId)) byCompany.set(companyId, new Set());
@@ -46,6 +48,15 @@ export function wakeCompany(companyId, exceptDeviceId) {
   if (!set) return 0;
   let n = 0;
   [...set].forEach((w) => { if (w.deviceId !== String(exceptDeviceId || '')) { w.done({ changed: true }); n++; } });
+  return n;
+}
+
+/** Somebody wrote in the company chat: every phone waiting for it hears it now (computers keep their own chat timer). */
+export function wakeChat(companyId, exceptDeviceId) {
+  const set = byCompany.get(companyId);
+  if (!set) return 0;
+  let n = 0;
+  [...set].forEach((w) => { if (w.chat && w.deviceId !== String(exceptDeviceId || '')) { w.done({ changed: true, chat: true }); n++; } });
   return n;
 }
 

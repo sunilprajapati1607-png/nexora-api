@@ -12,12 +12,12 @@
  * may do. That is the difference between a trial you can move the PC's
  * date past and one you cannot.
  */
-import { ensureSchema } from './db.js';
+import { ensureSchema, q } from './db.js';
 import { activate, authorise, touch, issueToken, reportUsage, companyUsage, describe } from './licence.js';
 import { runBom } from './engine.js';
 import { adminAuthorised, listLicences, licenceAction, companyAction, saveSettings, recentEvents, ADMIN_HTML } from './admin.js';
 import { login, listUsers, userAction, pull, push, describeUser, userCap, setCompanyPasscode, releaseSession, maxSeq, listDevices, deviceAction } from './sync.js';
-import { waitFor, wakeCompany, endSessionOn, WAIT_MS } from './waiters.js';
+import { waitFor, wakeCompany, wakeChat, endSessionOn, WAIT_MS } from './waiters.js';
 import { calcForm, calcWeigh, calcNumbers } from './weigh.js';
 import { quoteForm, quoteSheet } from './quoteSheet.js';
 import { checkBom as aiCheckBom, planRoute as aiPlanRoute, fillCalc as aiFillCalc, editBom as aiEditBom, quoteLetter as aiQuoteLetter, help as aiHelp, chat as aiChat, assist as aiAssist, speak as aiSpeak, pickLang, aiStatus } from './ai.js';
@@ -199,6 +199,8 @@ export default {
         /* 4.66.3 — and says nothing new in the room: the conversation can be read */
         if (!a.licence.canCalculate) return json({ error: 'LICENCE_REQUIRED', licence: a.licence, message: a.licence.message || 'This licence has ended — the conversation can be read, not written to.' }, 402);
         const out = await chatSend(a.companyId, a.user, await readJson(request));
+        /* Nexora Mobile — the phones waiting on the company hear it at once */
+        if (out.httpStatus === 200) wakeChat(a.companyId, a.row.device_id);
         return json(out.body, out.httpStatus);
       }
       if (path === '/v1/chat/delete' && method === 'POST') {
@@ -431,10 +433,18 @@ export default {
         const since = Math.max(0, parseInt(url.searchParams.get('since'), 10) || 0);
         const top = await maxSeq(a.companyId);
         if (top > since) return json({ changed: true, seq: top });
+        /* Nexora Mobile: a phone also says the last chat message it holds, and is answered at once when there
+           is a newer one — so nothing said between two waits is missed */
+        const chatParam = url.searchParams.get('chat');
+        const wantsChat = chatParam !== null && chatParam !== '';
+        if (wantsChat) {
+          const c = await q(`SELECT COALESCE(MAX(id), 0) AS m FROM chat_messages WHERE company_id = $1`, [a.companyId]);
+          if (Number(c[0] && c[0].m) > (parseInt(chatParam, 10) || 0)) return json({ changed: true, chat: true });
+        }
         const ms = parseInt(url.searchParams.get('ms'), 10) || WAIT_MS;
-        const heard = await waitFor(a.companyId, a.user.id, a.row.device_id, ms);
+        const heard = await waitFor(a.companyId, a.user.id, a.row.device_id, ms, { chat: wantsChat });
         if (heard.ended) return json({ sessionEnded: heard.ended });
-        return json({ changed: !!heard.changed });
+        return json({ changed: !!heard.changed, chat: !!heard.chat });
       }
 
       /* ---- 4.16.0 BETA — the ink assumption -------------------------
