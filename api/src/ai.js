@@ -136,7 +136,9 @@ export async function resolveModel(force, fetchImpl) {
 /** For /health — cached, never waits on Google. */
 export function aiStatus() {
   if (aiConfigured() && (!model.at || Date.now() - model.at > MODEL_TTL_MS)) resolveModel(false).catch(() => {});
-  return { configured: aiConfigured(), model: model.name, note: model.error || null, lastAudio: lastAudio, recent: recentCalls.slice(-12) };
+  /* 4.67.17 — which models this key can use (their public names only), so a busy day can be read */
+  return { configured: aiConfigured(), model: model.name, note: model.error || null, lastAudio: lastAudio, recent: recentCalls.slice(-12),
+    models: (genNames.length ? genNames : model.available || []).filter((n) => /gemini|gemma/i.test(n) && !/tts|embedding|image|audio|live|native/i.test(n)).slice(0, 60) };
 }
 
 /* ---- limits ------------------------------------------------------------- */
