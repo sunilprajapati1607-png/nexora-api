@@ -11,6 +11,7 @@
  * data beyond what the owner already has, and it can be replaced with
  * real accounts the day there is more than one operator.
  */
+import { endSessionOn } from './waiters.js';
 import { q, getSettings, logEvent } from './db.js';
 import { cleanPlan, cleanPlanFeatures, PLAN_FEATURES } from './plans.js';
 import { hashPasscode, validPasscode, PASSCODE_MIN } from './passcode.js';
@@ -32,7 +33,7 @@ export async function listLicences() {
   const rows = await q(`
     SELECT l.device_id, l.device_name, l.company, l.email, l.state, l.trial_started_at,
            l.created_at, l.last_seen_at, l.seen_count, l.app_version, l.notes,
-           l.company_id, l.seat_no,
+           l.company_id, l.seat_no, l.platform, l.approved_at,
            /* 4.6.0 — net of any owner reset, the same figure the licence
               is judged on. The raw report stays in the row. */
            GREATEST(0, l.txn_count - l.txn_base)::int         AS txn_count,
@@ -52,7 +53,7 @@ export async function listLicences() {
            u.name AS on_user, u.session_at AS on_since
       FROM licences l
       LEFT JOIN companies c ON c.id = l.company_id
-      LEFT JOIN company_users u ON u.session_device = l.device_id
+      LEFT JOIN company_users u ON (u.session_device = l.device_id OR u.session_mobile = l.device_id)
      ORDER BY l.created_at DESC
      LIMIT 500`);
   const settings = await getSettings();
@@ -297,12 +298,16 @@ export async function companyAction(body) {
 
        This releases the binding. It does not change the PIN and it does
        not remove anybody: the very next sign-in, anywhere, simply works. */
-    const u = (await q(`SELECT id, name, session_device FROM company_users WHERE id = $1 AND company_id = $2`,
+    const u = (await q(`SELECT id, name, session_device, session_mobile FROM company_users WHERE id = $1 AND company_id = $2`,
       [body.userId, id]))[0];
     if (!u) return { error: 'No such person on this company.' };
-    if (!u.session_device) return { ok: true, warning: u.name + ' is not signed in anywhere.' };
-    await q(`UPDATE company_users SET session_device = NULL, session_at = NULL WHERE id = $1`, [u.id]);
-    await logEvent(null, 'ADMIN_USER_SIGNOUT', { companyId: id, userId: u.id, was: u.session_device });
+    if (!u.session_device && !u.session_mobile) return { ok: true, warning: u.name + ' is not signed in anywhere.' };
+    await q(`UPDATE company_users SET session_device = NULL, session_at = NULL, session_mobile = NULL, session_mobile_at = NULL WHERE id = $1`, [u.id]);
+    await logEvent(null, 'ADMIN_USER_SIGNOUT', { companyId: id, userId: u.id, was: u.session_device, phone: u.session_mobile || null });
+    /* 2026-09-28 — the machine and the phone are told NOW (a waiting /v1/sync/wait answers), and
+       authorise() no longer takes an empty binding for "signed in here" */
+    const ended = { name: u.name, at: new Date().toISOString(), where: 'no other computer \u2014 the administrator signed this account out', signedOut: true };
+    [u.session_device, u.session_mobile].filter(Boolean).forEach((d) => { try { endSessionOn(id, u.id, d, ended); } catch (e) { /* told at the next call instead */ } });
     return { ok: true, warning: u.name + ' has been signed out. The machine they were on finds out at its next ' +
       'check and shows the sign-in screen; they can sign in anywhere now.' };
 
@@ -1272,7 +1277,7 @@ function currentSec(){try{return sessionStorage.getItem('nexora_admin_tab')||'se
 /* ---------- plans (4.48.0) ---------- */
 const PLAN_LABELS={quotation:'Quotation',chat:'Company conversation (chat)',notes:'Notes pad',bomWorkflow:'BOM workflow automation',onlinePrices:'Prices from the producer\u2019s list',bagView:'3D bag view',ink:'Ink assumption',sharing:'Email & WhatsApp sharing',
   exportExcel:'Export to Excel',exportPdf:'Export to PDF',priceHistory:'RM price history (price versions)',activityLog:'Activity log',backup:'Backup & restore',numberSeries:'Document number series',tableSettings:'Table Settings (own column names)',sectionSuggest:'BOM sections learned from the plant',
-  /* 4.65.0 */ priceImpact:'Price Impact',compare:'Compare calculations',targetCost:'Target Cost'};
+  /* 4.65.0 */ priceImpact:'Price Impact',compare:'Compare calculations',targetCost:'Target Cost',mobile:'Nexora Mobile (Android app)'};
 function renderPlans(){
   const m=(DATA.settings&&DATA.settings.planFeatures)||{STANDARD:{},PRO:{}};
   const tb=document.querySelector('#plantbl tbody');
@@ -1960,7 +1965,7 @@ function render(){
     let state=(l.state==='TRIAL'&&l.expired)?'EXPIRED':l.state;
     if(l.co_state==='SUSPENDED'&&state!=='REVOKED')state='SUSPENDED';
     return '<tr>'+
-      '<td><b>'+esc(l.co_name||l.company||'—')+'</b>'+(l.seat_no?' <code>computer '+l.seat_no+'</code>':'')+
+      '<td><b>'+esc(l.co_name||l.company||'—')+'</b>'+(l.platform==='mobile'?' <code>📱 phone'+(l.approved_at?'':' · waiting for approval')+'</code>':(l.seat_no?' <code>computer '+l.seat_no+'</code>':''))+
         (l.on_user
           ? '<br><span class="pill s-LICENSED">'+esc(l.on_user)+' is signed in</span>'
           : '<br><span class="why">nobody signed in — this machine shows its sign-in screen</span>')+

@@ -362,7 +362,9 @@ function describeState(row, company, settings) {
   const periodDays = startedAt
     ? Math.max(0, istDay(new Date(expiresAt).getTime()) - istDay(new Date(startedAt).getTime()))
     : null;
-  const base = { expiresAt, startedAt, periodDays, offlineMinutes, company: profile };
+  const base = { expiresAt, startedAt, periodDays, offlineMinutes, company: profile,
+    /* Nexora Mobile — what this installation is, and whether a phone has been approved */
+    device: { platform: row.platform === 'mobile' ? 'mobile' : 'desktop', approved: row.platform === 'mobile' ? !!row.approved_at : true } };
 
   /* Order matters: the narrowest refusal is checked first, so a revoked
      device inside a healthy company is still refused. */
@@ -406,7 +408,8 @@ function describeState(row, company, settings) {
 import { passcodeMatches } from './passcode.js';
 const DEVICE_RE = /^[a-f0-9]{16,64}$/i;
 
-export async function activate({ deviceId, deviceName, company, email, appVersion, licenceKey, loginId, passcode }) {
+export async function activate({ deviceId, deviceName, company, email, appVersion, licenceKey, loginId, passcode, platform }) {
+  const phone = String(platform || '').toLowerCase() === 'mobile';
   if (!DEVICE_RE.test(String(deviceId || ''))) {
     return { httpStatus: 400, body: { error: 'BAD_DEVICE_ID',
       message: 'This installation could not identify the computer it is running on.' } };
@@ -455,6 +458,24 @@ export async function activate({ deviceId, deviceName, company, email, appVersio
     }
   }
 
+  /* Nexora Mobile — a phone joins a company that already exists (its licence key, or its company id
+     and passcode), never makes a demo of its own, and only on a plan that carries Nexora Mobile */
+  if (phone) {
+    if (!keyed) {
+      const had = (await q(`SELECT company_id FROM licences WHERE device_id = $1 AND platform = 'mobile'`, [deviceId]))[0];
+      if (had && had.company_id) keyed = (await q(`SELECT * FROM companies WHERE id = $1`, [had.company_id]))[0] || null;
+    }
+    if (!keyed) {
+      return { httpStatus: 400, body: { error: 'MOBILE_NEEDS_COMPANY',
+        message: 'Enter your company\u2019s licence key, or its company id and passcode \u2014 ask your Nexora administrator.' } };
+    }
+    const feats = featuresFor(keyed.plan, settings, keyed.is_demo === true);
+    if (!feats.mobile) {
+      return { httpStatus: 403, body: { error: 'MOBILE_NOT_IN_PLAN',
+        message: 'Nexora Mobile is part of the PRO plan. Ask Nexora to move ' + keyed.name + ' to PRO.' } };
+    }
+  }
+
   const existing = await q(`SELECT * FROM licences WHERE device_id = $1`, [deviceId]);
   if (existing.length) {
     /* THE REINSTALL RULE. The row already exists, so the original expiry
@@ -474,11 +495,15 @@ export async function activate({ deviceId, deviceName, company, email, appVersio
        key into the same installation — it must take a seat in the real
        company and keep everything it already has. Seats are checked here
        too, or a customer with 5 seats could quietly activate 50. */
+    if (phone && row2.platform !== 'mobile') {
+      await q(`UPDATE licences SET platform = 'mobile' WHERE device_id = $1`, [deviceId]);
+      row2 = (await q(`SELECT * FROM licences WHERE device_id = $1`, [deviceId]))[0];
+    }
     if (keyed && Number(row2.company_id) !== Number(keyed.id)) {
       /* 4.42.0 — no seat check here any more: the machine takes no seat.
          What it can DO is decided when a person signs in on it, and that
          is where the count is kept (sync.js userCap). */
-      const seat = await nextComputerNo(keyed.id);
+      const seat = phone ? null : await nextComputerNo(keyed.id);
       await q(`UPDATE licences SET company_id = $2, seat_no = $3, state = 'TRIAL' WHERE device_id = $1`,
         [deviceId, keyed.id, seat]);
       await logEvent(deviceId, 'JOIN_COMPANY', { companyId: keyed.id, seat, from: row2.company_id || null });
@@ -502,8 +527,8 @@ export async function activate({ deviceId, deviceName, company, email, appVersio
   let seat = 1;
 
   if (co) {
-    /* 4.42.0 — a new machine on a known licence is simply numbered. */
-    seat = await nextComputerNo(co.id);
+    /* 4.42.0 — a new machine on a known licence is simply numbered (a phone is not a computer). */
+    seat = phone ? null : await nextComputerNo(co.id);
   } else {
     /* 4.23.1 — NO KEY AND NO COMPANY ID.
        Until 4.23.0 this created a company out of whatever name was typed:
@@ -536,12 +561,12 @@ export async function activate({ deviceId, deviceName, company, email, appVersio
   const rows = await q(
     `INSERT INTO licences (device_id, device_name, company, email, state,
                            trial_started_at, expires_at, app_version, last_seen_at, seen_count,
-                           company_id, seat_no)
-     VALUES ($1,$2,$3,$4,'TRIAL', now(), $6::timestamptz, $5, now(), 1, $7, $8)
+                           company_id, seat_no, platform)
+     VALUES ($1,$2,$3,$4,'TRIAL', now(), $6::timestamptz, $5, now(), 1, $7, $8, $9)
      ON CONFLICT (device_id) DO NOTHING
      RETURNING *`,
     [deviceId, deviceName || null, company || null, email || null,
-     appVersion || null, co.expires_at, co.id, seat]);
+     appVersion || null, co.expires_at, co.id, seat, phone ? 'mobile' : null]);
 
   /* A race on first launch could lose the INSERT; read the winner. */
   const row = rows.length ? rows[0]
@@ -602,10 +627,18 @@ export async function authorise(request) {
     const urows = await q(`SELECT * FROM company_users WHERE id = $1 AND company_id = $2`, [body.u, row.company_id]);
     if (urows.length && urows[0].active !== false) {
       const u = urows[0];
-      if (u.session_device && u.session_device !== row.device_id) {
-        const on = (await q(`SELECT device_name FROM licences WHERE device_id = $1`, [u.session_device]))[0];
-        superseded = { name: u.name, at: u.session_at || null,
-          where: (on && on.device_name) || 'another computer' };
+      /* a computer holds the person in session_device, a phone in session_mobile (Nexora Mobile) */
+      const slot = row.platform === 'mobile' ? u.session_mobile : u.session_device;
+      const slotAt = row.platform === 'mobile' ? u.session_mobile_at : u.session_at;
+      if (slot && slot !== row.device_id) {
+        const on = (await q(`SELECT device_name FROM licences WHERE device_id = $1`, [slot]))[0];
+        superseded = { name: u.name, at: slotAt || null,
+          where: (on && on.device_name) || (row.platform === 'mobile' ? 'another phone' : 'another computer') };
+      } else if (!slot) {
+        /* 2026-09-28 — SECURITY: an EMPTY binding is not "signed in here". It is what the console's
+           "sign out", or a sign-out on this machine, leaves — and until now the machine went on
+           working as that person. */
+        superseded = { name: u.name, at: null, where: 'no other computer \u2014 this account was signed out', signedOut: true };
       } else {
         user = u;
         /* 4.58.1 — "last active": at most once a minute, and never allowed
@@ -619,6 +652,20 @@ export async function authorise(request) {
   }
 
   const lic = describe(row, co, settings, usage);
+  /* 2026-09-28 — SECURITY: a withdrawn (REVOKED) installation could still pull the company's data.
+     It is told at its heartbeat (and may sign out) — every other route is refused. The same holds
+     for a phone that is not approved yet, or whose company's plan has no Nexora Mobile. */
+  let pth = '';
+  try { pth = new URL(request.url, 'http://x').pathname; } catch (e) { pth = ''; }
+  const OPEN = pth === '/v1/heartbeat' || pth === '/v1/logout';
+  if (row.state === 'REVOKED' && !OPEN) {
+    return { ok: false, httpStatus: 402, error: { error: 'REVOKED', message: lic.message || 'This installation has been withdrawn.', licence: lic } };   /* the shape a refused calculation always had */
+  }
+  if (row.platform === 'mobile' && !OPEN) {
+    const feats = (lic.company && lic.company.features) || {};
+    if (!feats.mobile) return { ok: false, httpStatus: 403, error: { error: 'MOBILE_NOT_IN_PLAN', message: 'Nexora Mobile is part of the PRO plan.' } };
+    if (!row.approved_at) return { ok: false, httpStatus: 403, error: { error: 'PHONE_PENDING', message: 'Your Nexora administrator has to approve this phone first.' } };
+  }
   return {
     ok: true, row, company: co, licence: lic, settings, usage, user, superseded,
     /* Every data route must filter on this and nothing else. It comes

@@ -56,7 +56,9 @@ export const PLAN_FEATURES = [
      cost tools, each its own line on the plan. */
   { id: 'priceImpact',  label: 'Price Impact',                       standard: false },
   { id: 'compare',      label: 'Compare calculations',               standard: false },
-  { id: 'targetCost',   label: 'Target Cost',                        standard: false }
+  { id: 'targetCost',   label: 'Target Cost',                        standard: false },
+  /* Nexora Mobile (owner 2026-09-28: "licence A … fakt PRO ma"): one phone per person, free, on PRO */
+  { id: 'mobile',       label: 'Nexora Mobile (Android app)',        standard: false }
 ];
 
 export const PLANS = ['STANDARD', 'PRO'];

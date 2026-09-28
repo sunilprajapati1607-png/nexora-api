@@ -16,7 +16,7 @@ import { ensureSchema } from './db.js';
 import { activate, authorise, touch, issueToken, reportUsage, companyUsage, describe } from './licence.js';
 import { runBom } from './engine.js';
 import { adminAuthorised, listLicences, licenceAction, companyAction, saveSettings, recentEvents, ADMIN_HTML } from './admin.js';
-import { login, listUsers, userAction, pull, push, describeUser, userCap, setCompanyPasscode, releaseSession, maxSeq } from './sync.js';
+import { login, listUsers, userAction, pull, push, describeUser, userCap, setCompanyPasscode, releaseSession, maxSeq, listDevices, deviceAction } from './sync.js';
 import { waitFor, wakeCompany, endSessionOn, WAIT_MS } from './waiters.js';
 import { checkBom as aiCheckBom, planRoute as aiPlanRoute, fillCalc as aiFillCalc, editBom as aiEditBom, quoteLetter as aiQuoteLetter, help as aiHelp, chat as aiChat, assist as aiAssist, speak as aiSpeak, pickLang, aiStatus } from './ai.js';
 import { send as chatSend, since as chatSince, remove as chatRemove, clearBy as chatClearBy, listBroadcasts, broadcastAction } from './chat.js';
@@ -155,6 +155,27 @@ export default {
         }
         return json({ token: issueToken(a.row, out.body.user.id), user: out.body.user, licence: a.licence,
           company: a.company ? { id: a.company.id, name: a.company.name } : null });
+      }
+      /* Nexora Mobile — the company's devices, and approving or removing a phone: the company's own
+         administrator, from the desktop (Settings → Users) or the phone. */
+      if (path === '/v1/devices' && method === 'GET') {
+        await ensureSchema();
+        const a = await authorise(request);
+        if (!a.ok) return json(a.error, a.httpStatus);
+        if (!a.user || a.user.role !== 'ADMIN') return json({ error: 'ADMIN_ONLY', message: 'Only your Nexora administrator can see the devices.' }, 403);
+        return json({ devices: await listDevices(a.companyId) });
+      }
+      if ((path === '/v1/devices/approve' || path === '/v1/devices/remove') && method === 'POST') {
+        await ensureSchema();
+        const a = await authorise(request);
+        if (!a.ok) return json(a.error, a.httpStatus);
+        if (!a.user || a.user.role !== 'ADMIN') return json({ error: 'ADMIN_ONLY', message: 'Only your Nexora administrator can approve or remove a phone.' }, 403);
+        const body = await readJson(request);
+        const out = await deviceAction(a.companyId, a.user.name, path.endsWith('approve') ? 'approve' : 'remove', body.deviceId);
+        if (out.signedOut) {
+          try { endSessionOn(a.companyId, out.signedOut.id, out.deviceId, { name: out.signedOut.name, at: new Date().toISOString(), where: 'no other phone \u2014 the administrator removed this phone', signedOut: true }); } catch (e) { /* told at its next call */ }
+        }
+        return json(out.body, out.httpStatus);
       }
       /* 4.44.0 — the company's own conversation. Scoped by the device
          row's company like every other read here, and refused outright

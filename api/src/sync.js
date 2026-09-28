@@ -125,9 +125,18 @@ export async function login(companyId, { name, pin }, deviceId) {
      heartbeat, which is when it learns it has been moved and signs itself
      out. Refusing the new sign-in instead would lock a person out of the
      machine in front of them because of one they walked away from. */
-  const displaced = u.session_device && deviceId && u.session_device !== deviceId ? u.session_device : null;
-  await q(`UPDATE company_users SET last_login_at = now(), session_device = $2, session_at = now() WHERE id = $1`,
-    [u.id, deviceId || null]);
+  /* Nexora Mobile — a phone has its own place: signing in on the phone moves only the phone slot, so
+     the computer stays signed in (one computer and one phone per person, owner 2026-09-28) */
+  const dev = deviceId ? (await q(`SELECT platform FROM licences WHERE device_id = $1`, [deviceId]))[0] : null;
+  const isPhone = !!(dev && dev.platform === 'mobile');
+  const held = isPhone ? u.session_mobile : u.session_device;
+  const displaced = held && deviceId && held !== deviceId ? held : null;
+  if (isPhone) {
+    await q(`UPDATE company_users SET last_login_at = now(), session_mobile = $2, session_mobile_at = now() WHERE id = $1`, [u.id, deviceId || null]);
+  } else {
+    await q(`UPDATE company_users SET last_login_at = now(), session_device = $2, session_at = now() WHERE id = $1`,
+      [u.id, deviceId || null]);
+  }
   await logEvent(null, 'LOGIN', { companyId, userId: u.id, deviceId: deviceId || null, displaced });
   /* 4.66.6 — displacedDevice stays on the service: index.js tells that
      machine at once (waiters.js) instead of at its next heartbeat. */
@@ -148,6 +157,44 @@ export async function releaseSession(userId, deviceId) {
   if (!userId || !deviceId) return;
   await q(`UPDATE company_users SET session_device = NULL, session_at = NULL
             WHERE id = $1 AND session_device = $2`, [userId, deviceId]);
+  await q(`UPDATE company_users SET session_mobile = NULL, session_mobile_at = NULL
+            WHERE id = $1 AND session_mobile = $2`, [userId, deviceId]);
+}
+
+/* ---- Nexora Mobile: the company's devices, for its administrator -------- */
+/** Every installation of this company: computers and phones, who is signed in on each, and whether a
+ *  phone is still waiting for approval. For the company's own administrator only. */
+export async function listDevices(companyId) {
+  const rows = await q(`SELECT l.device_id, l.device_name, l.platform, l.state, l.approved_at, l.approved_by, l.last_seen_at, l.seat_no, l.app_version,
+                              u.id AS user_id, u.name AS user_name
+                         FROM licences l
+                         LEFT JOIN company_users u ON u.company_id = l.company_id AND (u.session_device = l.device_id OR u.session_mobile = l.device_id)
+                        WHERE l.company_id = $1
+                        ORDER BY (l.platform = 'mobile') DESC, l.last_seen_at DESC NULLS LAST`, [companyId]);
+  return rows.map((r) => ({ id: r.device_id, name: r.device_name || '', platform: r.platform === 'mobile' ? 'mobile' : 'desktop',
+    state: r.state, approved: r.platform === 'mobile' ? !!r.approved_at : true, approvedBy: r.approved_by || null,
+    pending: r.platform === 'mobile' && !r.approved_at && r.state !== 'REVOKED',
+    lastSeen: r.last_seen_at || null, computerNo: r.seat_no || null, appVersion: r.app_version || null,
+    signedIn: r.user_id ? { id: r.user_id, name: r.user_name } : null }));
+}
+/** Approve a phone, or take one away (it is refused at once and its person is signed out of it). */
+export async function deviceAction(companyId, byName, action, deviceId) {
+  const d = (await q(`SELECT * FROM licences WHERE device_id = $1 AND company_id = $2`, [String(deviceId || ''), companyId]))[0];
+  if (!d) return { httpStatus: 404, body: { error: 'NO_DEVICE', message: 'That device is not on this company.' } };
+  if (d.platform !== 'mobile') return { httpStatus: 400, body: { error: 'NOT_A_PHONE', message: 'Computers are managed from the Nexora console.' } };
+  if (action === 'approve') {
+    await q(`UPDATE licences SET approved_at = now(), approved_by = $2, state = CASE WHEN state = 'REVOKED' THEN 'TRIAL' ELSE state END WHERE device_id = $1`, [d.device_id, byName || null]);
+    await logEvent(d.device_id, 'PHONE_APPROVED', { companyId, by: byName || null });
+    return { httpStatus: 200, body: { ok: true } };
+  }
+  if (action === 'remove') {
+    const who = (await q(`SELECT id, name FROM company_users WHERE company_id = $1 AND session_mobile = $2`, [companyId, d.device_id]))[0] || null;
+    await q(`UPDATE licences SET state = 'REVOKED', approved_at = NULL WHERE device_id = $1`, [d.device_id]);
+    await q(`UPDATE company_users SET session_mobile = NULL, session_mobile_at = NULL WHERE company_id = $1 AND session_mobile = $2`, [companyId, d.device_id]);
+    await logEvent(d.device_id, 'PHONE_REMOVED', { companyId, by: byName || null });
+    return { httpStatus: 200, body: { ok: true }, signedOut: who, deviceId: d.device_id };
+  }
+  return { httpStatus: 400, body: { error: 'BAD_ACTION', message: 'approve or remove' } };
 }
 
 /* ---- users ------------------------------------------------------------- */

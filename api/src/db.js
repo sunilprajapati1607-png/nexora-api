@@ -395,6 +395,14 @@ export function ensureSchema() {
     await q(`CREATE INDEX IF NOT EXISTS chat_company_id_idx ON chat_messages (company_id, id)`);
 
     await q(`ALTER TABLE company_users ADD COLUMN IF NOT EXISTS session_device TEXT`);
+    /* Nexora Mobile (2026-09-28, owner: licence A) — a person may be signed in on ONE computer and
+       ONE phone at once; the phone takes no seat. A phone is a licences row with platform 'mobile',
+       usable once the company's administrator has approved it (approved_at). */
+    await q(`ALTER TABLE company_users ADD COLUMN IF NOT EXISTS session_mobile TEXT`);
+    await q(`ALTER TABLE company_users ADD COLUMN IF NOT EXISTS session_mobile_at TIMESTAMPTZ`);
+    await q(`ALTER TABLE licences ADD COLUMN IF NOT EXISTS platform TEXT`);
+    await q(`ALTER TABLE licences ADD COLUMN IF NOT EXISTS approved_at TIMESTAMPTZ`);
+    await q(`ALTER TABLE licences ADD COLUMN IF NOT EXISTS approved_by TEXT`);
     await q(`ALTER TABLE company_users ADD COLUMN IF NOT EXISTS session_at TIMESTAMPTZ`);
     /* 4.58.1 — the last time this person's software spoke to the service.
        last_login_at moves only when a name and PIN are typed; a person
