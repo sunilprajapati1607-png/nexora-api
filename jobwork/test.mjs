@@ -470,7 +470,7 @@ await t('Google says high demand (503) for every model, then lets it through: as
   let m = 0;
   const always = threeModels(() => { m++; return new Response(JSON.stringify({ error: { message: 'high demand' } }), { status: 503 }); });
   const f = await call('POST', '/v1/ai/assist', { device: 'dev-hedge007', assist: { text: 'why' } }, always);
-  assert.equal(f.status, 503); assert.equal(f.json.error, 'AI_OVERLOADED'); assert.ok(m >= 3 && m <= 8, String(m));
+  assert.equal(f.status, 503); assert.equal(f.json.error, 'AI_OVERLOADED'); assert.ok(m >= 3 && m <= 10, String(m));
 });
 
 await t('a body of null is not a crash', async () => {

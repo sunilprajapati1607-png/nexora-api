@@ -632,30 +632,35 @@ async function tryModel(name, base, fetchImpl, ms, kind, cancel) {
   }
   return { ok: false, why: 'http', status: r ? r.status : 0, r: r, name: name };
 }
-/** The second model for a slow or failing question: another Flash-Lite the key lists (newest first), else a Flash that is not resting. */
-export function backupOf(name, names, skip) {
-  const not = [name].concat(skip || []);
+/** Every model a question may go to, in order: the usual one, the other Flash-Lites (newest first), then the
+    Flashes (newest first). 4.67.17 — measured live 22:05: every model said 503 "high demand" except
+    gemini-3.6-flash, which the retry never reached (it went round two models only). Now it goes down the list. */
+export function candidatesOf(first, names, skip) {
+  const not = [first].concat(skip || []);
   const pool = (names || []).filter((n) => not.indexOf(n) < 0 && !blocked.has(n) && rankOf(n) !== null);
-  const lite = pool.filter((n) => /flash-lite(?:-\d{3})?$/.test(n)).sort((a, b) => rankOf(b) - rankOf(a))[0];
-  if (lite) return lite;
-  const flash = pool.filter((n) => flashRank(n) !== null && !(resting.get(n) > Date.now())).sort((a, b) => flashRank(b) - flashRank(a))[0];
-  return flash || null;
+  const lites = pool.filter((n) => /flash-lite(?:-\d{3})?$/.test(n)).sort((a, b) => rankOf(b) - rankOf(a));
+  const flashes = pool.filter((n) => /-flash(?:-\d{3})?$/.test(n) && !(resting.get(n) > Date.now())).sort((a, b) => flashRank(b) - flashRank(a));
+  return [first].concat(lites, flashes);
 }
+/** The second model for a slow or failing question. */
+export function backupOf(name, names, skip) { return candidatesOf(name, names, skip)[1] || null; }
 /* 4.67.17 / 2.1.2 — measured live 2026-09-28 21:14: Google answered 503 "This model is currently experiencing
    high demand" for 3.8-flash, 3.5-flash-lite AND 3.1-flash-lite within seconds of each other; a question a
-   minute later went through. So when every model has said busy/overloaded and time is left, the question
-   waits a moment (1.5 s, 3 s, 4.5 s …) and is asked again, round the models, at most MAX_TRIES times. */
-const MAX_TRIES = 8;
+   minute later went through. So a question goes down the list of models; when all have said busy or
+   overloaded and time is left, it waits a moment (1.5 s, 3 s, 4.5 s …) and goes round them again, at most
+   MAX_TRIES asks in all. */
+const MAX_TRIES = 10;
 let retryPause = 1500;
 export function _setRetryPause(ms) { retryPause = ms; }
-const retryable = (res) => res && (res.why === 'busy' || res.why === 'network' || res.why === 'unreadable' || (res.why === 'http' && res.status >= 500));
+const retryable = (res) => res && (res.why === 'busy' || res.why === 'network' || res.why === 'unreadable' || res.why === 'retired' || (res.why === 'http' && res.status >= 500));
 const handsOver = (res) => res.why === 'timeout' || res.why === 'network' || res.why === 'busy' || res.why === 'retired' || res.why === 'unreadable' ||
   (res.why === 'http' && res.status >= 500);
-/** The usual model, and — when it is slow or fails — a second one; the first answer wins. */
-function race(first, base, fetchImpl, kind, deadline, skip) {
+/** The usual model, and — when it is slow or fails — the next one down the list; the first answer wins. */
+function race(first, payload, fetchImpl, kind, deadline, skip) {
   return new Promise((resolve) => {
-    let done = false, running = 0, backups = 0, last = null, tries = 0, round = 0, timer = null;
-    const tried = [first].concat(skip || []);
+    let done = false, running = 0, last = null, tries = 0, round = 0, timer = null;
+    const order = candidatesOf(first, model.available || [], skip);
+    let nextAt = 1;                              /* the next model down the list this round */
     const ctrls = [];
     const left = () => deadline - Date.now();
     const finish = (res) => {
@@ -664,37 +669,46 @@ function race(first, base, fetchImpl, kind, deadline, skip) {
       ctrls.forEach((c) => { try { c.abort(); } catch (e) { /* gone */ } });
       resolve(res);
     };
-    const hedge = (prefer) => {
-      if (done || backups >= 2 || left() < 8000) return;
-      const next = (prefer && !blocked.has(prefer) && tried.indexOf(prefer) < 0) ? prefer : backupOf(first, model.available || [], tried);
-      if (!next) return;
-      backups++; tried.push(next); run(next);
+    /* the next model to ask — one Google named (a retired model's successor) goes first */
+    const pickNext = (prefer) => {
+      if (prefer && !blocked.has(prefer)) {
+        const at = order.indexOf(prefer);
+        if (at < 0) order.splice(nextAt, 0, prefer);
+        else if (at > nextAt) { order.splice(at, 1); order.splice(nextAt, 0, prefer); }
+      }
+      while (nextAt < order.length && blocked.has(order[nextAt])) nextAt++;
+      return nextAt < order.length ? order[nextAt++] : null;
     };
-    /* every model tried has failed for a passing reason: a pause, and round the models again */
-    const again = () => {
+    const askNext = (prefer) => {
+      if (done || tries >= MAX_TRIES || left() < 8000) return false;
+      const next = pickNext(prefer);
+      if (!next) return false;
+      run(next);
+      return true;
+    };
+    /* nothing is running and nothing has answered: the next model at once; all asked — a pause, and round again */
+    const again = (prefer) => {
       if (done) return;
       if (tries >= MAX_TRIES || left() < 10000 || !retryable(last)) { finish(last); return; }
+      if (askNext(prefer)) return;
       round++;
-      setTimeout(() => {
-        if (done) return;
-        const pool = tried.filter((n) => !blocked.has(n) && (skip || []).indexOf(n) < 0);
-        if (!pool.length) { finish(last); return; }
-        run(pool[(round - 1) % pool.length]);
-      }, Math.min(retryPause * round, 6000));
+      nextAt = 0;
+      setTimeout(() => { if (!done && !askNext(null)) finish(last); }, Math.min(retryPause * round, 6000));
     };
     const run = (name) => {
       running++; tries++;
       const c = new AbortController(); ctrls.push(c);
-      tryModel(name, base, fetchImpl, Math.max(1000, left()), kind + (name === first ? '' : '/backup'), c.signal).then((res) => {
+      tryModel(name, payload, fetchImpl, Math.max(1000, left()), kind + (name === first ? '' : '/backup'), c.signal).then((res) => {
         running--;
         if (done) return;
         if (res.ok) { finish(res); return; }
+        /* what is said when nothing answers: the usual model's failure, unless it was only retired */
         if (!last || (name === first && res.why !== 'retired') || last.why === 'retired') last = res;
-        if (handsOver(res)) hedge(res.named);
-        if (!running) again();
+        if (!running) { if (handsOver(res)) again(res.named); else finish(last); }
       });
     };
-    timer = setTimeout(() => { if (!backups) hedge(null); }, hedgeMs);
+    /* slow, not failed: the next model is asked beside it */
+    timer = setTimeout(() => { if (!done && running && tries === 1) askNext(null); }, hedgeMs);
     run(first);
   });
 }
