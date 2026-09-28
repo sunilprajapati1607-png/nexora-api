@@ -446,7 +446,10 @@ function race(first, payload, fetchImpl, kind, deadline, skip) {
         if (res.ok) { finish(res); return; }
         /* what is said when nothing answers: the usual model's failure, unless it was only retired */
         if (!last || (name === first && res.why !== 'retired') || last.why === 'retired') last = res;
-        if (!running) { if (handsOver(res)) again(res.named); else finish(last); }
+        /* 4.67.17 — seen live 22:28: the usual model HUNG 70-98 s while every other one said 503 — so a failure
+           goes on down the list even while a slow one is still out (two at most), and Gemma is reached in time */
+        if (handsOver(res)) { if (!running) again(res.named); else if (running < 2) askNext(res.named); }
+        else if (!running) finish(last);
       });
     };
     /* slow, not failed: the next model is asked beside it */
