@@ -32,14 +32,20 @@ export function gstKey(v) {
   const g = String(v || '').toUpperCase().replace(/[^0-9A-Z]/g, '');
   return g.length === 15 ? g : '';
 }
+/* 4.69.0 — a customer has many contacts and many addresses (each with its own GSTIN): every phone and every GSTIN counts */
+const list = (v) => (Array.isArray(v) ? v.slice(0, 50) : []);
 function phonesOf(b) {
-  return [b.phone, b.phone2, b.contactPhone].map(phoneKey).filter(Boolean);
+  return [b.phone, b.phone2, b.contactPhone].concat(list(b.phones), list(b.contacts).map((k) => k && k.phone))
+    .map(phoneKey).filter(Boolean);
+}
+function gstinsOf(b) {
+  return [b.gstin].concat(list(b.gstins), list(b.addresses).map((a) => a && a.gstin)).map(gstKey).filter(Boolean);
 }
 
 export async function customerCheck(companyId, user, body) {
   const b = body && typeof body === 'object' ? body : {};
-  const want = { name: nameKey(b.name), gstin: gstKey(b.gstin), phones: phonesOf(b) };
-  if (!want.name && !want.gstin && !want.phones.length) return { matches: [] };
+  const want = { name: nameKey(b.name), gstins: gstinsOf(b), phones: phonesOf(b) };
+  if (!want.name && !want.gstins.length && !want.phones.length) return { matches: [] };
   const except = b.except ? String(b.except) : '';
   const rows = await q(
     `SELECT r.id, r.body, r.owner_id, u.name AS owner_name
@@ -51,7 +57,7 @@ export async function customerCheck(companyId, user, body) {
     const c = r.body && typeof r.body === 'object' ? r.body : {};
     const on = [];
     if (want.name && nameKey(c.name) === want.name) on.push('name');
-    if (want.gstin && gstKey(c.gstin) === want.gstin) on.push('gstin');
+    if (want.gstins.length && gstinsOf(c).some((g) => want.gstins.indexOf(g) > -1)) on.push('gstin');
     if (want.phones.length && phonesOf(c).some((p) => want.phones.indexOf(p) > -1)) on.push('phone');
     if (!on.length) continue;
     const mine = r.owner_id != null && Number(r.owner_id) === Number(user.id);
