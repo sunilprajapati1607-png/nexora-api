@@ -1346,7 +1346,7 @@ async function coGrace(btn){
   await load();
 }
 async function coAiLimit(btn){
-  const v=prompt('How many Nexora AI questions may this company ask a day (on Nexora\u2019s Google key)?\n\n0 = the service\u2019s own number. A company with its own Gemini key is limited by Google, not by this.',btn.dataset.now);
+  const v=prompt('How many Nexora AI questions may this company ask a day (on Nexora\u2019s Google key)?\\n\\n0 = the service\u2019s own number. A company with its own Gemini key is limited by Google, not by this.',btn.dataset.now);
   if(v===null)return;
   const r=await api('/admin/api/company',{method:'POST',body:JSON.stringify({id:+btn.dataset.id,action:'ailimit',aiDailyLimit:+v})});
   if(r.error){say('<div class="msg err">'+esc(r.error)+'</div>');return;}
