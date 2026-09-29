@@ -396,7 +396,7 @@ export async function userAction(companyId, actor, body) {
    Every write takes a fresh seq, so "everything since seq N" is exact. */
 /* 4.66.3 — masters only an administrator may write (see push) */
 const ADMIN_ONLY_MASTERS = { 'nexora.rm.price.v1': 1, 'nexora.constants.v1': 1, 'nexora.constants.custom.v1': 1, 'nexora.docseries.v1': 1, 'nexora.units.v1': 1, 'nexora.meshunit.v1': 1, 'nexora.quote.terms.v1': 1,
-  'nexora.constants.links.v1': 1, 'nexora.org.v1': 1, 'nexora.mkt.sources.v1': 1 };
+  'nexora.constants.links.v1': 1, 'nexora.org.v1': 1, 'nexora.mkt.sources.v1': 1, 'nexora.mkt.targets.v1': 1 };
 /* 4.68.0 — MARKETING: enquiry (the lead and the enquiry are one record) and customer. Owned like a quotation, but
    who is SENT one is wider: the owner, the person it is assigned to (an enquiry's assignedTo), an administrator or
    scope ALL, and anyone the administrator let see that person's marketing (permissions MKT_SEE_ALL, MKT_SEE:<id>) —
