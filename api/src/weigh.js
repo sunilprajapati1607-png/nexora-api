@@ -146,6 +146,15 @@ export async function calcNumbers(companyId) {
   return { httpStatus: 200, body: JSON.parse(JSON.stringify(out)) };
 }
 
+/** 4.68.2 — Nexora Mobile: the next enquiry number in the company's series (the phone holds only the enquiries
+ *  it may see, so it cannot find the free number itself — the computers use their stubs). */
+export async function enquiryNumber(companyId) {
+  const rows = await q(`SELECT body->>'enquiryNumber' AS n FROM sync_records WHERE company_id = $1 AND kind = 'enquiry'`, [companyId]);
+  const d = desktopOver(await mastersOf(companyId));
+  const n = d.NexoraDocSeries.next('enquiry', rows.map((r) => r.n).filter(Boolean), new Date().getFullYear());
+  return { httpStatus: 200, body: { enquiryNumber: String(n) } };
+}
+
 export async function calcForm(companyId) {
   return { httpStatus: 200, body: formOf(desktopOver(await mastersOf(companyId))) };
 }

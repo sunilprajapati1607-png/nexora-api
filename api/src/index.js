@@ -18,7 +18,7 @@ import { runBom } from './engine.js';
 import { adminAuthorised, listLicences, licenceAction, companyAction, saveSettings, recentEvents, ADMIN_HTML } from './admin.js';
 import { login, listUsers, userAction, pull, push, describeUser, userCap, setCompanyPasscode, releaseSession, maxSeq, listDevices, deviceAction } from './sync.js';
 import { waitFor, wakeCompany, wakeChat, endSessionOn, WAIT_MS } from './waiters.js';
-import { calcForm, calcWeigh, calcNumbers } from './weigh.js';
+import { calcForm, calcWeigh, calcNumbers, enquiryNumber } from './weigh.js';
 import { quoteForm, quoteSheet } from './quoteSheet.js';
 import { checkBom as aiCheckBom, planRoute as aiPlanRoute, fillCalc as aiFillCalc, editBom as aiEditBom, quoteLetter as aiQuoteLetter, help as aiHelp, chat as aiChat, assist as aiAssist, speak as aiSpeak, pickLang, aiStatus, withKey as aiWithKey, checkKey as aiCheckKey } from './ai.js';
 import { companyAi, keyInfo as aiKeyInfo, setKey as aiSetKey, clearKey as aiClearKey, canKeep as aiCanKeep } from './aikey.js';
@@ -298,6 +298,15 @@ export default {
         return json(pushed);
       }
       /* 4.68.0 — Marketing: is this customer already with somebody? Names only who, and on what it matched. */
+      /* 4.68.2 — Nexora Mobile: the next enquiry number (the computers find it from their own stubs) */
+      if (path === '/v1/marketing/number' && method === 'GET') {
+        await ensureSchema();
+        const a = await authorise(request);
+        if (!a.ok) return json(a.error, a.httpStatus);
+        if (!a.user) return json({ error: 'SIGN_IN', message: 'Sign in to make an enquiry.' }, 401);
+        const out = await enquiryNumber(a.companyId);
+        return json(out.body, out.httpStatus);
+      }
       if (path === '/v1/marketing/customer-check' && method === 'POST') {
         await ensureSchema();
         const a = await authorise(request);
