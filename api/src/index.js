@@ -21,7 +21,7 @@ import { waitFor, wakeCompany, wakeChat, endSessionOn, WAIT_MS } from './waiters
 import { calcForm, calcWeigh, calcNumbers } from './weigh.js';
 import { quoteForm, quoteSheet } from './quoteSheet.js';
 import { checkBom as aiCheckBom, planRoute as aiPlanRoute, fillCalc as aiFillCalc, editBom as aiEditBom, quoteLetter as aiQuoteLetter, help as aiHelp, chat as aiChat, assist as aiAssist, speak as aiSpeak, pickLang, aiStatus, withKey as aiWithKey, checkKey as aiCheckKey } from './ai.js';
-import { companyKey, keyInfo as aiKeyInfo, setKey as aiSetKey, clearKey as aiClearKey, canKeep as aiCanKeep } from './aikey.js';
+import { companyAi, keyInfo as aiKeyInfo, setKey as aiSetKey, clearKey as aiClearKey, canKeep as aiCanKeep } from './aikey.js';
 import { send as chatSend, since as chatSince, remove as chatRemove, clearBy as chatClearBy, listBroadcasts, broadcastAction } from './chat.js';
 import { ensureInkSchema, getModel, listModels, train as inkTrain, estimate as inkEstimate, reset as inkReset } from './inkstore.js';
 import { register, gstAction, remoteIp } from './register.js';
@@ -56,8 +56,8 @@ function canSeeCost(u) {
 /* 4.67.18 — a company that has put its own Google Gemini key in Settings has its Nexora AI questions asked
    with it (aikey.js keeps it locked; ai.js never shows it) */
 async function runAi(a, fn) {
-  const k = a && a.companyId ? await companyKey(a.companyId) : '';
-  return aiWithKey(k, fn);
+  const c = a && a.companyId ? await companyAi(a.companyId) : { key: '', limit: 0 };
+  return aiWithKey(c.key, fn, c.limit);   /* 4.67.21 — and the company's day, set in the console */
 }
 async function readJson(request) {
   /* 4.67.17 — a body of null, a number or a list is read as an empty object, never a crash */

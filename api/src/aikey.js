@@ -51,19 +51,26 @@ const cache = new Map();   // companyId -> { key, at }
 const CACHE_MS = 60 * 1000;
 
 /** The company's own key, or '' (none, or it can no longer be read). */
-export async function companyKey(companyId) {
+export async function companyKey(companyId) { return (await companyAi(companyId)).key; }
+
+/** 4.67.21 — what a Nexora AI question of this company is asked with: its own key ('' = Nexora's) and its
+ *  day's limit set in the console (0 = the service's own). Read once a minute per company. */
+export async function companyAi(companyId) {
   const id = Number(companyId);
-  if (!id || !canKeep()) return '';
+  if (!id) return { key: '', limit: 0 };
   const c = cache.get(id);
-  if (c && Date.now() - c.at < CACHE_MS) return c.key;
-  let k = '';
+  if (c && Date.now() - c.at < CACHE_MS) return { key: c.key, limit: c.limit };
+  let k = '', limit = 0;
   try {
-    const row = rowsOf(await query('SELECT ai_key_enc FROM companies WHERE id = $1', [id]))[0];
-    k = row && row.ai_key_enc ? (unseal(row.ai_key_enc) || '') : '';
-  } catch (e) { k = ''; }
-  cache.set(id, { key: k, at: Date.now() });
-  return k;
+    const row = rowsOf(await query('SELECT ai_key_enc, ai_daily_limit FROM companies WHERE id = $1', [id]))[0];
+    k = row && row.ai_key_enc && canKeep() ? (unseal(row.ai_key_enc) || '') : '';
+    limit = row ? Math.max(0, Number(row.ai_daily_limit) || 0) : 0;
+  } catch (e) { k = ''; limit = 0; }
+  cache.set(id, { key: k, limit: limit, at: Date.now() });
+  return { key: k, limit: limit };
 }
+/** the console changed something: read again at the next question */
+export function forget(companyId) { cache.delete(Number(companyId)); }
 
 /** What the application may know: whether there is one, its last 4, when it was set — never the key. */
 export async function keyInfo(companyId) {

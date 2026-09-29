@@ -16,6 +16,8 @@ import { q, getSettings, logEvent } from './db.js';
 import { cleanPlan, cleanPlanFeatures, PLAN_FEATURES } from './plans.js';
 import { hashPasscode, validPasscode, PASSCODE_MIN } from './passcode.js';
 import { newLicenceKey } from './licence.js';
+import { aiUsedToday, aiDefaultDaily } from './ai.js';
+import { forget as aiForget } from './aikey.js';
 import { ensureAdmin, usersSummary, userCap, listUsers, hashPin, validPin, nameKey, cleanEmail } from './sync.js';
 
 const ADMIN_KEY = process.env.NEXORA_ADMIN_KEY || '';
@@ -57,7 +59,7 @@ export async function listLicences() {
      ORDER BY l.created_at DESC
      LIMIT 500`);
   const settings = await getSettings();
-  return { licences: rows, companies: await listCompanies(), settings };
+  return { licences: rows, companies: await listCompanies(), settings, aiDefaultDaily: aiDefaultDaily() };
 }
 
 /* ---- companies (4.0.0) -----------------------------------------------
@@ -68,7 +70,7 @@ export async function listLicences() {
 export async function listCompanies() {
   const rows = await q(`
     SELECT c.id, c.name, c.licence_key, c.email, c.phone, c.state, c.seats, c.gstin,
-           c.grace_days, c.is_demo, c.expires_at, c.created_at, c.notes, c.txn_limit, c.plan,
+           c.grace_days, c.is_demo, c.expires_at, c.created_at, c.notes, c.txn_limit, c.plan, c.ai_daily_limit,
            /* 4.57.0 - when THIS stretch began, and how long it is. Both
               in SQL, in IST like days_left, so the console and the
               Android app cannot disagree with each other by a day. */
@@ -111,6 +113,8 @@ export async function listCompanies() {
     /* One seat = one person. Every name counts, switched off or not;
        users_count stays the ACTIVE number the page always showed. */
     c.users_total = (await userCap(c.id)).count;
+    /* 4.67.21 — Nexora AI questions asked today on Nexora's key (this service's count) */
+    c.ai_used_today = aiUsedToday(c.id);
   }
   return rows;
 }
@@ -221,6 +225,15 @@ export async function companyAction(body) {
     await q(`UPDATE companies SET gstin = $2 WHERE id = $1`,
       [id, String(body.gstin || '').trim().toUpperCase() || null]);
     await logEvent(null, 'ADMIN_COMPANY_GSTIN', { id });
+
+  } else if (action === 'ailimit') {
+    /* 4.67.21 — "want to limit ai call as per company per day from console and from console android app":
+       Nexora AI questions a day on Nexora's key. 0 (or empty) = the service's own number. A company with its
+       own Gemini key is Google's to limit, not this. */
+    const lim = Math.max(0, Math.min(100000, parseInt(body.aiDailyLimit, 10) || 0));
+    await q(`UPDATE companies SET ai_daily_limit = $2 WHERE id = $1`, [id, lim || null]);
+    aiForget(id);
+    await logEvent(null, 'ADMIN_COMPANY_AILIMIT', { id, aiDailyLimit: lim });
 
   } else if (action === 'txnlimit') {
     /* 4.3.0 — how many transactions this licence may commit.
@@ -1205,6 +1218,7 @@ function renderCompanyList(){
         '<div class="fact"><span>'+(state==='EXPIRED'?'Ended':state==='SUSPENDED'?'Suspended · ends':'Days left')+'</span><b>'+(state==='EXPIRED'||state==='SUSPENDED'?fmt(c.expires_at):(c.days_left===0?'today':c.days_left))+'</b>'+(state==='EXPIRED'||state==='SUSPENDED'?'':'<small>'+fmt(c.expires_at)+'</small>')+'</div>'+
         '<div class="fact"><span>Offline allowed</span><b>'+(c.grace_days>0?c.grace_days+' days':'none')+'</b>'+(c.grace_days>0?'':'<small>stops when it cannot reach the service</small>')+'</div>'+
         '<div class="fact"><span>Transactions</span>'+txnCell(c.txn_used,c.txn_limit)+'</div>'+
+        '<div class="fact"><span>Nexora AI today</span><b>'+(c.ai_used_today||0)+' of '+(c.ai_daily_limit||(DATA.aiDefaultDaily||'\u2014'))+'</b><small>'+(c.ai_daily_limit?'set for this company':'the service\u2019s own number')+'</small></div>'+
         '<div class="fact"><span>Hours in use</span><b>'+hoursText(c.usage_minutes)+'</b></div>'+
         '<div class="fact"><span>People</span>'+usersCell(c)+'</div>'+
       '</div>'+
@@ -1235,6 +1249,7 @@ function renderCompanyList(){
         '</div></div>':'')+
         '<div class="group"><h4>Usage</h4><div class="acts">'+
           '<button data-id="'+c.id+'" data-now="'+(c.txn_limit||0)+'" onclick="coLimit(this)">Transaction limit…</button>'+
+          '<button data-id="'+c.id+'" data-now="'+(c.ai_daily_limit||0)+'" onclick="coAiLimit(this)">Nexora AI a day…</button>'+
           '<button data-id="'+c.id+'" data-name="'+esc(c.name)+'" onclick="coReset(this)">Reset usage</button><span class="why">count and hours from zero; nothing saved is touched</span>'+
         '</div></div>'+
         '<div class="group"><h4>Stop</h4><div class="acts">'+
@@ -1328,6 +1343,13 @@ async function coGrace(btn){
   const v=prompt('How many days may this customer work with no contact with the service?\\n\\n0 = none: it stops as soon as it cannot reach us.',btn.dataset.now);
   if(v===null)return;
   await api('/admin/api/company',{method:'POST',body:JSON.stringify({id:+btn.dataset.id,action:'grace',graceDays:+v})});
+  await load();
+}
+async function coAiLimit(btn){
+  const v=prompt('How many Nexora AI questions may this company ask a day (on Nexora\u2019s Google key)?\n\n0 = the service\u2019s own number. A company with its own Gemini key is limited by Google, not by this.',btn.dataset.now);
+  if(v===null)return;
+  const r=await api('/admin/api/company',{method:'POST',body:JSON.stringify({id:+btn.dataset.id,action:'ailimit',aiDailyLimit:+v})});
+  if(r.error){say('<div class="msg err">'+esc(r.error)+'</div>');return;}
   await load();
 }
 async function coLimit(btn){

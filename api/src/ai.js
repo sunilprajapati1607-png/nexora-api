@@ -74,8 +74,14 @@ const TIMEOUT_MS = 60000;              /* 4.67.6 — a question with the plant's
    daily limit and per-minute limit do not apply to it. Everyone else is asked with Nexora's key. The key is
    never written into a message, a log, /health or an answer. */
 const keyScope = new AsyncLocalStorage();
-export function withKey(k, fn) { const v = String(k || '').trim(); return v ? keyScope.run({ key: v }, fn) : fn(); }
+export function withKey(k, fn, limit) {
+  const v = String(k || '').trim();
+  const n = Math.max(0, Number(limit) || 0);
+  return v || n ? keyScope.run({ key: v, limit: n }, fn) : fn();
+}
 function ownKey() { const x = keyScope.getStore(); return x && x.key ? x.key : ''; }
+/* 4.67.21 — the company's own day, set in the console (0 = the service's AI_DAILY_PER_COMPANY) */
+function companyDaily() { const x = keyScope.getStore(); return x && x.limit ? x.limit : 0; }
 const nexoraKey = () => String(process.env.GEMINI_API_KEY || '').trim();
 const key = () => ownKey() || nexoraKey();
 export function aiConfigured() { return !!key(); }
@@ -167,7 +173,7 @@ export function aiStatus() {
 /* ---- limits ------------------------------------------------------------- */
 const perCompany = new Map();        // companyId -> { day, n }
 let recent = [];                     // times of the last minute's calls
-const daily = () => Math.max(1, parseInt(process.env.AI_DAILY_PER_COMPANY, 10) || 60);
+const daily = () => companyDaily() || Math.max(1, parseInt(process.env.AI_DAILY_PER_COMPANY, 10) || 60);
 const perMinute = () => Math.max(1, parseInt(process.env.AI_PER_MINUTE, 10) || 10);
 /* 4.67.17 — the day is India's (the plants' own midnight, not 05:30 in the morning) */
 function today() { return new Date(Date.now() + 330 * 60000).toISOString().slice(0, 10); }
@@ -186,6 +192,9 @@ function take(companyId) {
   return { left: daily() - used - 1 };
 }
 export function _resetLimits() { perCompany.clear(); recent = []; }
+/** 4.67.21 — the console: how many questions each company has asked today (Nexora's key; this service's memory) */
+export function aiUsedToday(companyId) { const c = perCompany.get(String(companyId || 'none')); return c && c.day === today() ? c.n : 0; }
+export function aiDefaultDaily() { return Math.max(1, parseInt(process.env.AI_DAILY_PER_COMPANY, 10) || 60); }
 /* 4.67.17 — a question that Google did not answer (slow, busy, unreachable) is not counted against the company's day */
 function giveBack(companyId) {
   if (ownKey()) return;

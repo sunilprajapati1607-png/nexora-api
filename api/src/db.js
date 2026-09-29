@@ -166,6 +166,9 @@ export function ensureSchema() {
     await q(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS ai_key_enc TEXT`);
     await q(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS ai_key_last4 TEXT`);
     await q(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS ai_key_set_at TIMESTAMPTZ`);
+    /* 4.67.21 — "want to limit ai call as per company per day from console and from console android app":
+       Nexora AI questions a day for this company on Nexora's key. NULL or 0 = the service's own (AI_DAILY_PER_COMPANY). */
+    await q(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS ai_daily_limit INTEGER`);
 
     /* Per device, because each machine reports its own. The company total
        is the SUM across its seats, computed when needed rather than
