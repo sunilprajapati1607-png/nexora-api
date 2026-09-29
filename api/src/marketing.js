@@ -67,3 +67,16 @@ export async function customerCheck(companyId, user, body) {
   }
   return { matches };
 }
+
+/* 4.68.2 — Nexora Mobile: what a new enquiry needs from the company — the next number in its series and the
+   sources it may be booked under. The phone keeps no list-shaped master (its store holds objects), so the
+   sources come from here: the administrator's list, else the same starting list every computer shows. */
+const SOURCE_SEED = ['IndiaMART', 'TradeIndia', 'Website', 'Reference', 'Existing Customer', 'Cold Call', 'Visit',
+  'Exhibition', 'WhatsApp', 'Email', 'Walk-In', 'Other'];
+const sourceId = (name) => 'src-' + String(name).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+export async function sourcesOf(companyId) {
+  const rows = await q(`SELECT body FROM sync_records WHERE company_id = $1 AND kind = 'master' AND id = 'nexora.mkt.sources.v1' AND deleted = false`, [companyId]);
+  const b = rows[0] && rows[0].body;
+  const list = Array.isArray(b) ? b.filter((x) => x && x.id && x.name) : SOURCE_SEED.map((n) => ({ id: sourceId(n), name: n, active: true }));
+  return list.filter((x) => x.active !== false).map((x) => ({ id: String(x.id), name: String(x.name) }));
+}

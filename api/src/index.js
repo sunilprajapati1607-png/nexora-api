@@ -29,7 +29,7 @@ import { listInquiries, inquiryAction, publicInquiry } from './inquiry.js';
 import { listFeedback, feedbackShot, feedbackAction, publicFeedback } from './feedback.js';
 import { latestRelease, listReleases, releaseAction } from './appupdate.js';
 import { logoResponse } from './brand.js';
-import { customerCheck } from './marketing.js';
+import { customerCheck, sourcesOf } from './marketing.js';
 
 const CORS = {
   'access-control-allow-origin': '*',
@@ -305,6 +305,7 @@ export default {
         if (!a.ok) return json(a.error, a.httpStatus);
         if (!a.user) return json({ error: 'SIGN_IN', message: 'Sign in to make an enquiry.' }, 401);
         const out = await enquiryNumber(a.companyId);
+        out.body.sources = await sourcesOf(a.companyId);   /* and the sources a new enquiry may be booked under */
         return json(out.body, out.httpStatus);
       }
       if (path === '/v1/marketing/customer-check' && method === 'POST') {
