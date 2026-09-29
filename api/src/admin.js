@@ -803,6 +803,53 @@ th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;le
 .users-panel table.users th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.04em;opacity:.7;padding:4px 8px 4px 0}
 .users-panel table.users td{padding:7px 10px 7px 0;border-top:1px solid var(--border);font-size:13px}
 .users-panel tr.off{opacity:.55}
+/* 4.67.21 — "androud app and console ui are still not good, make them more flexi like weight calcuation android
+   app" · "in software and every where all fond will be in proper format like capital first then later as proper".
+   The console dressed like Nexora Mobile: the head on the logo's sweep, each figure in its own colour, cards
+   rounder and softer, a company edged in its state's colour (licensed blue, demo teal, expired amber,
+   suspended red), the tabs as pills. Labels and headings in Proper Case; what anyone typed keeps its letters. */
+:root{--k-blue:#0A66E0;--k-blue-bg:#E3EEFF;--k-teal:#0B8F7E;--k-teal-bg:#D9F4EF;--k-orange:#D9730D;--k-orange-bg:#FFEDDA;
+  --k-violet:#6D3FF5;--k-violet-bg:#EDE6FF;--k-green:#15803D;--k-green-bg:#DDF5E5;--k-red:#DC2626;--k-red-bg:#FDEAEA;
+  --k-amber:#B45309;--k-amber-bg:#FEF3C7;--radius:16px}
+:root[data-theme=dark]{--k-blue:#5AB0FF;--k-blue-bg:#12294A;--k-teal:#3FD6BE;--k-teal-bg:#0D332E;--k-orange:#FFB066;--k-orange-bg:#3A2613;
+  --k-violet:#B39BFF;--k-violet-bg:#281F48;--k-green:#4ADE80;--k-green-bg:#113222;--k-red:#F87171;--k-red-bg:#2C1616;
+  --k-amber:#FBBF24;--k-amber-bg:#33290F}
+#app>.top{background:linear-gradient(120deg,#002D86 0%,#0A66E0 55%,#1EA0FF 100%);color:#fff;border-radius:20px;padding:16px 18px;
+  position:relative;overflow:hidden;box-shadow:0 10px 28px rgba(10,102,224,.28)}
+#app>.top::after{content:'';position:absolute;right:-40px;top:-60px;width:180px;height:180px;border-radius:50%;background:rgba(255,255,255,.10);pointer-events:none}
+#app>.top h1,#app>.top .sub{color:#fff}#app>.top .sub{opacity:.88}
+#app>.top .brand-mark{background:#fff;border-radius:50%;padding:4px}
+#app>.top button{background:rgba(255,255,255,.14);border-color:rgba(255,255,255,.35);color:#fff}
+#app>.top button:hover{background:rgba(255,255,255,.24);color:#fff;border-color:#fff}
+#app>.top .mode-switch{background:rgba(255,255,255,.18);border-color:rgba(255,255,255,.4)}
+#app>.top .kpis{gap:10px}
+#app>.top .kpi{border:0;border-radius:14px;min-width:112px;padding:10px 14px;background:var(--k-blue-bg);box-shadow:0 2px 8px rgba(0,0,0,.08)}
+#app>.top .kpi::before{display:none}
+#app>.top .kpi b{font-size:22px;color:var(--k-blue)}
+#app>.top .kpi span{color:var(--text);text-transform:capitalize;letter-spacing:0;font-weight:700}
+#app>.top .kpi:nth-child(2){background:var(--k-teal-bg)}#app>.top .kpi:nth-child(2) b{color:var(--k-teal)}
+#app>.top .kpi:nth-child(3){background:var(--k-orange-bg)}#app>.top .kpi:nth-child(3) b{color:var(--k-orange)}
+#app>.top .kpi:nth-child(4){background:var(--k-green-bg)}#app>.top .kpi:nth-child(4) b{color:var(--k-green)}
+#app>.top .kpi:nth-child(5){background:var(--k-violet-bg)}#app>.top .kpi:nth-child(5) b{color:var(--k-violet)}
+.card{border-radius:var(--radius);box-shadow:var(--shadow-sm)}
+.card:hover{box-shadow:var(--shadow)}
+.co{border-radius:var(--radius);box-shadow:var(--shadow-sm),inset 5px 0 0 var(--k-blue);transition:transform .14s ease,box-shadow .16s ease}
+.co:hover{transform:translateY(-1px);box-shadow:var(--shadow),inset 5px 0 0 var(--k-blue)}
+.co:has(.pill.s-DEMO),.co:has(.pill.s-TRIAL){box-shadow:var(--shadow-sm),inset 5px 0 0 var(--k-teal);border-color:color-mix(in srgb,var(--k-teal) 30%,var(--border))}
+.co:has(.pill.s-EXPIRED){box-shadow:var(--shadow-sm),inset 5px 0 0 var(--k-amber);border-color:color-mix(in srgb,var(--k-amber) 30%,var(--border))}
+.co:has(.pill.s-SUSPENDED),.co:has(.pill.s-REVOKED),.co.suspended{box-shadow:var(--shadow-sm),inset 5px 0 0 var(--k-red);border-color:color-mix(in srgb,var(--k-red) 40%,var(--border))}
+.fact{border-radius:12px;background:var(--bg-sunken)}
+.pill{text-transform:capitalize}
+.s-TRIAL,.s-DEMO{background:var(--k-teal-bg);color:var(--k-teal)}.s-LICENSED{background:var(--k-blue-bg);color:var(--k-blue)}
+.s-EXPIRED{background:var(--k-amber-bg);color:var(--k-amber)}.s-REVOKED,.s-SUSPENDED,.s-FAILED{background:var(--k-red-bg);color:var(--k-red)}
+.jump button.tab{border-radius:999px}
+.jump button.tab.active{background:linear-gradient(120deg,#0A66E0,#1EA0FF);border-color:transparent;box-shadow:0 4px 12px rgba(10,102,224,.3)}
+h2,h3,h4,th,.group h4,.fact span,.kpi span,label,.users-panel table.users th{text-transform:capitalize;letter-spacing:0}
+input,select,textarea,option,code,.key{text-transform:none}
+button.primary{background:linear-gradient(120deg,#0A66E0,#1EA0FF);border-color:transparent}
+.fact b{display:block;margin-top:2px}
+#app>.top h1 .sub{text-transform:capitalize}
+#app>.top h1{white-space:nowrap}
 </style></head><body>
 <div class="wrap">
   <div id="gate" class="card">
@@ -1218,7 +1265,7 @@ function renderCompanyList(){
         '<div class="fact"><span>'+(state==='EXPIRED'?'Ended':state==='SUSPENDED'?'Suspended · ends':'Days left')+'</span><b>'+(state==='EXPIRED'||state==='SUSPENDED'?fmt(c.expires_at):(c.days_left===0?'today':c.days_left))+'</b>'+(state==='EXPIRED'||state==='SUSPENDED'?'':'<small>'+fmt(c.expires_at)+'</small>')+'</div>'+
         '<div class="fact"><span>Offline allowed</span><b>'+(c.grace_days>0?c.grace_days+' days':'none')+'</b>'+(c.grace_days>0?'':'<small>stops when it cannot reach the service</small>')+'</div>'+
         '<div class="fact"><span>Transactions</span>'+txnCell(c.txn_used,c.txn_limit)+'</div>'+
-        '<div class="fact"><span>Nexora AI today</span><b>'+(c.ai_used_today||0)+' of '+(c.ai_daily_limit||(DATA.aiDefaultDaily||'\u2014'))+'</b><small>'+(c.ai_daily_limit?'set for this company':'the service\u2019s own number')+'</small></div>'+
+        '<div class="fact"><span>Nexora AI today</span><b>'+(c.ai_used_today||0)+(c.ai_daily_limit?' of '+c.ai_daily_limit:(DATA.aiDefaultDaily&&DATA.aiDefaultDaily<100000?' of '+DATA.aiDefaultDaily:''))+'</b><small>'+(c.ai_daily_limit?'a day, set for this company':(DATA.aiDefaultDaily&&DATA.aiDefaultDaily<100000?'a day, the service\u2019s own number':'no daily limit'))+'</small></div>'+
         '<div class="fact"><span>Hours in use</span><b>'+hoursText(c.usage_minutes)+'</b></div>'+
         '<div class="fact"><span>People</span>'+usersCell(c)+'</div>'+
       '</div>'+
