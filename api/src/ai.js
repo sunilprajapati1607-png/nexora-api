@@ -1050,7 +1050,37 @@ export async function chat(companyId, payload, lang, fetchImpl) {
    route or material is dropped and said.
    ========================================================================== */
 export const ASSIST_VIEWS = ['dashboard', 'calculation', 'history', 'bom', 'bomrecords', 'routes', 'rm', 'structures', 'constants',
-  'quotation', 'quoterecords', 'compare', 'targetcost', 'priceimpact', 'workflows', 'settings', 'easycost'];
+  'quotation', 'quoterecords', 'compare', 'targetcost', 'priceimpact', 'workflows', 'settings', 'easycost',
+  /* 4.68.3 — Marketing's windows */
+  'mktdash', 'enquiry', 'enquiries', 'followups', 'customers', 'mktwork', 'mkttargets', 'mktsources'];
+
+/* 4.68.3 — MARKETING, AS FIGURES. "aaje ketla follow-ups baki?" · "aa mahine ketlu Won?": the enquiries this person
+   may see, counted — open, due, won and lost, by status, source and person, against the month's targets — and each
+   enquiry by its NUMBER, status, dates, bags, kg, source and person. Never a customer's name, phone or GSTIN, never a
+   rate: an enquiry has none, and nothing here reads one. */
+const MKT_STATUS = ['NEW', 'CONTACTED', 'CALCULATED', 'QUOTED', 'NEGOTIATION', 'WON', 'LOST'];
+export function cleanMarketing(m) {
+  if (!m || typeof m !== 'object') return null;
+  const nn = (v) => { const x = nr(v); return x == null ? 0 : x; };
+  const byStatus = {};
+  MKT_STATUS.forEach((k) => { const v = m.byStatus && nr(m.byStatus[k]); if (v) byStatus[k] = v; });
+  return {
+    month: str(m.month, 7), today: str(m.today, 10),
+    open: nn(m.open), dueToday: nn(m.dueToday), overdue: nn(m.overdue), noDate: nn(m.noDate), writtenToday: nn(m.writtenToday),
+    wonMonth: { n: nn(m.wonMonth && m.wonMonth.n), bags: nn(m.wonMonth && m.wonMonth.bags), kg: nn(m.wonMonth && m.wonMonth.kg) },
+    lostMonth: nn(m.lostMonth), won90: nn(m.won90), lost90: nn(m.lost90),
+    target: { bags: nn(m.target && m.target.bags), kg: nn(m.target && m.target.kg) },
+    byStatus: byStatus,
+    bySource: list(m.bySource, 30).map((x) => ({ source: str(x && x.source, 40), n: nn(x && x.n), won: nn(x && x.won) })).filter((x) => x.source),
+    lostReasons: list(m.lostReasons, 12).map((x) => ({ reason: str(x && x.reason, 60), n: nn(x && x.n) })).filter((x) => x.reason),
+    people: list(m.people, 40).map((x) => ({ person: str(x && x.person, 40), open: nn(x && x.open), due: nn(x && x.due), wonN: nn(x && x.wonN),
+      wonBags: nn(x && x.wonBags), wonKg: nn(x && x.wonKg), targetBags: nn(x && x.targetBags), targetKg: nn(x && x.targetKg),
+      followUpsMonth: nn(x && x.followUpsMonth), calls: nn(x && x.calls), visits: nn(x && x.visits) })).filter((x) => x.person),
+    enquiries: list(m.enquiries, 80).map((x) => ({ n: str(x && x.n, 30), status: MKT_STATUS.indexOf(x && x.status) > -1 ? x.status : '',
+      date: str(x && x.date, 10), next: str(x && x.next, 10), nextKind: str(x && x.nextKind, 12), bags: nr(x && x.bags), kg: nr(x && x.kg),
+      source: str(x && x.source, 40), person: str(x && x.person, 40), quotes: nr(x && x.quotes), calcs: list(x && x.calcs, 8).map((c) => str(c, 30)) })).filter((x) => x.n)
+  };
+}
 /* 4.67.7 — "observe our alll work of software make most of compitible with ai": what a window
    shows, as a small flat object of technical words and figures (never a name, a customer or a
    bag's cost — the application leaves them out; this keeps only short strings and numbers) */
@@ -1101,6 +1131,8 @@ export function cleanAssist(p) {
     rules: list(x.rules, 30).map((r) => str(r, 300)).filter(Boolean),
     voice: !!x.voice,
     /* 4.67.7 — the plant's saved work by NUMBER and technical figures (never an item name or a customer) */
+    /* 4.68.3 */
+    marketing: cleanMarketing(x.marketing),
     records: list(x.records, 60).map((r) => ({ n: str(r && r.n, 30), construction: str(r && r.construction, 60), width: nr(r && r.width), length: nr(r && r.length),
       gsm: nr(r && r.gsm), weight: nr(r && r.weight), target: nr(r && r.target), bags: nr(r && r.bags), status: str(r && r.status, 16), date: str(r && r.date, 10),
       bom: !!(r && r.bom), rev: nr(r && r.rev) })).filter((r) => r.n),
@@ -1220,6 +1252,7 @@ const ASSIST_SYSTEM = [
   'Order steps as the work goes: calc → save → route (only if needed) → bom → recipe/waste → cost. Leave out what NOW shows is already done. When the person corrects something ("no, width 520", "make it 75 gram"), return the WHOLE corrected list of steps again with the change, with "fresh":false on the calc step when NOW.calc.madeByAi is true.',
   'If something needed is missing, still return the steps you can and ask for the rest in "answer". Keep "answer" short and practical: what you understood, what the steps will do, any assumption.',
   'Reply in the SAME language the person used: English → English; Gujarati (in Gujarati script or in English letters) → Gujarati in Gujarati script; Hindi → Hindi in Devanagari. Keep codes, field names, material and process names and Nexora button names in English. Set "lang" to en, gu or hi accordingly.',
+  'MARKETING (4.68.3): the enquiries this person may see, as figures — open, dueToday and overdue follow-ups, noDate (open with no follow-up date), writtenToday, wonMonth (n, bags, kg), lostMonth, won90/lost90, target (this person\u2019s or the team\u2019s month, bags and kg), byStatus, bySource, lostReasons, people (each person\u2019s open, due, won, target, follow-ups, calls, visits) and enquiries (NUMBER, status, date, next follow-up and its kind, bags, kg, source, person, quotations, linked calculations). Answer marketing questions from these yourself ("how many follow-ups are due today", "how much was won this month", "who is behind target", "which enquiries are late") with the numbers, and use an enquiry NUMBER to point at one. A customer is never named: there is none in MARKETING, so never make one up.',
   'EVERY WINDOW (4.67.7): NOW.view is what the window on screen shows (its filters, the numbers listed, what is picked). RECORDS are the saved calculations, BOMS the saved BOMs, QUOTES the quotations — by their NUMBERS and technical figures (width, length, GSM, weight, construction, date; never an item name or a customer). Answer questions about them yourself ("how many 2L bags this month", "which bag is heaviest", "which bags have no BOM") and use their numbers in find/compare/targetcost steps. CONSTANTS are the plant\u2019s constants (name, value, unit); WORKFLOWLIST the saved workflows; GROUPS the RM groups.',
   'ALLOWED says what this person may do (cost = may see costs; rm, price, constants, route, quote, compare, targetcost, priceimpact, notes). Never propose a step for what is false; say who can do it (an administrator in Settings \u2192 Users).',
   'BE THE EXPERT, EASY AND EXACT. Write the answer for a busy person who does not know the software: first the result in one line, then the reason. Use short lines; "- " bullets; "1. 2. 3." for steps to follow; **bold** for the key figure; a table ("| a | b |" rows) when comparing. Use ONLY figures from CONTEXT or that you work out from them — show the working in one line (e.g. denier = GSM x DENIER FACTOR / (warp + weft) with the plant\u2019s own constant), and mark any estimate as an estimate. "How do I…" → numbered steps in the person\u2019s words, plus a "guide" step at the first button (and "open" when it is on another window). When the person only asks, answer — no steps.',
@@ -1671,7 +1704,9 @@ export function assistContext(p, routesSent) {
     FIGURES: p.figures, GROUPS: p.groups, CONSTANTS: p.constants, HELP_TOPICS: p.topics, WORKFLOWLIST: p.workflowList,
     PROCESSES: p.processes, MATERIALS: p.materials, ALLOWED: p.allowed, RULES: p.rules, LEARNED: p.learned,
     ROUTES: routesSent, RECORDS: p.records, BOMS: p.boms, QUOTES: p.quotes,
+    MARKETING: p.marketing ? Object.assign({}, p.marketing, { enquiries: asTable(lean(p.marketing.enquiries)) }) : null,
     SCREEN: p.screen, VOICE: p.voice, NOW: p.now };
+  if (!p.marketing) delete ctx.MARKETING;   /* 4.68.3 — only where Marketing is on */
   const out = {};
   Object.keys(ctx).forEach((k) => {
     if (k === 'ALLOWED' || k === 'VOICE' || k === 'SCREEN') { out[k] = ctx[k]; return; }   /* every yes and no of ALLOWED is said */
