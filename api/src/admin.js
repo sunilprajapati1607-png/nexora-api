@@ -1348,7 +1348,8 @@ function currentSec(){try{return sessionStorage.getItem('nexora_admin_tab')||'se
 /* ---------- plans (4.48.0) ---------- */
 const PLAN_LABELS={quotation:'Quotation',chat:'Company conversation (chat)',notes:'Notes pad',bomWorkflow:'BOM workflow automation',onlinePrices:'Prices from the producer\u2019s list',bagView:'3D bag view',ink:'Ink assumption',sharing:'Email & WhatsApp sharing',
   exportExcel:'Export to Excel',exportPdf:'Export to PDF',priceHistory:'RM price history (price versions)',activityLog:'Activity log',backup:'Backup & restore',numberSeries:'Document number series',tableSettings:'Table Settings (own column names)',sectionSuggest:'BOM sections learned from the plant',
-  /* 4.65.0 */ priceImpact:'Price Impact',compare:'Compare calculations',targetCost:'Target Cost',mobile:'Nexora Mobile (Android app)'};
+  /* 4.65.0 */ priceImpact:'Price Impact',compare:'Compare calculations',targetCost:'Target Cost',mobile:'Nexora Mobile (Android app)',
+  /* 4.68.0 */ marketing:'Marketing (enquiries, customers, follow-ups)'};
 function renderPlans(){
   const m=(DATA.settings&&DATA.settings.planFeatures)||{STANDARD:{},PRO:{}};
   const tb=document.querySelector('#plantbl tbody');

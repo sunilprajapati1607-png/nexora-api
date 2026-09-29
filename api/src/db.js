@@ -240,6 +240,8 @@ export function ensureSchema() {
       )`);
     await q(`CREATE INDEX IF NOT EXISTS sync_records_company_seq_idx ON sync_records (company_id, seq)`);
     await q(`CREATE INDEX IF NOT EXISTS sync_records_calcnumber_idx ON sync_records (company_id, (body->>'calcNumber')) WHERE kind = 'calc'`);
+    /* 4.68.0 — marketing: an enquiry's number is checked on every push, like a calculation's */
+    await q(`CREATE INDEX IF NOT EXISTS sync_records_enqnumber_idx ON sync_records (company_id, (body->>'enquiryNumber')) WHERE kind = 'enquiry'`);
 
     /* 4.42.0 — ENQUIRIES.
 

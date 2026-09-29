@@ -58,7 +58,9 @@ export const PLAN_FEATURES = [
   { id: 'compare',      label: 'Compare calculations',               standard: false },
   { id: 'targetCost',   label: 'Target Cost',                        standard: false },
   /* Nexora Mobile (owner 2026-09-28: "licence A … fakt PRO ma"): one phone per person, free, on PRO */
-  { id: 'mobile',       label: 'Nexora Mobile (Android app)',        standard: false }
+  { id: 'mobile',       label: 'Nexora Mobile (Android app)',        standard: false },
+  /* 4.68.0 — Marketing: enquiries, customers, follow-ups, targets (owner 2026-09-29: "pro ma j") */
+  { id: 'marketing',    label: 'Marketing (enquiries, customers, follow-ups)', standard: false }
 ];
 
 export const PLANS = ['STANDARD', 'PRO'];

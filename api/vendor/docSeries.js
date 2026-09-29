@@ -53,7 +53,9 @@
     calc:  { prefix: 'CAL', year: true, yearDigits: 4, pad: 6, suffix: '' },
     quote: { prefix: 'QT',  year: true, yearDigits: 4, pad: 6, suffix: '' },
     bom:   { prefix: 'BOM', year: true, yearDigits: 4, pad: 6, suffix: '' },
-    item:  { prefix: 'NX',  year: false, yearDigits: 4, pad: 5, suffix: '' }
+    item:  { prefix: 'NX',  year: false, yearDigits: 4, pad: 5, suffix: '' },
+    /* 4.68.0 — marketing: the enquiry (lead and enquiry are one record) */
+    enquiry: { prefix: 'ENQ', year: true, yearDigits: 4, pad: 6, suffix: '' }
   };
   const KINDS = Object.keys(DEFAULTS);
 
@@ -61,7 +63,8 @@
     calc:  'Calculation number',
     quote: 'Quotation number',
     bom:   'BOM number',
-    item:  'Item code'
+    item:  'Item code',
+    enquiry: 'Enquiry number'
   };
 
   function read() {

@@ -29,6 +29,7 @@ import { listInquiries, inquiryAction, publicInquiry } from './inquiry.js';
 import { listFeedback, feedbackShot, feedbackAction, publicFeedback } from './feedback.js';
 import { latestRelease, listReleases, releaseAction } from './appupdate.js';
 import { logoResponse } from './brand.js';
+import { customerCheck } from './marketing.js';
 
 const CORS = {
   'access-control-allow-origin': '*',
@@ -295,6 +296,14 @@ export default {
         /* 4.66.6 — every other machine of the company pulls now */
         if (pushed && pushed.applied && pushed.applied.length) wakeCompany(a.companyId, a.row.device_id);
         return json(pushed);
+      }
+      /* 4.68.0 — Marketing: is this customer already with somebody? Names only who, and on what it matched. */
+      if (path === '/v1/marketing/customer-check' && method === 'POST') {
+        await ensureSchema();
+        const a = await authorise(request);
+        if (!a.ok) return json(a.error, a.httpStatus);
+        if (!a.user) return json({ error: 'SIGN_IN', message: 'Sign in to check a customer.' }, 401);
+        return json(await customerCheck(a.companyId, a.user, await readJson(request)));
       }
       /* Nexora Mobile — a calculation made on the phone: the form (constructions and fields, the
          company's own), and the bag weighed by the desktop's own engine on the service (weigh.js).

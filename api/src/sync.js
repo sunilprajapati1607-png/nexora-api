@@ -396,15 +396,39 @@ export async function userAction(companyId, actor, body) {
    Every write takes a fresh seq, so "everything since seq N" is exact. */
 /* 4.66.3 — masters only an administrator may write (see push) */
 const ADMIN_ONLY_MASTERS = { 'nexora.rm.price.v1': 1, 'nexora.constants.v1': 1, 'nexora.constants.custom.v1': 1, 'nexora.docseries.v1': 1, 'nexora.units.v1': 1, 'nexora.meshunit.v1': 1, 'nexora.quote.terms.v1': 1,
-  'nexora.constants.links.v1': 1, 'nexora.org.v1': 1 };
-const KINDS = { master: true, calc: true, bom: true, quote: true };
+  'nexora.constants.links.v1': 1, 'nexora.org.v1': 1, 'nexora.mkt.sources.v1': 1 };
+/* 4.68.0 — MARKETING: enquiry (the lead and the enquiry are one record) and customer. Owned like a quotation, but
+   who is SENT one is wider: the owner, the person it is assigned to (an enquiry's assignedTo), an administrator or
+   scope ALL, and anyone the administrator let see that person's marketing (permissions MKT_SEE_ALL, MKT_SEE:<id>) —
+   "admin can give permision to marketing manager to see all user data or can select several user data". */
+const KINDS = { master: true, calc: true, bom: true, quote: true, enquiry: true, customer: true };
+const MKT_KINDS = { enquiry: true, customer: true };
 const PAGE = 200;
 const MAX_BODY = 4 * 1024 * 1024;   // one record; a calculation with its trace is ~50 KB
 
 function canSee(user, row) {
   if (row.kind === 'master') return true;
+  if (MKT_KINDS[row.kind]) return mktCanSee(user, row);
   if (user.scope === 'ALL') return true;
   return row.owner_id == null || Number(row.owner_id) === Number(user.id);
+}
+function permsOf(user) {
+  let p = user && user.permissions;
+  if (typeof p === 'string') { try { p = JSON.parse(p); } catch (e) { p = null; } }
+  return p && typeof p === 'object' ? p : {};
+}
+/** 4.68.0 — may this person be given the marketing records of person `id`? Their own, always. */
+export function mktSeesPerson(user, id) {
+  if (id == null) return true;
+  if (Number(id) === Number(user.id)) return true;
+  if (user.role === 'ADMIN' || user.scope === 'ALL') return true;
+  const p = permsOf(user);
+  return p.MKT_SEE_ALL === true || p['MKT_SEE:' + Number(id)] === true;
+}
+function mktCanSee(user, row) {
+  if (mktSeesPerson(user, row.owner_id)) return true;
+  const b = row.body || {};
+  return row.kind === 'enquiry' && b.assignedTo != null && b.assignedTo !== '' && mktSeesPerson(user, b.assignedTo);
 }
 
 /** A calculation another person owns is sent as a STUB — number, code and
@@ -424,7 +448,17 @@ function quoteStubOf(row) {
   return { calcId: row.id, stub: true, quoteNumber: b.quoteNumber || null,
     ownerId: row.owner_id == null ? null : Number(row.owner_id) };
 }
-const STUBS = { calc: stubOf, quote: quoteStubOf };
+/** 4.68.0 — an enquiry's number and owner (so the numbering stays free across the company), and a customer's id
+ *  and owner only: never the buyer's name, phone, GSTIN, requirement or follow-ups. A stub also replaces a copy
+ *  someone may no longer see after the administrator takes the grant back. */
+function enquiryStubOf(row) {
+  const b = row.body || {};
+  return { id: row.id, stub: true, enquiryNumber: b.enquiryNumber || null, ownerId: row.owner_id == null ? null : Number(row.owner_id) };
+}
+function customerStubOf(row) {
+  return { id: row.id, stub: true, ownerId: row.owner_id == null ? null : Number(row.owner_id) };
+}
+const STUBS = { calc: stubOf, quote: quoteStubOf, enquiry: enquiryStubOf, customer: customerStubOf };
 
 export async function pull(companyId, user, since, limit) {
   const from = Math.max(0, parseInt(since, 10) || 0);
@@ -452,6 +486,25 @@ export async function pull(companyId, user, since, limit) {
 
 function calcNumberOf(body) {
   return body && typeof body === 'object' && body.calcNumber ? String(body.calcNumber) : null;
+}
+
+/** 4.68.0 — the next free number after a taken one, whatever the series looks like (ENQ-2026-000012,
+ *  E/26/0012-A …): the last run of digits is the counter, the rest must match. */
+async function suggestNext(companyId, kind, field, taken) {
+  const m = /^(.*?)(\d+)(\D*)$/.exec(String(taken || ''));
+  if (!m) return null;
+  const head = m[1], width = m[2].length, tail = m[3];
+  const rows = await q(
+    `SELECT body->>'${field}' AS n FROM sync_records WHERE company_id = $1 AND kind = $2 AND deleted = false AND body->>'${field}' LIKE $3`,
+    [companyId, kind, head.replace(/[\\%_]/g, (c) => '\\' + c) + '%']);
+  let max = 0;
+  rows.forEach((r) => {
+    const x = String(r.n || '');
+    if (x.slice(0, head.length) !== head) return;
+    const d = /^(\d+)(\D*)$/.exec(x.slice(head.length));
+    if (d && d[2] === tail) { const k = parseInt(d[1], 10); if (k > max) max = k; }
+  });
+  return head + String(max + 1).padStart(width, '0') + tail;
 }
 
 /** Next free calculation number for the year the taken one was in. */
@@ -493,6 +546,23 @@ export async function push(companyId, user, records) {
       if (cur && base != null && Number(cur.seq) > base && !cur.deleted && JSON.stringify(cur.body) !== bodyText) {
         conflicts.push({ kind, id, seq: Number(cur.seq), body: cur.body, reason: 'STALE' });
         continue;
+      }
+    } else if (MKT_KINDS[kind]) {
+      /* 4.68.0 — marketing. Whoever is given an enquiry may work on it (a follow-up by the person it is assigned
+         to, the manager's note); only its owner, an administrator or scope ALL may delete it. */
+      if (cur && !cur.deleted && cur.owner_id != null && Number(cur.owner_id) !== Number(user.id)) {
+        const may = rec.deleted ? (user.role === 'ADMIN' || user.scope === 'ALL') : mktCanSee(user, { kind, owner_id: cur.owner_id, body: cur.body });
+        if (!may) { refused.push({ id, kind, reason: 'NOT_YOURS' }); continue; }
+      }
+      if (kind === 'enquiry' && !rec.deleted && rec.body && rec.body.enquiryNumber) {
+        const n = String(rec.body.enquiryNumber);
+        const clash = await q(
+          `SELECT id FROM sync_records WHERE company_id = $1 AND kind = 'enquiry' AND deleted = false
+             AND id <> $2 AND body->>'enquiryNumber' = $3 LIMIT 1`, [companyId, id, n]);
+        if (clash.length) {
+          conflicts.push({ kind, id, reason: 'NUMBER_TAKEN', enquiryNumber: n, suggested: await suggestNext(companyId, 'enquiry', 'enquiryNumber', n) });
+          continue;
+        }
       }
     } else {
       /* Owned records. Someone with scope OWN cannot touch what another
