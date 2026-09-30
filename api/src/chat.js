@@ -46,7 +46,9 @@ const MAX_TAGS = 12;
    application writes, and UPDATE, which only Nexora writes (below). */
 const TAG_KINDS = { CALC: 1, BOM: 1, QUOTE: 1, ITEM: 1, RM: 1, STRUCTURE: 1, ROUTE: 1, PROCESS: 1, PERSON: 1, UPDATE: 1,
   /* 4.66.0 — a change waiting for the administrator (AP-XXXXXX) */
-  APPROVAL: 1 };
+  APPROVAL: 1,
+  /* 4.70.3 — Marketing's: an enquiry by its number, a customer by name (desktop 4.70.3, phone 0.9.2) */
+  ENQUIRY: 1, CUSTOMER: 1 };
 
 function cleanTags(v) {
   if (!Array.isArray(v)) return [];
