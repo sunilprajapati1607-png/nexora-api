@@ -403,6 +403,8 @@ const ADMIN_ONLY_MASTERS = { 'nexora.rm.price.v1': 1, 'nexora.constants.v1': 1, 
    "admin can give permision to marketing manager to see all user data or can select several user data". */
 const KINDS = { master: true, calc: true, bom: true, quote: true, enquiry: true, customer: true };
 const MKT_KINDS = { enquiry: true, customer: true };
+/* 4.70.4 — the records a stale push is answered for (see the push below) */
+const STALE_KINDS = { quote: true, enquiry: true, customer: true };
 const PAGE = 200;
 const MAX_BODY = 4 * 1024 * 1024;   // one record; a calculation with its trace is ~50 KB
 
@@ -582,6 +584,17 @@ export async function push(companyId, user, records) {
           }
         }
       }
+    }
+
+    /* 4.70.4 — "keep version" (owner 2026-09-30): a quotation, an enquiry or a customer pushed against the seq this
+       client last saw (baseSeq), when the company's copy has moved on since and differs, comes back as a STALE conflict
+       carrying the current copy. The client folds the two sets of changes together and keeps the other side's differing
+       values as a version, so a change made on a phone and one made on a computer at the same time are both kept.
+       A push without baseSeq (an older client) is taken as before: the last save wins. */
+    if (STALE_KINDS[kind] && !rec.deleted && cur && !cur.deleted && rec.baseSeq != null &&
+        Number(cur.seq) > Number(rec.baseSeq) && JSON.stringify(cur.body) !== bodyText) {
+      conflicts.push({ kind, id, seq: Number(cur.seq), body: cur.body, reason: 'STALE' });
+      continue;
     }
 
     const owner = kind === 'master' ? null : (cur && cur.owner_id != null ? cur.owner_id : user.id);
