@@ -76,6 +76,12 @@ jobs:
           DB_URL: ${{ secrets.SUPABASE_DB_URL }}
           PASS: ${{ secrets.BACKUP_PASSPHRASE }}
         run: |
+          # 2026-10-01 — a secret pasted with an Enter after it carried a line end into the URL
+          # (pg_dump: database "postgres<line end>" does not exist). Spaces and line ends around both secrets
+          # are taken off here, in every step that reads them, so a paste can never break the backup
+          # and the passphrase used is exactly the one written on paper.
+          trim() { printf '%s' "$1" | tr -d '\r\n' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'; }
+          DB_URL=$(trim "$DB_URL"); PASS=$(trim "$PASS")
           how="see docs/DB-BACKUP.md in this repository"
           if [ -z "$DB_URL" ]; then
             echo "::error::the secret SUPABASE_DB_URL is not set — $how"; exit 1; fi
@@ -162,6 +168,12 @@ jobs:
         env:
           DB_URL: ${{ secrets.SUPABASE_DB_URL }}
         run: |
+          # 2026-10-01 — a secret pasted with an Enter after it carried a line end into the URL
+          # (pg_dump: database "postgres<line end>" does not exist). Spaces and line ends around both secrets
+          # are taken off here, in every step that reads them, so a paste can never break the backup
+          # and the passphrase used is exactly the one written on paper.
+          trim() { printf '%s' "$1" | tr -d '\r\n' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'; }
+          export DB_URL="$(trim "$DB_URL")"
           mkdir -p backup out
           day=$(TZ=Asia/Kolkata date '+%Y-%m-%d')
           file="nexora-db-$(TZ=Asia/Kolkata date '+%Y-%m-%d_%H%M')IST.dump"
@@ -235,6 +247,12 @@ jobs:
           PASS: ${{ secrets.BACKUP_PASSPHRASE }}
           FILE: ${{ steps.dump.outputs.file }}
         run: |
+          # 2026-10-01 — a secret pasted with an Enter after it carried a line end into the URL
+          # (pg_dump: database "postgres<line end>" does not exist). Spaces and line ends around both secrets
+          # are taken off here, in every step that reads them, so a paste can never break the backup
+          # and the passphrase used is exactly the one written on paper.
+          trim() { printf '%s' "$1" | tr -d '\r\n' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'; }
+          PASS=$(trim "$PASS")
           # A keyring of its own, thrown away with the runner. The passphrase
           # goes in on a pipe (never a command line); --no-symkey-cache so the
           # check below really reads it again instead of trusting a cache.
