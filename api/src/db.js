@@ -15,7 +15,8 @@
 import { createClient } from './pgmini.js';
 import { parsePlanFeatures } from './plans.js';
 
-export const pool = createClient(process.env.DATABASE_URL);
+/* 2026-10-01 — up to 4 connections (PG_POOL to change it; 1 = the old single one) */
+export const pool = createClient(process.env.DATABASE_URL, process.env.PG_POOL || 4);
 
 export async function q(text, params) {
   return pool.query(text, params);
@@ -440,8 +441,22 @@ export function ensureSchema() {
   return ready;
 }
 
+/* 2026-10-01 — the settings are read on nearly every request (24,000 reads
+   since 17 Sep) and change only when the owner saves them in the console.
+   The rows are kept here for 30 s and dropped the moment this service
+   writes them (forgetSettings); every call still builds its own object. */
+const SETTINGS_TTL_MS = 30 * 1000;
+let settingsRows = null, settingsAt = 0, settingsGen = 0;
+export function forgetSettings() { settingsGen++; settingsRows = null; }
+
 export async function getSettings() {
-  const rows = await q(`SELECT key, value FROM settings`);
+  let rows = settingsRows;
+  if (!rows || Date.now() - settingsAt > SETTINGS_TTL_MS) {
+    const gen = settingsGen;
+    rows = await q(`SELECT key, value FROM settings`);
+    /* a read that started before a write must not put the old rows back */
+    if (gen === settingsGen) { settingsRows = rows; settingsAt = Date.now(); }
+  }
   const s = {};
   rows.forEach((r) => { s[r.key] = r.value; });
   return {

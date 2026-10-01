@@ -12,7 +12,7 @@
  * real accounts the day there is more than one operator.
  */
 import { endSessionOn } from './waiters.js';
-import { q, getSettings, logEvent } from './db.js';
+import { q, getSettings, forgetSettings, logEvent } from './db.js';
 import { cleanPlan, cleanPlanFeatures, PLAN_FEATURES } from './plans.js';
 import { hashPasscode, validPasscode, PASSCODE_MIN } from './passcode.js';
 import { newLicenceKey } from './licence.js';
@@ -601,6 +601,7 @@ export async function saveSettings(body) {
     await q(`INSERT INTO settings (key, value) VALUES ($1,$2)
              ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`, [k, v]);
   }
+  forgetSettings();
   return { ok: true, settings: await getSettings() };
 }
 

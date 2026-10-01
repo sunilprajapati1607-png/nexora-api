@@ -376,13 +376,36 @@ async function runQuery(conn, text, params) {
 
 /* ---- the pool -------------------------------------------------------- */
 /**
- * One connection, reused, reopened if it dies. A Neon Function handles
- * one request at a time per instance, so a single serialised connection
- * is the honest shape — and queries are queued rather than raced.
+ * 2026-10-01 — "can our server handle 10 pc and 10 mobile at once" (5
+ * companies). One connection served every machine and phone in turn: each
+ * query waits for the one before it, and Render (Singapore) to the database
+ * (Mumbai) is a network round trip per query. So there are now a few LANES,
+ * each one connection used one query at a time exactly as before, and a
+ * query goes to the lane with the least waiting. Ties go to the first lane,
+ * so a quiet service still uses one connection; the others open only when
+ * requests overlap. Nothing here holds a transaction or a session setting
+ * across queries (there is none in the service), so any lane will do.
  */
-export function createClient(url) {
+export function createClient(url, size) {
+  const n = Math.max(1, Math.min(10, parseInt(size, 10) || 1));
+  const lanes = [];
+  for (let i = 0; i < n; i++) lanes.push(createLane(url));
+  function query(text, params) {
+    let best = lanes[0];
+    for (const l of lanes) if (l.waiting() < best.waiting()) best = l;
+    return best.query(text, params);
+  }
+  return { query, size: n, open: () => lanes.filter((l) => l.isOpen()).length };
+}
+
+/**
+ * One connection, reused, reopened if it dies, one query at a time — queries
+ * are queued rather than raced.
+ */
+function createLane(url) {
   let conn = null;
   let chain = Promise.resolve();
+  let waiting = 0;
 
   async function ensure() {
     if (conn && !conn.dead && conn.socket && !conn.socket.destroyed) return conn;
@@ -408,11 +431,14 @@ export function createClient(url) {
         throw e;
       }
     };
+    waiting++;
+    const done = () => { waiting--; };
     chain = chain.then(run, run);
+    chain.then(done, done);
     return chain;
   }
 
-  return { query };
+  return { query, waiting: () => waiting, isOpen: () => !!(conn && !conn.dead && conn.socket && !conn.socket.destroyed) };
 }
 
 function isConnectionFault(e) {
