@@ -377,7 +377,10 @@ export default {
         if (!a.user) return json({ error: 'SIGN_IN', message: 'Sign in to make a calculation.' }, 401);
         if (!a.licence.canCalculate) return json({ error: 'LICENCE_REQUIRED', licence: a.licence, message: a.licence.message || 'This licence has ended — saved work can be opened, but new calculations need a licence.' }, 402);
         const body = await readBody();
-        const out = await calcWeigh(a.companyId, body.calc);
+        /* C8 — weight in, GSM out: "solveGsm": true travels in the calculation, or beside it (lifted in);
+           without it the calculation goes through exactly as before */
+        const calc = body.solveGsm === true && body.calc && typeof body.calc === 'object' ? Object.assign({}, body.calc, { solveGsm: true }) : body.calc;
+        const out = await calcWeigh(a.companyId, calc);
         return json(out.body, out.httpStatus);
       }
       /* 4.67.14 — the next number in the company's own series, for a calculation saved on the phone */

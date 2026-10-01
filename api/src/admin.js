@@ -17,7 +17,7 @@ import { q, getSettings, forgetSettings, logEvent } from './db.js';
 import { cleanPlan, cleanPlanFeatures, PLAN_FEATURES } from './plans.js';
 import { hashPasscode, validPasscode, PASSCODE_MIN } from './passcode.js';
 import { newLicenceKey } from './licence.js';
-import { aiUsedToday, aiDefaultDaily } from './ai.js';
+import { aiUsedTodayAll, aiDefaultDaily } from './ai.js';
 import { forget as aiForget } from './aikey.js';
 import { ensureAdmin, usersSummary, userCap, listUsers, hashPin, validPin, nameKey, cleanEmail, defaultPermissions, resendPrices } from './sync.js';
 
@@ -157,7 +157,7 @@ export async function listCompanies() {
        users_count stays the ACTIVE number the page always showed. */
     c.users_total = (await userCap(c.id)).count;
     /* 4.67.21 — Nexora AI questions asked today on Nexora's key (this service's count) */
-    c.ai_used_today = aiUsedToday(c.id);
+    c.ai_used_today = await aiUsedTodayAll(c.id);   /* 4.71.0 — the higher of memory and the database */
   }
   return rows;
 }

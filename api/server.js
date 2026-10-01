@@ -14,6 +14,10 @@
  */
 import { createServer } from 'node:http';
 import app from './src/index.js';
+/* 4.71.0 — the Nexora AI day count is kept in the database as well as in memory (ai.js takeCounted) */
+import { setUsageStore } from './src/ai.js';
+import { aiUsageStore } from './src/db.js';
+setUsageStore(aiUsageStore);
 
 const PORT = process.env.PORT || 3000;
 

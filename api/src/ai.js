@@ -25,9 +25,10 @@ import { AsyncLocalStorage } from 'node:async_hooks';
  * Google retiring one never needs a release.
  *
  * Limits: the free tier is shared by every plant, so each company gets
- * AI_DAILY_PER_COMPANY checks a day (default 60) and the service sends at
+ * AI_DAILY_PER_COMPANY checks a day (default 30 — owner 2026-10-01: "company mate per day 30 … pasi consol mathi
+ * vadharvanu"; the console raises it for one company) and the service sends at
  * most AI_PER_MINUTE (default 10) a minute; beyond that it says "busy"
- * with the seconds to wait. Counters are in memory (reset on a restart).
+ * with the seconds to wait. The day is counted in memory AND in the database (ai_usage, 4.71.0); the higher counts.
  */
 
 const API = 'https://generativelanguage.googleapis.com/v1beta';
@@ -173,7 +174,7 @@ export function aiStatus() {
 /* ---- limits ------------------------------------------------------------- */
 const perCompany = new Map();        // companyId -> { day, n }
 let recent = [];                     // times of the last minute's calls
-const daily = () => companyDaily() || Math.max(1, parseInt(process.env.AI_DAILY_PER_COMPANY, 10) || 60);
+const daily = () => companyDaily() || Math.max(1, parseInt(process.env.AI_DAILY_PER_COMPANY, 10) || 30);
 const perMinute = () => Math.max(1, parseInt(process.env.AI_PER_MINUTE, 10) || 10);
 /* 4.67.17 — the day is India's (the plants' own midnight, not 05:30 in the morning) */
 function today() { return new Date(Date.now() + 330 * 60000).toISOString().slice(0, 10); }
@@ -194,12 +195,50 @@ function take(companyId) {
 export function _resetLimits() { perCompany.clear(); recent = []; }
 /** 4.67.21 — the console: how many questions each company has asked today (Nexora's key; this service's memory) */
 export function aiUsedToday(companyId) { const c = perCompany.get(String(companyId || 'none')); return c && c.day === today() ? c.n : 0; }
-export function aiDefaultDaily() { return Math.max(1, parseInt(process.env.AI_DAILY_PER_COMPANY, 10) || 60); }
+
+/* 4.71.0 — owner 2026-10-01: "banne jagya ae rakhvu je vadhare hoy a manya rahese". The day's count was only in this
+   service's memory, so a restart or a deploy started every company's day again from 0. Now it is kept in the memory
+   AND in the database (ai_usage, db.js aiUsageStore), and the HIGHER of the two is the count. The database is asked
+   for at most AI_USAGE_WAIT_MS (2.5 s): slow or away, the memory's count stands and Nexora AI carries on. */
+let usageStore = null;               // { add(company, day, atLeast) -> Promise<n>, back(company, day), get(company, day) -> Promise<n> }
+export function setUsageStore(s) { usageStore = s || null; }
+const usageWait = () => Math.max(10, parseInt(process.env.AI_USAGE_WAIT_MS, 10) || 2500);
+function inTime(p) {
+  let t;
+  return Promise.race([Promise.resolve(p), new Promise((_, no) => { t = setTimeout(() => no(new Error('slow')), usageWait()); })])
+    .finally(() => clearTimeout(t));
+}
+async function takeCounted(companyId) {
+  const t = take(companyId);         // the minute's limit, and the day as this process counts it (this question included)
+  if (t.busy || t.spent || t.own || !usageStore) return t;
+  const k = String(companyId || 'none'), d = today();
+  const mine = perCompany.get(k);
+  let n;
+  try { n = Number(await inTime(usageStore.add(k, d, mine.n))); } catch (e) { return t; }
+  if (!(n > 0)) return t;
+  if (n > mine.n) mine.n = n;        // the database knew more (the service restarted): the higher count is the count
+  if (n > daily()) {                 // over the day after all: this question is not asked, and is taken off again
+    mine.n = n - 1;
+    recent.pop();
+    Promise.resolve().then(() => usageStore.back(k, d)).catch(() => {});
+    return { spent: true, used: n - 1 };
+  }
+  return { left: daily() - n };
+}
+/** The console: the higher of this service's count and the database's. */
+export async function aiUsedTodayAll(companyId) {
+  const mem = aiUsedToday(companyId);
+  if (!usageStore || typeof usageStore.get !== 'function') return mem;
+  try { return Math.max(mem, Number(await inTime(usageStore.get(String(companyId || 'none'), today()))) || 0); } catch (e) { return mem; }
+}
+export function aiDefaultDaily() { return Math.max(1, parseInt(process.env.AI_DAILY_PER_COMPANY, 10) || 30); }
 /* 4.67.17 — a question that Google did not answer (slow, busy, unreachable) is not counted against the company's day */
 function giveBack(companyId) {
   if (ownKey()) return;
   const c = perCompany.get(String(companyId || 'none'));
   if (c && c.day === today() && c.n > 0) c.n--;
+  /* 4.71.0 — and in the database too, or the next question would take the higher (unreturned) count back */
+  if (usageStore) Promise.resolve().then(() => usageStore.back(String(companyId || 'none'), today())).catch(() => {});
 }
 
 /* ---- what may be sent ---------------------------------------------------- */
@@ -531,9 +570,10 @@ async function askClassic(companyId, t, name, payload, fetchImpl, opts, kind) {
 async function ask(companyId, system, prompt, fetchImpl, opts) {
   opts = opts || {};
   if (!aiConfigured()) return { fail: { httpStatus: 503, body: { error: 'AI_OFF', message: 'Nexora AI is not switched on at the service yet.' } } };
-  const t = take(companyId);
+  const t = await takeCounted(companyId);
   if (t.busy) return { fail: { httpStatus: 429, body: { error: 'AI_BUSY', retryAfter: t.busy, message: 'Nexora AI is busy — try again in ' + t.busy + ' seconds.' } } };
-  if (t.spent) return { fail: { httpStatus: 429, body: { error: 'AI_DAILY', message: 'This company has used today’s ' + daily() + ' Nexora AI checks. They come back tomorrow.' } } };
+  /* 4.71.0 — owner: "puru thay etle nexora msg aape k tamaro ai quota khatam thai gyo che" */
+  if (t.spent) return { fail: { httpStatus: 429, body: { error: 'AI_DAILY', limit: daily(), message: 'Your company’s Nexora AI quota for today (' + daily() + ') is used up. It comes back tomorrow — ask Nexora to raise it.' } } };
   const deadline = Date.now() + deadlineMs;
   const name = await resolveModel(false, fetchImpl);
   if (!name) { giveBack(companyId); return { fail: { httpStatus: 503, body: { error: 'AI_MODEL', message: 'Nexora AI has no model it can use right now.' } } }; }

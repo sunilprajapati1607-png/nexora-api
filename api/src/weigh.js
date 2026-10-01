@@ -23,6 +23,10 @@
  * shows and takes lengths and mesh in them, and they are turned into
  * millimetres and tapes per inch here, by the desktop's own units.js,
  * before the engine sees them — exactly as the computer's form does.
+ *
+ * C8 (owner 2026-10-01): and the other way round — with solveGsm the target
+ * weight is given and the body fabric GSM is found by the computer's own
+ * search (solveGsmWith below).
  */
 import vm from 'node:vm';
 import { readFileSync } from 'node:fs';
@@ -102,11 +106,11 @@ function engineInput(d, calc) {
   return Object.assign(merged, { 'TARGET WEIGHT': calc.targetWeight, 'DOWNSIDE %': calc.downsidePct, 'UPSIDE %': calc.upsidePct });
 }
 
-/** Weigh one bag over the given desktop modules. Exported for the tests, which weigh with no database. */
-export function weighWith(d, calc) {
-  const c = calc && typeof calc === 'object' ? calc : {};
+/** The construction, the fields it shows, and the inputs typed in the company's units turned into what the
+ *  computer's form stores. Shared by weighing and by C8's GSM search, so both read the units the same way. */
+function prepared(d, c) {
   const construction = d.NexoraStructureStore.get(String(c.structure || ''));
-  if (!construction) return { httpStatus: 400, body: { error: 'NO_CONSTRUCTION', message: 'Pick a construction first.' } };
+  if (!construction) return { refusal: { httpStatus: 400, body: { error: 'NO_CONSTRUCTION', message: 'Pick a construction first.' } } };
   /* only the fields this construction shows, as the computer's form only offers those */
   const active = {};
   d.NexoraFieldDefs.FIELDS.forEach((f) => { if (f.flagKey === null || construction.fields[f.flagKey]) active[f.key] = true; });
@@ -122,15 +126,120 @@ export function weighWith(d, calc) {
     }
     inputs[k] = typeof v === 'number' ? v : String(v).slice(0, 40);
   });
-  const rec = { inputs, targetWeight: c.targetWeight, downsidePct: c.downsidePct, upsidePct: c.upsidePct };
-  const r = d.NexoraEngine.calculate(engineInput(d, rec), { constants: d.NexoraConstantsStore.getLookup(d.NexoraConstants.SEED_CONSTANTS), construction });
-  /* JSON round trip: out of the vm's realm, into plain objects */
-  const out = JSON.parse(JSON.stringify({
+  return { construction, active, inputs };
+}
+
+/** The engine's answer as the phone is sent it. JSON round trip: out of the vm's realm, into plain objects. */
+function plainResult(r) {
+  return JSON.parse(JSON.stringify({
     netWeight: r.netWeight, minWeight: r.minWeight, maxWeight: r.maxWeight, variance: r.variance, variancePercent: r.variancePercent,
     components: r.components, derived: r.derived, reporting: r.reporting, trace: r.trace,
     errors: r.errors || [], warnings: r.warnings || []
   }));
-  return { httpStatus: 200, body: { ok: true, structure: construction.name, inputs, result: out } };
+}
+
+/** The normal weighing of prepared inputs: one engine run, the tolerance band from the calculation's target. */
+function weighPrepared(d, p, c) {
+  const rec = { inputs: p.inputs, targetWeight: c.targetWeight, downsidePct: c.downsidePct, upsidePct: c.upsidePct };
+  const r = d.NexoraEngine.calculate(engineInput(d, rec), { constants: d.NexoraConstantsStore.getLookup(d.NexoraConstants.SEED_CONSTANTS), construction: p.construction });
+  return { httpStatus: 200, body: { ok: true, structure: p.construction.name, inputs: p.inputs, result: plainResult(r) } };
+}
+
+/** Weigh one bag over the given desktop modules. Exported for the tests, which weigh with no database.
+ *  C8 (owner 2026-10-01) — with solveGsm: true the target weight is given and the body fabric GSM is found. */
+export function weighWith(d, calc) {
+  const c = calc && typeof calc === 'object' ? calc : {};
+  if (c.solveGsm === true) return solveGsmWith(d, c);
+  const p = prepared(d, c);
+  if (p.refusal) return p.refusal;
+  return weighPrepared(d, p, c);
+}
+
+/* ------------------------------------------------------------------
+   C8 — WEIGHT IN, GSM OUT  (owner 2026-10-01: "mobile app has feature of
+   gsm to weight and weight to gsm at calculation")
+   ------------------------------------------------------------------
+   The computer's Calculation, in Weight mode, takes a target bag weight
+   and finds the Body Fabric GSM for it: app.js solveGsmFromWeight(), a
+   bisection of BD FAB GSM over the unchanged engine. This is that search,
+   line for line — the same bounds (5 and 400 g/m²), the same 60 steps or
+   0.005 g/m² apart, the same rounding to 0.1, the same words when the
+   target is out of reach — so the phone, which carries no formula, gets
+   the computer's GSM. The bag is then weighed once more at that GSM,
+   exactly as the computer recalculates its form after writing it in.
+   It is a copy, not a shared file (app.js is the whole window), so
+   weigh-test.mjs cuts solveGsmFromWeight() out of the desktop's app.js,
+   runs that real text with stand-ins for the screen and checks this
+   search gives the same GSM, gram and words — if the desktop's search
+   ever changes, that test fails until this one follows. */
+const GSM_KEY = 'BD FAB GSM';
+const GSM_LO = 5, GSM_HI = 400;
+/* the computer's fmt(n, 2): two decimals, grouped (en-IN, the plants' own; the same as en-US below 1,00,000) */
+const g2 = (x) => Number(x).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+/** app.js bodyGpmOf(): the engine's own body GPM figure (reporting.MBC8, "Body UL GPM"), wherever it keeps it. */
+export function bodyGpmOf(res) {
+  const rep = res && res.reporting;
+  if (!rep) return null;
+  const pick = (x) => (x && typeof x === 'object') ? x.value : x;
+  if (Array.isArray(rep)) {
+    const hit = rep.find((x) => /body.*GPM/i.test(String(x.label || x.name || x.key || '')));
+    return hit ? Number(pick(hit)) : null;
+  }
+  for (const k of Object.keys(rep)) {
+    if (/^MBC8$|body.*GPM/i.test(k) || /body.*GPM/i.test(String((rep[k] && rep[k].label) || ''))) {
+      const v = Number(pick(rep[k]));
+      if (isFinite(v)) return v;
+    }
+  }
+  return null;
+}
+
+function solveGsmWith(d, c) {
+  const p = prepared(d, c);
+  if (p.refusal) return p.refusal;
+  if (!p.active[GSM_KEY]) return { httpStatus: 400, body: { error: 'NO_GSM_FIELD', message: 'This construction has no body fabric GSM to find.' } };
+  /* a JSON number only (C8: "targetWeight not a number > 0 → NO_TARGET"); text such as "75", "1e2" or "0x46" is refused,
+     not guessed at — the phone sends a number, or "" when nothing is typed */
+  const target = typeof c.targetWeight === 'number' ? c.targetWeight : NaN;
+  if (!(isFinite(target) && target > 0)) return { httpStatus: 400, body: { error: 'NO_TARGET', message: 'Type the target weight in grams.' } };
+  /* any GSM sent is ignored: the search sets it */
+  delete p.inputs[GSM_KEY];
+  const opts = { constants: d.NexoraConstantsStore.getLookup(d.NexoraConstants.SEED_CONSTANTS), construction: p.construction };
+  const rec = { inputs: p.inputs, targetWeight: c.targetWeight, downsidePct: c.downsidePct, upsidePct: c.upsidePct };
+  const weightAt = (gsm) => {
+    try {
+      const r = d.NexoraEngine.calculate(Object.assign({}, engineInput(d, rec), { [GSM_KEY]: gsm }), opts);
+      return (r && !(r.errors || []).length && isFinite(r.netWeight)) ? r.netWeight : null;
+    } catch (e) { return null; }
+  };
+  let lo = GSM_LO, hi = GSM_HI;
+  const wLo = weightAt(lo), wHi = weightAt(hi);
+  if (wLo == null || wHi == null) {
+    return { httpStatus: 422, body: { error: 'CANNOT_WEIGH', message: 'The bag cannot be weighed yet — fill in its sizes first, and the GSM follows.' } };
+  }
+  if (target < wLo) {
+    return { httpStatus: 422, body: { error: 'TARGET_OUT_OF_REACH', reason: 'TOO_LIGHT', weightAtMin: wLo,
+      message: 'Even at ' + lo + ' g/m² the bag weighs ' + g2(wLo) + ' g — its other parts alone exceed the target of ' + g2(target) + ' g.' } };
+  }
+  if (target > wHi) {
+    return { httpStatus: 422, body: { error: 'TARGET_OUT_OF_REACH', reason: 'TOO_HEAVY', weightAtMax: wHi,
+      message: 'Even at ' + hi + ' g/m² the bag weighs only ' + g2(wHi) + ' g — the target of ' + g2(target) + ' g is out of reach on fabric alone.' } };
+  }
+  for (let i = 0; i < 60; i++) {
+    const mid = (lo + hi) / 2;
+    const w = weightAt(mid);
+    if (w == null) break;
+    if (w < target) lo = mid; else hi = mid;
+    if (hi - lo < 0.005) break;
+  }
+  const gsm = Math.round(((lo + hi) / 2) * 10) / 10;
+  /* weighed once more at that GSM, the ordinary way (the tolerance band from the target, as today) */
+  p.inputs[GSM_KEY] = gsm;
+  const out = weighPrepared(d, p, c);
+  const res = out.body.result;
+  out.body.solved = { ok: true, gsm, target, netWeight: res.netWeight, bodyGpm: bodyGpmOf(res) };
+  return out;
 }
 
 /** The next calculation number and item code in the company's series, past every one it has used

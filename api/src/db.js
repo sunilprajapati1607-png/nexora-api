@@ -488,7 +488,12 @@ export function ensureSchema() {
        Only a table this connection owns is touched — ALTER TABLE on
        somebody else's table would fail, and a failed bootstrap stops the
        whole service — and a failure here is never allowed to stop it. */
-    for (const t of ['chat_messages', 'feedback', 'inquiries', 'app_releases']) {
+    /* 4.71.0 — each company's Nexora AI questions per India day, kept beside the service's own memory (ai.js
+       takeCounted: the higher of the two is the count, so a restart no longer gives a company its day again) */
+    await q(`CREATE TABLE IF NOT EXISTS ai_usage (company_id TEXT NOT NULL, day TEXT NOT NULL, n INTEGER NOT NULL DEFAULT 0,
+                                                PRIMARY KEY (company_id, day))`);
+    await q(`DELETE FROM ai_usage WHERE day < to_char(now() AT TIME ZONE 'Asia/Kolkata' - interval '40 days', 'YYYY-MM-DD')`);
+    for (const t of ['chat_messages', 'feedback', 'inquiries', 'app_releases', 'ai_usage']) {
       try {
         await q(`DO $rls$ BEGIN
                    IF EXISTS (SELECT 1 FROM pg_tables WHERE schemaname = current_schema() AND tablename = '${t}' AND tableowner = current_user)
@@ -568,3 +573,14 @@ export async function logEvent(deviceId, event, detail) {
       [deviceId || null, event, detail ? JSON.stringify(detail) : null]);
   } catch (e) { /* logging must never break a request */ }
 }
+
+/* 4.71.0 — the database side of the Nexora AI day count (ai.js setUsageStore). One statement adds this question and
+   takes the HIGHER of the database's count and the service's memory (atLeast), so the two never undercount. */
+export const aiUsageStore = {
+  add: (company, day, atLeast) => q(`INSERT INTO ai_usage (company_id, day, n) VALUES ($1, $2, GREATEST($3::int, 1))
+      ON CONFLICT (company_id, day) DO UPDATE SET n = GREATEST(ai_usage.n + 1, EXCLUDED.n) RETURNING n`,
+    [String(company), String(day), Number(atLeast) || 1]).then((r) => (r && r[0] ? Number(r[0].n) : 0)),
+  back: (company, day) => q(`UPDATE ai_usage SET n = GREATEST(n - 1, 0) WHERE company_id = $1 AND day = $2`, [String(company), String(day)]),
+  get: (company, day) => q(`SELECT n FROM ai_usage WHERE company_id = $1 AND day = $2`, [String(company), String(day)])
+    .then((r) => (r && r[0] ? Number(r[0].n) : 0))
+};
