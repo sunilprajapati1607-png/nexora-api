@@ -40,7 +40,7 @@
  * configured, and never blocks a registration by being unreachable.
  */
 import { q, getSettings, logEvent } from './db.js';
-import { newLicenceKey, issueToken, describe, companyUsage } from './licence.js';
+import { newLicenceKey, issueToken, describe, companyUsage, deviceKeyHash, settleDeviceKey, deviceKeyRefused } from './licence.js';
 import { ensureAdmin } from './sync.js';
 import { hashPasscode, validPasscode, PASSCODE_MIN } from './passcode.js';
 import { validGstinShape, verifyGstin } from './gst.js';
@@ -61,13 +61,32 @@ export function normaliseMobile(raw) {
 export function remoteIp(request) {
   const h = request && request.headers;
   if (!h || typeof h.get !== 'function') return null;
-  /* Behind Render's proxy the real client is the FIRST address in
-     x-forwarded-for; server.js adds x-nexora-remote from the socket for
-     the case with no proxy at all. */
+  const clip = (v) => { const s = String(v || '').trim(); return s ? s.slice(0, 64) : null; };
+  /* 4.71.0 (audit) — WHICH ADDRESS CAN BE BELIEVED.
+     On Render the service sits behind Cloudflare (every answer carries
+     "server: cloudflare" and a CF-RAY). Cloudflare APPENDS the address that
+     connected to it to whatever x-forwarded-for the client already sent, so
+     the FIRST address there — what this read until now — is whatever the
+     client chose to write: a robot could pass every throttle (enquiries,
+     reports, the console key) simply by writing a new one each time.
+     cf-connecting-ip is written by Cloudflare itself for every request and
+     replaces any the client sent, so on Render that is the address. If it
+     is ever missing, the LAST x-forwarded-for address — the one added by the
+     proxy nearest the client — and then the socket.
+     Anywhere else (this machine, the test suites) there is no Cloudflare in
+     front, a cf-connecting-ip would be the client's own writing, and the
+     old reading stands: the first x-forwarded-for address, then the socket
+     address server.js puts in x-nexora-remote (which a client cannot set). */
+  if (process.env.RENDER) {
+    const cf = clip(h.get('cf-connecting-ip'));
+    if (cf) return cf;
+    const chain = String(h.get('x-forwarded-for') || '').split(',').map((s) => s.trim()).filter(Boolean);
+    if (chain.length) return clip(chain[chain.length - 1]);
+    return clip(h.get('x-nexora-remote'));
+  }
   const fwd = String(h.get('x-forwarded-for') || '').split(',')[0].trim();
   if (fwd) return fwd.slice(0, 64);
-  const direct = String(h.get('x-nexora-remote') || '').trim();
-  return direct ? direct.slice(0, 64) : null;
+  return clip(h.get('x-nexora-remote'));
 }
 
 function refuse(httpStatus, error, message, extra) {
@@ -177,14 +196,21 @@ export async function register(body, request) {
   if (!co) throw new Error('Could not allocate a licence key.');
 
   /* ---- this computer takes seat 1 ---------------------------------- */
+  /* C7 — holding this installation's device key (its sha256 only; licence.js), so that knowing this
+     computer's id is never enough to activate another machine as it */
+  const keyHash = deviceKeyHash(b.deviceKey);
   const lic = await q(
+    /* 4.71.0 — the company's first computer: approved as it registers (nobody else could approve it) */
     `INSERT INTO licences (device_id, device_name, company, email, state,
-                           trial_started_at, expires_at, app_version, last_seen_at, seen_count, company_id, seat_no)
-     VALUES ($1, $2, $3, $4, 'TRIAL', now(), $5::timestamptz, $6, now(), 1, $7, 1)
+                           trial_started_at, expires_at, app_version, last_seen_at, seen_count, company_id, seat_no,
+                           approved_at, approved_by, device_key_hash)
+     VALUES ($1, $2, $3, $4, 'TRIAL', now(), $5::timestamptz, $6, now(), 1, $7, 1, now(), 'registered the company', $8)
      ON CONFLICT (device_id) DO NOTHING
      RETURNING *`,
-    [deviceId, b.deviceName || null, company, email, co.expires_at, b.appVersion || null, co.id]);
+    [deviceId, b.deviceName || null, company, email, co.expires_at, b.appVersion || null, co.id, keyHash]);
   const row = lic.length ? lic[0] : (await q(`SELECT * FROM licences WHERE device_id = $1`, [deviceId]))[0];
+  /* C7 — a row that appeared between the check above and this insert is somebody else's unless it holds this key */
+  if (!lic.length && !(await settleDeviceKey(row, keyHash))) return deviceKeyRefused(deviceId, 'register', keyHash, row && row.company_id);
 
   /* ---- the first administrator, signed in ----------------------------- */
   const admin = await ensureAdmin(co.id, { name: adminName, pin: adminPin });

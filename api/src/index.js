@@ -12,11 +12,11 @@
  * may do. That is the difference between a trial you can move the PC's
  * date past and one you cannot.
  */
-import { ensureSchema, q } from './db.js';
-import { activate, authorise, touch, issueToken, reportUsage, companyUsage, describe } from './licence.js';
-import { runBom } from './engine.js';
-import { adminAuthorised, listLicences, licenceAction, companyAction, saveSettings, recentEvents, ADMIN_HTML } from './admin.js';
-import { login, listUsers, userAction, pull, push, describeUser, userCap, setCompanyPasscode, releaseSession, maxSeq, listDevices, deviceAction } from './sync.js';
+import { ensureSchema, q, dbAlive } from './db.js';
+import { activate, authorise, touch, issueToken, reportUsage, companyUsage, describe, tokenSecretOk, MISCONFIGURED } from './licence.js';
+import { runBom, missingRates } from './engine.js';
+import { adminGate, listLicences, licenceAction, companyAction, saveSettings, recentEvents, ADMIN_HTML } from './admin.js';
+import { login, listUsers, userAction, pull, push, describeUser, userCap, setCompanyPasscode, releaseSession, maxSeq, listDevices, deviceAction, canSeeCost, PRICE_MASTER } from './sync.js';
 import { waitFor, wakeCompany, wakeChat, endSessionOn, WAIT_MS } from './waiters.js';
 import { calcForm, calcWeigh, calcNumbers, enquiryNumber } from './weigh.js';
 import { quoteForm, quoteSheet } from './quoteSheet.js';
@@ -26,7 +26,7 @@ import { send as chatSend, since as chatSince, remove as chatRemove, clearBy as 
 import { ensureInkSchema, getModel, listModels, train as inkTrain, estimate as inkEstimate, reset as inkReset } from './inkstore.js';
 import { register, gstAction, remoteIp } from './register.js';
 import { listInquiries, inquiryAction, publicInquiry } from './inquiry.js';
-import { listFeedback, feedbackShot, feedbackAction, publicFeedback } from './feedback.js';
+import { listFeedback, feedbackShot, feedbackAction, publicFeedback, MAX_SHOT } from './feedback.js';
 import { latestRelease, listReleases, releaseAction } from './appupdate.js';
 import { logoResponse } from './brand.js';
 import { customerCheck, sourcesOf } from './marketing.js';
@@ -46,23 +46,43 @@ function json(body, status) {
     headers: Object.assign({ 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' }, CORS)
   });
 }
-/* 4.67.17 — "costs and prices (Rs)": the administrator, and whoever the administrator gave VIEW_COST (the same rule as the application) */
-function canSeeCost(u) {
-  if (!u) return false;
-  if (u.role === 'ADMIN') return true;
-  let p = u.permissions;
-  if (typeof p === 'string') { try { p = JSON.parse(p); } catch (e) { p = null; } }
-  return !!(p && typeof p === 'object' && p.VIEW_COST === true);
-}
+/* 4.67.17 — "costs and prices (Rs)": canSeeCost (sync.js since 4.71.0, where the price master is held back by the
+   same rule) */
 /* 4.67.18 — a company that has put its own Google Gemini key in Settings has its Nexora AI questions asked
    with it (aikey.js keeps it locked; ai.js never shows it) */
 async function runAi(a, fn) {
   const c = a && a.companyId ? await companyAi(a.companyId) : { key: '', limit: 0 };
   return aiWithKey(c.key, fn, c.limit);   /* 4.67.21 — and the company's day, set in the console */
 }
-async function readJson(request) {
+/* 4.71.0 (audit) — HOW MUCH ONE REQUEST MAY CARRY. server.js stops anything
+   over 64 MB before it is held; each route now has its own, far smaller,
+   limit, and a body over it is answered 413 { error: 'TOO_LARGE' } instead
+   of being read. The routes anyone can reach without a token — an
+   enquiry, registering, activating, signing in — carry a few fields and
+   get 256 KB. A problem report carries one picture of the screen, so it
+   gets what feedback.js allows a picture plus room for the words. A sync
+   push is up to 200 records (a calculation with its trace is ~50 KB) and
+   gets 32 MB; Nexora AI a minute of speech or a few photos (ai.js caps
+   those at 8 MB) and gets 12 MB; everything else 8 MB. */
+const KB = 1024, MB = 1024 * 1024;
+const BODY_LIMITS = { '/enquiry': 256 * KB, '/v1/register': 256 * KB, '/v1/activate': 256 * KB, '/v1/login': 256 * KB,
+  '/feedback': MAX_SHOT + 256 * KB, '/v1/sync/push': 32 * MB };
+function bodyLimit(path) {
+  if (BODY_LIMITS[path]) return BODY_LIMITS[path];
+  if (path.indexOf('/v1/ai/') === 0) return 12 * MB;
+  return 8 * MB;
+}
+const TOO_LARGE = { error: 'TOO_LARGE', message: 'That is too much to send at once.' };
+function tooLarge() { return Object.assign(new Error('too large'), { tooLarge: true }); }
+async function readJson(request, limit) {
+  const cap = limit || 8 * MB;
+  const said = parseInt(request.headers.get('content-length'), 10);
+  if (said > cap) throw tooLarge();
+  let buf;
+  try { buf = await request.arrayBuffer(); } catch (e) { return {}; }
+  if (buf.byteLength > cap) throw tooLarge();
   /* 4.67.17 — a body of null, a number or a list is read as an empty object, never a crash */
-  try { const v = await request.json(); return v && typeof v === 'object' && !Array.isArray(v) ? v : {}; } catch (e) { return {}; }
+  try { const v = JSON.parse(new TextDecoder().decode(buf)); return v && typeof v === 'object' && !Array.isArray(v) ? v : {}; } catch (e) { return {}; }
 }
 
 export default {
@@ -72,8 +92,14 @@ export default {
     const method = request.method.toUpperCase();
 
     if (method === 'OPTIONS') return new Response(null, { status: 204, headers: CORS });
+    const readBody = () => readJson(request, bodyLimit(path));
 
     try {
+      /* 4.71.0 (audit) — a body that says it is over the route's limit is refused before it is read */
+      if (method === 'POST' && parseInt(request.headers.get('content-length'), 10) > bodyLimit(path)) return json(TOO_LARGE, 413);
+      /* 4.71.0 (audit) — no token secret, no tokens: every route that issues or reads one says so plainly
+         (licence.js tokenSecretOk) instead of signing with an empty key */
+      if (path.indexOf('/v1/') === 0 && !tokenSecretOk()) return json(MISCONFIGURED, 503);
       /* ---- open ---------------------------------------------------- */
       /* 4.45.0 — a report from Help → Nexora Contact. Open, like an
          enquiry, so a machine that has not activated can still speak;
@@ -86,14 +112,23 @@ export default {
         if (request.headers.get('authorization')) {
           try { const a = await authorise(request); if (a && a.ok) auth = a; } catch (e) { auth = null; }
         }
-        const ip = request.headers.get('x-forwarded-for') || request.headers.get('cf-connecting-ip') || null;
-        const out = await publicFeedback(await readJson(request), ip ? String(ip).split(',')[0].trim() : null, auth);
+        /* 4.71.0 (audit) — the address Cloudflare saw, not one the sender wrote (register.js remoteIp) */
+        const out = await publicFeedback(await readBody(), remoteIp(request), auth);
         return json(out, out.ok ? 200 : (out.error === 'TOO_MANY' ? 429 : 400));
       }
       if (path === '/health' || path === '/') {
-        await ensureSchema();
+        /* 4.71.0 (audit) — and whether the DATABASE answers: a cheap SELECT 1 with a two-second limit of its
+           own. Until now /health said ok whenever this process was up, so a service that could reach no data
+           at all still looked healthy. 503 { ok: false, db: 'down' } when it cannot. */
+        let db = false;
+        try {
+          let t = null;
+          await Promise.race([ensureSchema(), new Promise((resolve, reject) => { t = setTimeout(() => reject(new Error('slow')), 15000); })]).finally(() => clearTimeout(t));
+          db = await dbAlive(2000);
+        } catch (e) { db = false; }
         /* ai: whether Nexora AI is switched on and which model — never the key */
-        return json({ ok: true, service: 'nexora-api', version: '1.0.0', time: new Date().toISOString(), ai: Object.assign(aiStatus(), { ownKeys: aiCanKeep() }) });   /* 4.67.18 — ownKeys: a company's own Gemini key can be kept here (never a key) */
+        const about = { service: 'nexora-api', version: '1.0.0', time: new Date().toISOString(), ai: Object.assign(aiStatus(), { ownKeys: aiCanKeep() }) };   /* 4.67.18 — ownKeys: a company's own Gemini key can be kept here (never a key) */
+        return db ? json(Object.assign({ ok: true, db: 'ok' }, about)) : json(Object.assign({ ok: false, db: 'down' }, about), 503);
       }
 
       /* 4.42.0 — the website's contact and demo forms. Open by necessity:
@@ -103,14 +138,14 @@ export default {
          learns nothing from the reply. */
       if (path === '/enquiry' && method === 'POST') {
         await ensureSchema();
-        const body = await readJson(request);
+        const body = await readBody();
         return json(await publicInquiry(body, remoteIp(request)));
       }
 
       /* ---- the app ------------------------------------------------- */
       if (path === '/v1/activate' && method === 'POST') {
         await ensureSchema();
-        const body = await readJson(request);
+        const body = await readBody();
         const out = await activate(body);
         return json(out.body, out.httpStatus);
       }
@@ -119,7 +154,7 @@ export default {
          until the owner licenses it in the console. */
       if (path === '/v1/register' && method === 'POST') {
         await ensureSchema();
-        const body = await readJson(request);
+        const body = await readBody();
         const out = await register(body, request);
         return json(out.body, out.httpStatus);
       }
@@ -128,7 +163,7 @@ export default {
         await ensureSchema();
         const a = await authorise(request);
         if (!a.ok) return json(a.error, a.httpStatus);
-        const body = await readJson(request);
+        const body = await readBody();
         await touch(a.row.device_id, body.appVersion);
 
         /* 4.3.0 — the heartbeat is where a machine reports what it has
@@ -162,7 +197,7 @@ export default {
         await ensureSchema();
         const a = await authorise(request);
         if (!a.ok) return json(a.error, a.httpStatus);
-        const body = await readJson(request);
+        const body = await readBody();
         const out = await login(a.companyId, body, a.row.device_id);
         if (out.httpStatus !== 200) return json(out.body, out.httpStatus);
         /* 4.66.6 — the machine this person left is told now, not at its
@@ -172,7 +207,9 @@ export default {
           endSessionOn(a.companyId, out.body.user.id, out.displacedDevice,
             { name: out.body.user.name, at: new Date().toISOString(), where: a.row.device_name || 'another computer' });
         }
-        return json({ token: issueToken(a.row, out.body.user.id), user: out.body.user, licence: a.licence,
+        /* 4.71.0 — an administrator who signs in on a computer that was waiting approves it (sync.js login) */
+        const lic = out.approvedNow && a.licence ? Object.assign({}, a.licence, { device: Object.assign({}, a.licence.device, { approved: true }) }) : a.licence;
+        return json({ token: issueToken(a.row, out.body.user.id), user: out.body.user, licence: lic,
           company: a.company ? { id: a.company.id, name: a.company.name } : null });
       }
       /* Nexora Mobile — the company's devices, and approving or removing a phone: the company's own
@@ -188,11 +225,13 @@ export default {
         await ensureSchema();
         const a = await authorise(request);
         if (!a.ok) return json(a.error, a.httpStatus);
-        if (!a.user || a.user.role !== 'ADMIN') return json({ error: 'ADMIN_ONLY', message: 'Only your Nexora administrator can approve or remove a phone.' }, 403);
-        const body = await readJson(request);
-        const out = await deviceAction(a.companyId, a.user.name, path.endsWith('approve') ? 'approve' : 'remove', body.deviceId);
+        if (!a.user || a.user.role !== 'ADMIN') return json({ error: 'ADMIN_ONLY', message: 'Only your Nexora administrator can approve or remove a phone or a computer.' }, 403);
+        const body = await readBody();
+        /* 4.71.0 — computers too: one that joined an existing company waits here as a phone does */
+        const out = await deviceAction(a.companyId, a.user.name, path.endsWith('approve') ? 'approve' : 'remove', body.deviceId, a.row.device_id);
         if (out.signedOut) {
-          try { endSessionOn(a.companyId, out.signedOut.id, out.deviceId, { name: out.signedOut.name, at: new Date().toISOString(), where: 'no other phone \u2014 the administrator removed this phone', signedOut: true }); } catch (e) { /* told at its next call */ }
+          const what = out.platform === 'mobile' ? 'phone' : 'computer';
+          try { endSessionOn(a.companyId, out.signedOut.id, out.deviceId, { name: out.signedOut.name, at: new Date().toISOString(), where: 'no other ' + what + ' \u2014 the administrator removed this ' + what, signedOut: true }); } catch (e) { /* told at its next call */ }
         }
         return json(out.body, out.httpStatus);
       }
@@ -215,7 +254,7 @@ export default {
         if (!a.ok) return json(a.error, a.httpStatus);
         /* 4.66.3 — and says nothing new in the room: the conversation can be read */
         if (!a.licence.canCalculate) return json({ error: 'LICENCE_REQUIRED', licence: a.licence, message: a.licence.message || 'This licence has ended — the conversation can be read, not written to.' }, 402);
-        const out = await chatSend(a.companyId, a.user, await readJson(request));
+        const out = await chatSend(a.companyId, a.user, await readBody());
         /* Nexora Mobile — the phones waiting on the company hear it at once */
         if (out.httpStatus === 200) wakeChat(a.companyId, a.row.device_id);
         return json(out.body, out.httpStatus);
@@ -224,7 +263,7 @@ export default {
         await ensureSchema();
         const a = await authorise(request);
         if (!a.ok) return json(a.error, a.httpStatus);
-        const b2 = await readJson(request);
+        const b2 = await readBody();
         const out = await chatRemove(a.companyId, a.user, b2 && b2.id);
         return json(out.body, out.httpStatus);
       }
@@ -233,7 +272,7 @@ export default {
         await ensureSchema();
         const a = await authorise(request);
         if (!a.ok) return json(a.error, a.httpStatus);
-        const b3 = await readJson(request);
+        const b3 = await readBody();
         const out = await chatClearBy(a.companyId, a.user, b3 && b3.userId);
         return json(out.body, out.httpStatus);
       }
@@ -246,8 +285,13 @@ export default {
            sign-in anywhere displaces nobody. Only if they are still bound
            to THIS machine: a person who has already moved on must not have
            their new session cleared by the old machine catching up. */
-        if (a.user) {
-          await releaseSession(a.user.id, a.row.device_id);
+        /* 4.71.0 (audit) — the person the TOKEN names, not only one authorise() still counted as signed in
+           here (somebody since switched off, say): whoever it is, a binding that is still this machine's is let
+           go, so a token left on a closed computer stops acting as them. The desktop sends this at start-up
+           when its last session was never ended. releaseSession touches only a binding to THIS machine. */
+        const leaving = a.user ? a.user.id : a.tokenUser;
+        if (leaving) {
+          await releaseSession(leaving, a.row.device_id);
         }
         return json({ token: issueToken(a.row, null), licence: a.licence });
       }
@@ -262,7 +306,7 @@ export default {
           const cap = await userCap(a.companyId);
           return json({ users: await listUsers(a.companyId), me: describeUser(a.user), maxUsers: cap.max, count: cap.count });
         }
-        const out = await userAction(a.companyId, a.user, await readJson(request));
+        const out = await userAction(a.companyId, a.user, await readBody());
         return json(out.body, out.httpStatus);
       }
       /* 4.42.0 — an administrator sets a new company passcode from inside
@@ -273,7 +317,7 @@ export default {
         const a = await authorise(request);
         if (!a.ok) return json(a.error, a.httpStatus);
         if (!a.user) return json({ error: 'SIGN_IN', message: 'Sign in to change the company passcode.' }, 401);
-        const out = await setCompanyPasscode(a.companyId, a.user, await readJson(request));
+        const out = await setCompanyPasscode(a.companyId, a.user, await readBody());
         return json(out.body, out.httpStatus);
       }
       if (path === '/v1/sync/pull' && method === 'GET') {
@@ -291,7 +335,7 @@ export default {
         /* 4.66.3 — a read-only company cannot push. A demo or licence that has ended is read-only on the service
            too: saved work still comes down (pull), nothing new goes up. */
         if (!a.licence.canCalculate) return json({ error: 'LICENCE_REQUIRED', licence: a.licence, message: a.licence.message || 'This licence has ended — saved work can be opened and printed, but nothing new is saved to the company.' }, 402);
-        const body = await readJson(request);
+        const body = await readBody();
         const pushed = await push(a.companyId, a.user, body.records);
         /* 4.66.6 — every other machine of the company pulls now */
         if (pushed && pushed.applied && pushed.applied.length) wakeCompany(a.companyId, a.row.device_id);
@@ -313,7 +357,7 @@ export default {
         const a = await authorise(request);
         if (!a.ok) return json(a.error, a.httpStatus);
         if (!a.user) return json({ error: 'SIGN_IN', message: 'Sign in to check a customer.' }, 401);
-        return json(await customerCheck(a.companyId, a.user, await readJson(request)));
+        return json(await customerCheck(a.companyId, a.user, await readBody()));
       }
       /* Nexora Mobile — a calculation made on the phone: the form (constructions and fields, the
          company's own), and the bag weighed by the desktop's own engine on the service (weigh.js).
@@ -332,7 +376,7 @@ export default {
         if (!a.ok) return json(a.error, a.httpStatus);
         if (!a.user) return json({ error: 'SIGN_IN', message: 'Sign in to make a calculation.' }, 401);
         if (!a.licence.canCalculate) return json({ error: 'LICENCE_REQUIRED', licence: a.licence, message: a.licence.message || 'This licence has ended — saved work can be opened, but new calculations need a licence.' }, 402);
-        const body = await readJson(request);
+        const body = await readBody();
         const out = await calcWeigh(a.companyId, body.calc);
         return json(out.body, out.httpStatus);
       }
@@ -352,7 +396,7 @@ export default {
         if (!a.ok) return json(a.error, a.httpStatus);
         if (!a.user) return json({ error: 'SIGN_IN', message: 'Sign in to make a quotation.' }, 401);
         if (!a.licence.canCalculate) return json({ error: 'LICENCE_REQUIRED', licence: a.licence, message: a.licence.message || 'This licence has ended — saved quotations can be opened, but new ones need a licence.' }, 402);
-        const body = await readJson(request);
+        const body = await readBody();
         const out = await quoteSheet(a.companyId, a.user, body.quote);
         return json(out.body, out.httpStatus);
       }
@@ -378,7 +422,7 @@ export default {
         const admin = a.user.role === 'ADMIN';
         if (method === 'GET') return json(Object.assign({ ok: true, admin: admin }, await aiKeyInfo(a.companyId)));
         if (!admin) return json({ error: 'ADMIN_ONLY', message: 'Only an administrator can change the Gemini key.' }, 403);
-        const body = await readJson(request);
+        const body = await readBody();
         if (body.action === 'remove') { await aiClearKey(a.companyId); return json(Object.assign({ ok: true, admin: true }, await aiKeyInfo(a.companyId))); }
         if (body.action !== 'set') return json({ error: 'BAD_ACTION', message: 'Say set or remove.' }, 400);
         if (!aiCanKeep()) return json({ error: 'AI_KEY_UNAVAILABLE', message: 'The Nexora service cannot keep a key just now — ask Nexora.' }, 503);
@@ -395,7 +439,7 @@ export default {
         const a = await authorise(request);
         if (!a.ok) return json(a.error, a.httpStatus);
         if (!a.user) return json({ error: 'SIGN_IN', message: 'Sign in to use Nexora AI.' }, 401);
-        const body = await readJson(request);
+        const body = await readBody();
         const out = await runAi(a, () => aiCheckBom(a.companyId || a.row.device_id, body.bom, pickLang(body.lang)));
         return json(out.body, out.httpStatus);
       }
@@ -405,7 +449,7 @@ export default {
         const a = await authorise(request);
         if (!a.ok) return json(a.error, a.httpStatus);
         if (!a.user) return json({ error: 'SIGN_IN', message: 'Sign in to use Nexora AI.' }, 401);
-        const body = await readJson(request);
+        const body = await readBody();
         const out = await runAi(a, () => aiEditBom(a.companyId || a.row.device_id, body.edit, pickLang(body.lang)));
         return json(out.body, out.httpStatus);
       }
@@ -414,7 +458,7 @@ export default {
         const a = await authorise(request);
         if (!a.ok) return json(a.error, a.httpStatus);
         if (!a.user) return json({ error: 'SIGN_IN', message: 'Sign in to use Nexora AI.' }, 401);
-        const body = await readJson(request);
+        const body = await readBody();
         const out = await runAi(a, () => aiQuoteLetter(a.companyId || a.row.device_id, body.quote, pickLang(body.lang)));
         return json(out.body, out.httpStatus);
       }
@@ -423,7 +467,7 @@ export default {
         const a = await authorise(request);
         if (!a.ok) return json(a.error, a.httpStatus);
         if (!a.user) return json({ error: 'SIGN_IN', message: 'Sign in to use Nexora AI.' }, 401);
-        const body = await readJson(request);
+        const body = await readBody();
         const out = await runAi(a, () => aiChat(a.companyId || a.row.device_id, body.chat, pickLang(body.lang)));
         return json(out.body, out.httpStatus);
       }
@@ -433,7 +477,7 @@ export default {
         const a = await authorise(request);
         if (!a.ok) return json(a.error, a.httpStatus);
         if (!a.user) return json({ error: 'SIGN_IN', message: 'Sign in to use Nexora AI.' }, 401);
-        const body = await readJson(request);
+        const body = await readBody();
         const out = await runAi(a, () => aiAssist(a.companyId || a.row.device_id, body.assist, pickLang(body.lang), undefined, { canCost: canSeeCost(a.user) }));
         return json(out.body, out.httpStatus);
       }
@@ -443,7 +487,7 @@ export default {
         const a = await authorise(request);
         if (!a.ok) return json(a.error, a.httpStatus);
         if (!a.user) return json({ error: 'SIGN_IN', message: 'Sign in to use Nexora AI.' }, 401);
-        const body = await readJson(request);
+        const body = await readBody();
         const out = await runAi(a, () => aiSpeak(a.companyId || a.row.device_id, body.speak, pickLang(body.lang)));
         return json(out.body, out.httpStatus);
       }
@@ -452,7 +496,7 @@ export default {
         const a = await authorise(request);
         if (!a.ok) return json(a.error, a.httpStatus);
         if (!a.user) return json({ error: 'SIGN_IN', message: 'Sign in to use Nexora AI.' }, 401);
-        const body = await readJson(request);
+        const body = await readBody();
         const out = await runAi(a, () => aiHelp(a.companyId || a.row.device_id, body.help, pickLang(body.lang)));
         return json(out.body, out.httpStatus);
       }
@@ -462,7 +506,7 @@ export default {
         const a = await authorise(request);
         if (!a.ok) return json(a.error, a.httpStatus);
         if (!a.user) return json({ error: 'SIGN_IN', message: 'Sign in to use Nexora AI.' }, 401);
-        const body = await readJson(request);
+        const body = await readBody();
         const out = await runAi(a, () => aiFillCalc(a.companyId || a.row.device_id, body.fill, pickLang(body.lang)));
         return json(out.body, out.httpStatus);
       }
@@ -472,7 +516,7 @@ export default {
         const a = await authorise(request);
         if (!a.ok) return json(a.error, a.httpStatus);
         if (!a.user) return json({ error: 'SIGN_IN', message: 'Sign in to use Nexora AI.' }, 401);
-        const body = await readJson(request);
+        const body = await readBody();
         const out = await runAi(a, () => aiPlanRoute(a.companyId || a.row.device_id, body.plan, pickLang(body.lang)));
         return json(out.body, out.httpStatus);
       }
@@ -527,15 +571,15 @@ export default {
           return json({ models: await listModels(companyId) });
         }
         if (path === '/v1/ink/predict' && method === 'POST') {
-          const out = await inkEstimate(companyId, await readJson(request));
+          const out = await inkEstimate(companyId, await readBody());
           return json(out.body, out.httpStatus);
         }
         if (path === '/v1/ink/train' && method === 'POST') {
-          const out = await inkTrain(companyId, userId, await readJson(request));
+          const out = await inkTrain(companyId, userId, await readBody());
           return json(out.body, out.httpStatus);
         }
         if (path === '/v1/ink/reset' && method === 'POST') {
-          const body = await readJson(request);
+          const body = await readBody();
           const out = await inkReset(companyId, body.substrate);
           return json(out.body, out.httpStatus);
         }
@@ -553,10 +597,23 @@ export default {
           return json({ error: 'LICENCE_REQUIRED', licence: a.licence, message: a.licence.message }, 402);
         }
 
-        const payload = await readJson(request);
+        const payload = await readBody();
+        /* 4.71.0 (audit, C2) — a person who may not see costs has no prices on their computer, so their rates
+           arrive empty: each one missing is taken from the company's own price master, by the desktop's own
+           rule (engine.js currentRateFrom). Read only when something is missing.
+           ONLY FOR A PERSON SIGNED IN HERE (a.user: active, and this machine holds their place). A token
+           with nobody on it is just a device id re-activated — and a device id is not a secret — so filling
+           for it handed the whole price list to anyone who had one. Nobody signed in: the payload's own
+           rates or none, as before 4.71.0. And a person who may not see costs gets the cost, not the rates
+           it was costed with (engine.js hideFilledRates). */
+        let book = null;
+        if (a.companyId && a.user && missingRates(payload).length) {
+          const pr = (await q(`SELECT body FROM sync_records WHERE company_id = $1 AND kind = 'master' AND id = $2 AND deleted = false`, [a.companyId, PRICE_MASTER]))[0];
+          book = pr && pr.body && typeof pr.body === 'object' ? pr.body : null;
+        }
         let out;
         try {
-          out = runBom(payload);
+          out = runBom(payload, book, { hideFilled: !!book && !canSeeCost(a.user) });
         } catch (e) {
           return json({ error: 'ENGINE_ERROR',
             message: 'The route could not be costed. ' + (e && e.message ? e.message : '') }, 400);
@@ -590,27 +647,30 @@ export default {
       }
       if (path.startsWith('/admin/api/')) {
         await ensureSchema();
-        if (!adminAuthorised(request)) return json({ error: 'UNAUTHORISED' }, 401);
+        /* 4.71.0 (audit) — compared in constant time, and five wrong keys from one address shut it out for
+           fifteen minutes (admin.js adminGate) */
+        const gate = await adminGate(request, remoteIp(request));
+        if (!gate.ok) return json(gate.body, gate.httpStatus);
 
         if (path === '/admin/api/licences' && method === 'GET') return json(await listLicences());
-        if (path === '/admin/api/licence' && method === 'POST') return json(await licenceAction(await readJson(request)));
-        if (path === '/admin/api/gst' && method === 'POST') { const out = await gstAction(await readJson(request)); return json(out.body, out.httpStatus); }
-        if (path === '/admin/api/company' && method === 'POST') return json(await companyAction(await readJson(request)));
-        if (path === '/admin/api/settings' && method === 'POST') return json(await saveSettings(await readJson(request)));
+        if (path === '/admin/api/licence' && method === 'POST') return json(await licenceAction(await readBody()));
+        if (path === '/admin/api/gst' && method === 'POST') { const out = await gstAction(await readBody()); return json(out.body, out.httpStatus); }
+        if (path === '/admin/api/company' && method === 'POST') return json(await companyAction(await readBody()));
+        if (path === '/admin/api/settings' && method === 'POST') return json(await saveSettings(await readBody()));
         if (path === '/admin/api/events' && method === 'GET') return json({ events: await recentEvents(url.searchParams.get('deviceId')) });
         /* 4.42.0 — enquiries: the leads, before they are customers. */
         if (path === '/admin/api/inquiries' && method === 'GET') return json(await listInquiries());
-        if (path === '/admin/api/inquiry' && method === 'POST') return json(await inquiryAction(await readJson(request)));
+        if (path === '/admin/api/inquiry' && method === 'POST') return json(await inquiryAction(await readBody()));
         /* 4.45.0 — feedback and problem reports from the application. */
         if (path === '/admin/api/feedback' && method === 'GET') return json(await listFeedback());
         if (path === '/admin/api/feedback/shot' && method === 'GET') return json(await feedbackShot(url.searchParams.get('id')));
-        if (path === '/admin/api/feedback' && method === 'POST') return json(await feedbackAction(await readJson(request)));
+        if (path === '/admin/api/feedback' && method === 'POST') return json(await feedbackAction(await readBody()));
         /* 4.47.1 — Nexora speaks in every plant's room. */
         if (path === '/admin/api/broadcast' && method === 'GET') return json(await listBroadcasts());
-        if (path === '/admin/api/broadcast' && method === 'POST') return json(await broadcastAction(await readJson(request)));
+        if (path === '/admin/api/broadcast' && method === 'POST') return json(await broadcastAction(await readBody()));
         /* 4.44.0 — the phone console's own releases. */
         if (path === '/admin/api/app' && method === 'GET') return json(await listReleases());
-        if (path === '/admin/api/app' && method === 'POST') return json(await releaseAction(await readJson(request)));
+        if (path === '/admin/api/app' && method === 'POST') return json(await releaseAction(await readBody()));
         /* What a phone asks on every check. Behind the admin key like
            everything else here: only the owner runs this application, and
            an unlisted build is not an advertisement. */
@@ -620,6 +680,8 @@ export default {
 
       return json({ error: 'NOT_FOUND', path }, 404);
     } catch (e) {
+      if (e && e.tooLarge) return json(TOO_LARGE, 413);
+      if (e && e.misconfigured) return json(MISCONFIGURED, 503);
       /* Rule #35: an error a person can read, and never a bare 500. */
       return json({
         error: 'SERVER_ERROR',

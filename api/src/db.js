@@ -35,7 +35,11 @@ export async function moveExpiriesToEndOfDay() {
 
 export function ensureSchema() {
   if (ready) return ready;
-  ready = (async () => {
+  /* 4.71.0 (audit) — a failed bootstrap is not remembered. The promise used
+     to be kept whatever it settled to, so one cold start that met the
+     database down (Supabase restarting, a network blip) left every request
+     failing until the service itself was restarted. */
+  const attempt = (async () => {
     await q(`
       CREATE TABLE IF NOT EXISTS licences (
         device_id        TEXT PRIMARY KEY,
@@ -436,9 +440,88 @@ export function ensureSchema() {
                ('demo_signup', 'no'),
                ('session_minutes', '30')
              ON CONFLICT (key) DO NOTHING`);
+
+    /* ---- 4.71.0 (audit, owner 2026-10-01) ------------------------------ */
+    /* Three wrong PINs lock the person for fifteen minutes; three wrong
+       passcodes lock the company's join the same way (lockout.js). */
+    await q(`ALTER TABLE company_users ADD COLUMN IF NOT EXISTS pin_fails INTEGER NOT NULL DEFAULT 0`);
+    await q(`ALTER TABLE company_users ADD COLUMN IF NOT EXISTS pin_locked_until TIMESTAMPTZ`);
+    await q(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS passcode_fails INTEGER NOT NULL DEFAULT 0`);
+    await q(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS passcode_locked_until TIMESTAMPTZ`);
+
+    /* A COMPUTER WAITS FOR ITS ADMINISTRATOR, AS A PHONE DOES.
+       A second computer joining an existing company (its licence key, or its
+       company id and passcode) is now created unapproved — approved_at,
+       the phone's own column. Every computer that existed before this
+       release was working, so each is approved ONCE, here; the settings row
+       says it was done, so a computer that joins afterwards and is waiting
+       is never approved by a later cold start. */
+    const pcDone = await q(`SELECT 1 FROM settings WHERE key = 'pc_approval_v1'`);
+    if (!pcDone.length) {
+      await q(`UPDATE licences SET approved_at = now(), approved_by = 'Nexora (before computer approval)'
+                WHERE (platform IS NULL OR platform <> 'mobile') AND approved_at IS NULL`);
+      await q(`INSERT INTO settings (key, value) VALUES ('pc_approval_v1', $1) ON CONFLICT (key) DO NOTHING`, [new Date().toISOString()]);
+    }
+    /* WHO WITHDREW A MACHINE. 'COMPANY' — its own administrator removed it
+       (/v1/devices/remove), and may bring it back (/v1/devices/approve);
+       'NEXORA' — the console revoked it, and only the console restores it.
+       Without this a company administrator could undo Nexora's revoke of a
+       computer through the phones' approve. NULL on a row revoked before
+       this column existed: before 4.71.0 only the console could revoke a
+       computer, so sync.js deviceAction reads a NULL computer as Nexora's. */
+    await q(`ALTER TABLE licences ADD COLUMN IF NOT EXISTS revoked_by TEXT`);
+    /* C7 — THE DEVICE KEY (owner 2026-10-01: "દરેક PC/phone ને ગુપ્ત key").
+       A device id is not a secret — it is in the console and in reports —
+       so knowing an approved computer's id was enough to activate another
+       machine AS it and be handed its token. Each installation now makes one
+       random key of its own and sends it whenever it joins or re-joins; only
+       its sha256 is kept, here, and it is never listed or returned by any
+       route (licence.js deviceKeyHash). NULL on every row made before this
+       release: such a row takes the first key it is shown (licence.js
+       activate), and one that is removed or revoked is cleared back to NULL. */
+    await q(`ALTER TABLE licences ADD COLUMN IF NOT EXISTS device_key_hash TEXT`);
+
+    /* Row level security on the tables the service alone reads. The service
+       connects as their OWNER, and an owner is not held by row level
+       security, so its own queries are unchanged; anything else that can
+       reach the database (Supabase's public API among them) is shut out.
+       Only a table this connection owns is touched — ALTER TABLE on
+       somebody else's table would fail, and a failed bootstrap stops the
+       whole service — and a failure here is never allowed to stop it. */
+    for (const t of ['chat_messages', 'feedback', 'inquiries', 'app_releases']) {
+      try {
+        await q(`DO $rls$ BEGIN
+                   IF EXISTS (SELECT 1 FROM pg_tables WHERE schemaname = current_schema() AND tablename = '${t}' AND tableowner = current_user)
+                      AND NOT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                                       WHERE n.nspname = current_schema() AND c.relname = '${t}' AND c.relrowsecurity) THEN
+                     EXECUTE 'ALTER TABLE ${t} ENABLE ROW LEVEL SECURITY';
+                   END IF;
+                 END $rls$`);
+      } catch (e) { /* the service runs on without it; the owner sees it in Supabase's advisor */ }
+    }
     return true;
   })();
-  return ready;
+  ready = attempt;
+  attempt.catch(() => { if (ready === attempt) ready = null; });
+  return attempt;
+}
+
+/** 4.71.0 (audit) — /health: can the database answer at all? One SELECT 1
+ *  with a short limit of its own, so a database that has stopped answering
+ *  makes /health say so in two seconds instead of hanging with it. */
+export async function dbAlive(ms) {
+  let timer = null;
+  try {
+    const out = await Promise.race([
+      q('SELECT 1 AS ok').then(() => true),
+      new Promise((resolve) => { timer = setTimeout(() => resolve(false), ms || 2000); })
+    ]);
+    return out === true;
+  } catch (e) {
+    return false;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 /* 2026-10-01 — the settings are read on nearly every request (24,000 reads

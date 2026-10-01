@@ -62,7 +62,7 @@ createServer(async (req, res) => {
   } catch (e) {
     if (e && e.tooBig) {
       res.writeHead(413, { 'content-type': 'application/json', connection: 'close' });
-      res.end(JSON.stringify({ error: 'TOO_BIG', message: 'That is too much to send at once.' }));
+      res.end(JSON.stringify({ error: 'TOO_LARGE', message: 'That is too much to send at once.' }));   /* 4.71.0 — the name every route answers with */
       try { req.destroy(); } catch (x) { /* gone */ }
       return;
     }

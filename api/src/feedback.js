@@ -25,7 +25,7 @@ export const STATES = ['NEW', 'SEEN', 'FIXED', 'CLOSED'];
 
 /* A 1400px-wide JPEG of a busy screen is 150–350 KB as base64; this is
    room for a large one and a wall against a 30 MB bitmap. */
-const MAX_SHOT = 2500000;
+export const MAX_SHOT = 2500000;
 
 function clean(v, max) {
   if (v === null || v === undefined) return null;

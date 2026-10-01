@@ -22,7 +22,12 @@
   function itemTotals(item, calc) {
     const rate = Number(item.rate) || 0;
     const qty = Number(item.quantity) || 0;
-    const grams = item.calcId && calc && calc.result ? (Number(calc.result.netWeight) || 0)
+    /* 4.71.0 (audit) — a saved quotation keeps the weight it was quoted at (gramsAtQuote): the calculation edited
+       later must not change an amount the buyer already has on paper. Rows saved before 4.71.0 have none and read
+       the calculation as before. */
+    const frozen = qnum(item.gramsAtQuote);
+    const grams = frozen !== null && frozen > 0 ? frozen
+      : item.calcId && calc && calc.result ? (Number(calc.result.netWeight) || 0)
       : (qnum(parseFloat(String((item.text && item.text.weight) || ''))) || 0);
     const kg = (grams * qty) / 1000;
     let amount = 0;

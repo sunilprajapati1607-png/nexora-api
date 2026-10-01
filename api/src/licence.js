@@ -21,12 +21,29 @@
  * lived on purpose — a stolen token is worth 24 hours, and every call that
  * matters re-reads the licence row anyway.
  */
-import { createHmac, timingSafeEqual, randomInt } from 'node:crypto';
+import { createHmac, createHash, timingSafeEqual, randomInt } from 'node:crypto';
 import { q, getSettings, logEvent } from './db.js';
 import { cleanPlan, featuresFor } from './plans.js';
 
 const SECRET = process.env.NEXORA_TOKEN_SECRET || '';
 const TOKEN_TTL_SEC = 24 * 60 * 60;
+/* 4.71.0 (audit) — FAIL CLOSED. With NEXORA_TOKEN_SECRET missing the
+   tokens used to be signed with an EMPTY key, and anybody who knew that
+   could write themselves one. A secret that is missing or shorter than
+   sixteen characters now signs nothing and accepts nothing: every route
+   that needs a token answers 503 SERVICE_MISCONFIGURED until it is set
+   on Render.
+   (Lead's change before release: only a MISSING secret refuses. A short
+   one still works — the live service's secret length cannot be read from
+   here, and refusing it would stop every plant on the deploy — but it is
+   reported loudly on every start so it gets lengthened on Render.) */
+export const TOKEN_SECRET_MIN = 16;
+export function tokenSecretOk() { return SECRET.length > 0; }
+if (SECRET.length > 0 && SECRET.length < TOKEN_SECRET_MIN) {
+  console.error('[nexora] NEXORA_TOKEN_SECRET is shorter than ' + TOKEN_SECRET_MIN + ' characters — lengthen it on Render (tokens stay valid until then)');
+}
+export const MISCONFIGURED = { error: 'SERVICE_MISCONFIGURED',
+  message: 'The Nexora service is not set up correctly just now. Your work is safe on this computer — Nexora has been told; try again later.' };
 
 /* ---- licence keys ----------------------------------------------------
    NEX-4K2M-9QTX-7BWH. Read over the phone, typed by a plant clerk, so the
@@ -66,6 +83,7 @@ function unb64u(s) {
   return Buffer.from(String(s).replace(/-/g, '+').replace(/_/g, '/'), 'base64');
 }
 function sign(payloadB64) {
+  if (!tokenSecretOk()) throw Object.assign(new Error('NEXORA_TOKEN_SECRET is not set'), { misconfigured: true });
   return b64u(createHmac('sha256', SECRET).update(payloadB64).digest());
 }
 
@@ -83,6 +101,7 @@ export function issueToken(lic, userId) {
 }
 
 export function readToken(token) {
+  if (!tokenSecretOk()) return null;
   if (!token || typeof token !== 'string' || token.indexOf('.') < 0) return null;
   const [p, sig] = token.split('.');
   if (!p || !sig) return null;
@@ -229,10 +248,14 @@ async function adoptOrphan(row) {
     await q(`UPDATE companies SET state = 'LICENSED', is_demo = false WHERE id = $1`, [co.id]);
     co.state = 'LICENSED'; co.is_demo = false;
   }
-  await q(`UPDATE licences SET company_id = $2, seat_no = 1 WHERE device_id = $1`, [row.device_id, co.id]);
+  /* 4.71.0 — the only computer of the company just made for it: nobody else could approve it */
+  await q(`UPDATE licences SET company_id = $2, seat_no = 1,
+                               approved_at = CASE WHEN platform = 'mobile' THEN approved_at ELSE COALESCE(approved_at, now()) END
+            WHERE device_id = $1`, [row.device_id, co.id]);
   await logEvent(row.device_id, 'COMPANY_BACKFILL', { companyId: co.id, key: co.licence_key });
   row.company_id = co.id;
   row.seat_no = 1;
+  if (row.platform !== 'mobile' && !row.approved_at) row.approved_at = new Date();
   return co;
 }
 
@@ -363,8 +386,18 @@ function describeState(row, company, settings) {
     ? Math.max(0, istDay(new Date(expiresAt).getTime()) - istDay(new Date(startedAt).getTime()))
     : null;
   const base = { expiresAt, startedAt, periodDays, offlineMinutes, company: profile,
-    /* Nexora Mobile — what this installation is, and whether a phone has been approved */
-    device: { platform: row.platform === 'mobile' ? 'mobile' : 'desktop', approved: row.platform === 'mobile' ? !!row.approved_at : true } };
+    /* Nexora Mobile — what this installation is, and whether a phone has been approved.
+       4.71.0 — a computer too: one that joined an existing company waits for its administrator. */
+    device: { platform: row.platform === 'mobile' ? 'mobile' : 'desktop', approved: !!row.approved_at } };
+  /* C7 — whether this installation's row holds a device key yet: a yes or a no, never the hash. A row
+     takes the first key it is shown, and a running app shows its key only when it joins — which one in
+     daily use may not do for months (its heartbeat keeps its token fresh). So every computer and phone
+     from before 4.71.0, and every one the console restored (its key was let go when it was revoked),
+     would sit with no key, and whoever knew its id could hand it one first. Told keyHeld === false at
+     its heartbeat, the app joins quietly once (/v1/activate { deviceId, deviceKey, rejoinOnly: true })
+     and its row takes its own key. Left out on a withdrawn row: that takes no key whatever is sent
+     (settleDeviceKey), so there is nothing for the app to do but be let back in. */
+  if (row.state !== 'REVOKED') base.device.keyHeld = !!row.device_key_hash;
 
   /* Order matters: the narrowest refusal is checked first, so a revoked
      device inside a healthy company is still refused. */
@@ -406,15 +439,140 @@ function describeState(row, company, settings) {
 
 /* ---- activation ----------------------------------------------------- */
 import { passcodeMatches } from './passcode.js';
+import { takeAttempt, failedAttempt, clearAttempts, strangerAttempt, lockedBody } from './lockout.js';
 const DEVICE_RE = /^[a-f0-9]{16,64}$/i;
 
-export async function activate({ deviceId, deviceName, company, email, appVersion, licenceKey, loginId, passcode, platform }) {
+/** 4.71.0 — does this company already have a working computer its administrator let in? */
+async function hasApprovedPc(companyId, exceptDevice) {
+  const rows = await q(`SELECT 1 FROM licences
+                         WHERE company_id = $1 AND device_id <> $2 AND (platform IS NULL OR platform <> 'mobile')
+                           AND approved_at IS NOT NULL AND state <> 'REVOKED' LIMIT 1`, [companyId, String(exceptDevice || '')]);
+  return rows.length > 0;
+}
+
+/** 4.71.0 (audit) — the refusal a computer that is waiting for its administrator gets on every call but the
+ *  heartbeat, sign-out and sign-in: the phone's own (PHONE_PENDING, 403), so one answer means "ask your
+ *  administrator" on both; `platform` says which. */
+export const PC_PENDING = { error: 'PHONE_PENDING', platform: 'desktop', pending: true,
+  message: 'Your Nexora administrator has to approve this computer first — ask them to approve it in Settings → Users → Devices, or to sign in on it once.' };
+
+/** 4.71.0 (audit) — a machine the Nexora console revoked (admin.js 'revoke'). Only the console restores it:
+ *  until now /v1/devices/approve turned ANY revoked row back to TRIAL, so once computers were let through
+ *  there a company administrator could undo Nexora's withdrawal of one. A row revoked before revoked_by
+ *  existed says nothing: a computer then could only have been revoked by the console (that route refused
+ *  computers), so it is Nexora's; a phone could have been either, and keeps what it always had.
+ *  (Kept here rather than in sync.js since C7: activate reads it too, and sync.js already imports from here.) */
+export function revokedByNexora(d) {
+  if (!d || d.state !== 'REVOKED') return false;
+  if (d.revoked_by) return d.revoked_by === 'NEXORA';
+  return d.platform !== 'mobile';
+}
+
+/* ---- C7 — THE DEVICE KEY (owner 2026-10-01) ----------------------------
+     "દરેક PC/phone ને ગુપ્ત key"
+   A device id is not a secret: it is in the console, in a report, on a
+   screen somebody photographed. Until now knowing an approved computer's
+   id was enough to activate ANOTHER machine as that computer and be handed
+   its token. So every installation makes one random key of its own (32
+   bytes from a cryptographic generator, 64 hex characters), keeps it, never
+   shows it, and sends it with every join and re-join (/v1/activate,
+   /v1/register). The service keeps only sha256 of it (device_key_hash),
+   which no route ever lists or returns.
+
+     a new row                         takes the key it was made with
+     a row with no key yet             takes the first key it is shown — every
+       (made before this release)      row from before 4.71.0, until its app
+                                       upgrades; no key and none sent is let
+                                       through as before
+     a row with a key                  the key sent must be that one; a wrong
+                                       key, or none, is DEVICE_KEY_MISMATCH
+     removed by the company            the key is cleared, and the machine that
+       (/v1/devices/remove)            joins again with the company's licence
+                                       key or id + passcode is a NEW device:
+                                       waiting for the administrator, holding
+                                       its own new key — the ONLY way back:
+                                       the administrator cannot approve a
+                                       removed one back (409 REJOIN_NEEDED,
+                                       sync.js), which would leave it live
+                                       with no key
+     revoked by Nexora (console)       the key is cleared; the machine stays
+                                       refused until the console restores it
+
+   Only joining is guarded. A token, the heartbeat, signing in — none of
+   them carries the key or is changed by it: a token is already proof that
+   this installation joined. But the licence every one of them is told says
+   whether the row holds a key yet (licence.device.keyHeld, yes or no, never
+   the hash), so a running app whose row has none — from before 4.71.0, or
+   restored by the console — joins quietly once and its row takes its key. */
+const DEVICE_KEY_RE = /^[0-9a-f]{64}$/;
+export const DEVICE_KEY_MISMATCH = { error: 'DEVICE_KEY_MISMATCH',
+  message: 'This computer or phone does not match the one your company approved. Ask your administrator to remove it under Settings → Users & access → Computers & phones, then join again.' };
+
+/** The key an installation sent, as read here: its 64 hex characters, or '' for none. An older app sends
+ *  none; anything not of that shape cannot have been made by a Nexora app and is read as none too — which
+ *  a row that holds a key refuses exactly as it refuses a wrong one. */
+function cleanDeviceKey(raw) {
+  const s = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
+  return DEVICE_KEY_RE.test(s) ? s : '';
+}
+/** What is kept: sha256 of the key (hex), never the key. null when none was sent. */
+export function deviceKeyHash(raw) {
+  const k = cleanDeviceKey(raw);
+  return k ? createHash('sha256').update(k, 'utf8').digest('hex') : null;
+}
+/** Constant time over the two hashes. A row that holds no key matches anything (see the table above). */
+function deviceKeyMatches(heldHash, sentHash) {
+  if (!heldHash) return true;
+  if (!sentHash) return false;
+  const a = Buffer.from(String(heldHash), 'utf8');
+  const b = Buffer.from(String(sentHash), 'utf8');
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+/** The refusal, logged — whether a key came at all, never any of it. */
+export async function deviceKeyRefused(deviceId, via, sentHash, companyId) {
+  await logEvent(deviceId, 'DEVICE_KEY_MISMATCH', { via, keySent: !!sentHash, companyId: companyId || null });
+  return { httpStatus: 401, body: Object.assign({}, DEVICE_KEY_MISMATCH) };
+}
+/** The last word on `row`'s key before a token is issued for it: a row with no key takes the one sent, and
+ *  then what the row holds must match what was sent. Both halves are read from the DATABASE, never from
+ *  the copy of the row the caller holds — that copy may be a moment old, and two installations racing for
+ *  one row (two re-joins of a removed machine, two first launches) would each find their own key in their
+ *  own copy and both be handed a token. Here the take is one conditional UPDATE (the second to arrive
+ *  waits on the first's row lock and then finds the key taken), and the comparison is against what the
+ *  row holds after it: the loser finds the winner's key and is refused. A WITHDRAWN row takes no key: it
+ *  stays withdrawn whatever is sent, and taking one would only let whoever knew its id shut out the real
+ *  machine when its company lets it join again. `row.device_key_hash` is brought up to date for the
+ *  caller (describe reads it). */
+export async function settleDeviceKey(row, sentHash) {
+  if (!row || !row.device_id) return false;
+  if (sentHash) {
+    await q(`UPDATE licences SET device_key_hash = $2
+              WHERE device_id = $1 AND device_key_hash IS NULL AND state <> 'REVOKED'`, [row.device_id, sentHash]);
+  }
+  const now = (await q(`SELECT device_key_hash FROM licences WHERE device_id = $1`, [row.device_id]))[0];
+  if (!now) return false;
+  row.device_key_hash = now.device_key_hash || null;
+  return deviceKeyMatches(row.device_key_hash, sentHash);
+}
+
+export async function activate({ deviceId, deviceName, company, email, appVersion, licenceKey, loginId, passcode, platform, rejoinOnly, deviceKey }) {
   const phone = String(platform || '').toLowerCase() === 'mobile';
   if (!DEVICE_RE.test(String(deviceId || ''))) {
     return { httpStatus: 400, body: { error: 'BAD_DEVICE_ID',
       message: 'This installation could not identify the computer it is running on.' } };
   }
   const settings = await getSettings();
+
+  /* C7 — THE DEVICE KEY FIRST. A machine whose row holds a key and that does
+     not send it is refused before anything else is looked at: before a
+     licence key or a passcode is tried (so nobody spends a company's
+     passcode tries through somebody else's device id), and before a phone's
+     company is looked up from its row (whose refusals name the company). */
+  const sentKeyHash = deviceKeyHash(deviceKey);
+  const held = (await q(`SELECT device_key_hash, company_id FROM licences WHERE device_id = $1`, [deviceId]))[0];
+  if (held && !deviceKeyMatches(held.device_key_hash, sentKeyHash)) {
+    return deviceKeyRefused(deviceId, 'activate', sentKeyHash, held.company_id);
+  }
 
   /* A key was typed. Resolve it BEFORE anything else, so a wrong key is a
      clear refusal rather than a silent demo. */
@@ -446,17 +604,43 @@ export async function activate({ deviceId, deviceName, company, email, appVersio
   const lid = String(loginId || '').trim().toLowerCase();
   if (!keyed && lid) {
     const found = await q(`SELECT * FROM companies WHERE login_id = $1`, [lid]);
-    if (!found.length || !passcodeMatches(passcode, found[0].passcode_hash)) {
+    const badPasscode = { httpStatus: 401, body: { error: 'BAD_PASSCODE',
+      message: 'That company id and passcode do not match. Check them with the person who registered your company.' } };
+    /* 4.71.0 (audit) — three wrong passcodes and the company's join is shut
+       for fifteen minutes, the right passcode included (lockout.js). An id
+       that does not exist is counted too, so the lock never tells a
+       stranger which ids are real. */
+    if (!found.length) {
       await logEvent(deviceId, 'PASSCODE_REJECTED', { loginId: lid });
-      return { httpStatus: 401, body: { error: 'BAD_PASSCODE',
-        message: 'That company id and passcode do not match. Check them with the person who registered your company.' } };
+      const s = strangerAttempt('passcode|' + lid);
+      return s.locked ? { httpStatus: 423, body: lockedBody('passcode', s.retryAfter) } : badPasscode;
     }
+    const turn = await takeAttempt('passcode', found[0].id);
+    if (!turn.ok) {
+      await logEvent(deviceId, 'PASSCODE_LOCKED', { loginId: lid, companyId: found[0].id });
+      return { httpStatus: 423, body: lockedBody('passcode', turn.retryAfter) };
+    }
+    if (!passcodeMatches(passcode, found[0].passcode_hash)) {
+      await logEvent(deviceId, 'PASSCODE_REJECTED', { loginId: lid });
+      const lockedFor = await failedAttempt('passcode', found[0].id, turn.tries);
+      if (lockedFor) {
+        await logEvent(deviceId, 'PASSCODE_LOCKED', { loginId: lid, companyId: found[0].id });
+        return { httpStatus: 423, body: lockedBody('passcode', lockedFor) };
+      }
+      return badPasscode;
+    }
+    await clearAttempts('passcode', found[0].id);
     keyed = found[0];
     if (keyed.state === 'SUSPENDED') {
       return { httpStatus: 403, body: { error: 'COMPANY_SUSPENDED',
         message: 'The licence for ' + keyed.name + ' has been suspended. Contact Nexora to restore it.' } };
     }
   }
+
+  /* C7 — the company whose licence key, or id and passcode, was actually TYPED. A phone below also finds
+     its company from its own row when nothing was typed; that is not a credential, and only a credential
+     lets a machine its company removed join again. */
+  const typedCo = keyed;
 
   /* Nexora Mobile — a phone joins a company that already exists (its licence key, or its company id
      and passcode), never makes a demo of its own, and only on a plan that carries Nexora Mobile */
@@ -481,6 +665,76 @@ export async function activate({ deviceId, deviceName, company, email, appVersio
     /* THE REINSTALL RULE. The row already exists, so the original expiry
        stands. Details are refreshed; the clock is not. */
     const row = existing[0];
+    /* 4.71.0 (audit) — A MACHINE ON ANOTHER COMPANY STAYS THERE.
+       A device id is not a secret — it is in the console, in a report, on
+       a screen somebody photographed — and until now typing any company's
+       key with it MOVED that machine into the company whose key was typed:
+       a stranger's licence key and a plant's device id were enough to pull
+       the plant's computer, and whatever it then saved, into the stranger's
+       company. A machine that belongs to a company leaves it only once that
+       company (its administrator, or Nexora) has removed it — REVOKED. */
+    if (keyed && row.company_id && Number(row.company_id) !== Number(keyed.id) && row.state !== 'REVOKED') {
+      await logEvent(deviceId, 'MOVE_REFUSED', { from: row.company_id, to: keyed.id });
+      return { httpStatus: 409, body: { error: 'DEVICE_IN_OTHER_COMPANY',
+        message: 'This ' + (phone ? 'phone' : 'computer') + ' is already on another company’s Nexora licence. ' +
+                 'Ask that company’s administrator (or Nexora) to remove it there first, then try again.' } };
+    }
+    /* C7 — A MACHINE ITS COMPANY REMOVED, JOINING THAT COMPANY AGAIN with its licence key or its id and
+       passcode, is a NEW device: waiting for the administrator (never approved here, not even as the only
+       computer — an administrator who signs in on it approves it), holding the key it sent now. Its old key
+       was cleared when it was removed, which is how a reinstalled machine that lost its key gets back in:
+       "ask your administrator to remove it, then join again". One Nexora revoked stays refused (as before);
+       only the console gives that back.
+       Only the request that actually turns the row from REVOKED wins it: the UPDATE is conditional on that
+       (and on the row still being this company's, and not Nexora's) and says whether it changed a row. Two
+       re-joins of the same removed machine both read REVOKED a moment ago; the second's UPDATE finds the
+       row already taken, changes nothing, and the key check below refuses it unless it holds the very key
+       the first one set — before it has written anything. */
+    if (typedCo && row.state === 'REVOKED' && row.company_id && Number(row.company_id) === Number(typedCo.id) && !revokedByNexora(row)) {
+      const won = await q(`UPDATE licences SET state = 'TRIAL', approved_at = NULL, approved_by = NULL, revoked_by = NULL,
+                                               device_key_hash = $2
+                            WHERE device_id = $1 AND state = 'REVOKED' AND company_id = $3
+                              AND revoked_by IS DISTINCT FROM 'NEXORA'
+                        RETURNING device_id`, [deviceId, sentKeyHash, typedCo.id]);
+      if (won.length) await logEvent(deviceId, 'REJOIN_PENDING', { companyId: typedCo.id, platform: phone ? 'mobile' : 'desktop', keySent: !!sentKeyHash });
+    }
+
+    /* C7 — THE KEY IS SETTLED BEFORE ANYTHING ELSE IS WRITTEN: a row with no key yet takes this one, and the
+       row, as the database holds it now, must hold the key sent. A request refused here has changed nothing
+       — not the machine's name or company details, not a computer turned into a phone (which takes its
+       approval), not its company. (The check at the top already refused a plain wrong key; this one catches
+       whoever lost a race for the row since.) */
+    if (!(await settleDeviceKey(row, sentKeyHash))) return deviceKeyRefused(deviceId, 'activate', sentKeyHash, row.company_id);
+    let row2 = (await q(`SELECT * FROM licences WHERE device_id = $1`, [deviceId]))[0];
+
+    /* MOVING A MACHINE ONTO A REAL LICENCE. A demo user who buys types the
+       key into the same installation — it must take a seat in the real
+       company and keep everything it already has. Seats are checked here
+       too, or a customer with 5 seats could quietly activate 50. */
+    if (keyed && Number(row2.company_id) !== Number(keyed.id)) {
+      /* 4.42.0 — no seat check here any more: the machine takes no seat.
+         What it can DO is decided when a person signs in on it, and that
+         is where the count is kept (sync.js userCap). */
+      const seat = phone ? null : await nextComputerNo(keyed.id);
+      /* 4.71.0 — an approval given by the company it left does not come along: a computer waits for this
+         company's administrator, unless it is the company's first */
+      const firstPc = !phone && !(await hasApprovedPc(keyed.id, deviceId));
+      /* C7 — and it carries the key it sent into its new company (a removed or revoked machine's was
+         cleared; a row with none yet takes it; one it already held was checked above). Only while the row
+         still holds no key or this one: a machine that raced this request onto the row with a key of its
+         own keeps it, and this request is refused having moved nothing. */
+      const moved = await q(`UPDATE licences SET company_id = $2, seat_no = $3, state = 'TRIAL',
+                                   approved_at = CASE WHEN $4::bool THEN now() ELSE NULL END,
+                                   approved_by = CASE WHEN $4::bool THEN 'first computer of the company' ELSE NULL END,
+                                   revoked_by = NULL,
+                                   device_key_hash = COALESCE(device_key_hash, $5)
+                WHERE device_id = $1 AND (device_key_hash IS NULL OR device_key_hash = $5)
+            RETURNING device_id`,
+        [deviceId, keyed.id, seat, firstPc, sentKeyHash]);
+      if (!moved.length) return deviceKeyRefused(deviceId, 'activate', sentKeyHash, row2.company_id);
+      await logEvent(deviceId, 'JOIN_COMPANY', { companyId: keyed.id, seat, from: row2.company_id || null, approved: firstPc });
+    }
+
     await q(`UPDATE licences
                SET last_seen_at = now(), seen_count = seen_count + 1,
                    app_version  = COALESCE($2, app_version),
@@ -489,26 +743,11 @@ export async function activate({ deviceId, deviceName, company, email, appVersio
                    email        = COALESCE(NULLIF($5,''), email)
              WHERE device_id = $1`,
       [deviceId, appVersion || null, deviceName || '', company || '', email || '']);
-    let row2 = (await q(`SELECT * FROM licences WHERE device_id = $1`, [deviceId]))[0];
-
-    /* MOVING A MACHINE ONTO A REAL LICENCE. A demo user who buys types the
-       key into the same installation — it must take a seat in the real
-       company and keep everything it already has. Seats are checked here
-       too, or a customer with 5 seats could quietly activate 50. */
     if (phone && row2.platform !== 'mobile') {
-      await q(`UPDATE licences SET platform = 'mobile' WHERE device_id = $1`, [deviceId]);
-      row2 = (await q(`SELECT * FROM licences WHERE device_id = $1`, [deviceId]))[0];
+      /* 4.71.0 — a computer's approval is not a phone's: the phone waits for its own */
+      await q(`UPDATE licences SET platform = 'mobile', approved_at = NULL, approved_by = NULL WHERE device_id = $1`, [deviceId]);
     }
-    if (keyed && Number(row2.company_id) !== Number(keyed.id)) {
-      /* 4.42.0 — no seat check here any more: the machine takes no seat.
-         What it can DO is decided when a person signs in on it, and that
-         is where the count is kept (sync.js userCap). */
-      const seat = phone ? null : await nextComputerNo(keyed.id);
-      await q(`UPDATE licences SET company_id = $2, seat_no = $3, state = 'TRIAL' WHERE device_id = $1`,
-        [deviceId, keyed.id, seat]);
-      await logEvent(deviceId, 'JOIN_COMPANY', { companyId: keyed.id, seat, from: row2.company_id || null });
-      row2 = (await q(`SELECT * FROM licences WHERE device_id = $1`, [deviceId]))[0];
-    }
+    row2 = (await q(`SELECT * FROM licences WHERE device_id = $1`, [deviceId]))[0];
 
     let co = await companyOf(row2);
     if (!co) { co = await adoptOrphan(row2); row2 = (await q(`SELECT * FROM licences WHERE device_id = $1`, [deviceId]))[0]; }
@@ -523,12 +762,27 @@ export async function activate({ deviceId, deviceName, company, email, appVersio
   }
 
   /* ---- a machine seen for the first time ---------------------------- */
+  /* 4.71.0 (audit) — a QUIET RE-JOIN (the desktop lost its token and asks again with only its device id) is
+     answered only for a machine already known: it never turns into a new company or a demo. */
+  if (rejoinOnly === true && !keyed && !lid) {
+    return { httpStatus: 404, body: { error: 'NOT_REGISTERED',
+      message: 'This computer is not known to the Nexora service. Open Licence & service to activate it.' } };
+  }
   let co = keyed;
   let seat = 1;
+  /* 4.71.0 (audit, owner 2026-10-01) — A COMPUTER JOINING AN EXISTING
+     COMPANY WAITS FOR ITS ADMINISTRATOR, exactly as a phone always has. A
+     licence key or a company passcode that has been passed round is then no
+     longer enough to put a new computer onto the plant's data: the
+     administrator approves it (Settings → Users → Devices, the same
+     /v1/devices the phones use), or signs in on it once. The company's
+     FIRST computer is approved as it joins — there is nobody yet to ask. */
+  let approvePc = !phone;
 
   if (co) {
     /* 4.42.0 — a new machine on a known licence is simply numbered (a phone is not a computer). */
     seat = phone ? null : await nextComputerNo(co.id);
+    if (!phone) approvePc = !(await hasApprovedPc(co.id, deviceId));
   } else {
     /* 4.23.1 — NO KEY AND NO COMPANY ID.
        Until 4.23.0 this created a company out of whatever name was typed:
@@ -558,22 +812,26 @@ export async function activate({ deviceId, deviceName, company, email, appVersio
     });
   }
 
+  /* C7 — a new row is made holding the key it was made with (none from an older app) */
   const rows = await q(
     `INSERT INTO licences (device_id, device_name, company, email, state,
                            trial_started_at, expires_at, app_version, last_seen_at, seen_count,
-                           company_id, seat_no, platform)
-     VALUES ($1,$2,$3,$4,'TRIAL', now(), $6::timestamptz, $5, now(), 1, $7, $8, $9)
+                           company_id, seat_no, platform, approved_at, approved_by, device_key_hash)
+     VALUES ($1,$2,$3,$4,'TRIAL', now(), $6::timestamptz, $5, now(), 1, $7, $8, $9,
+             CASE WHEN $10::bool THEN now() ELSE NULL END, CASE WHEN $10::bool THEN 'first computer of the company' ELSE NULL END, $11)
      ON CONFLICT (device_id) DO NOTHING
      RETURNING *`,
     [deviceId, deviceName || null, company || null, email || null,
-     appVersion || null, co.expires_at, co.id, seat, phone ? 'mobile' : null]);
+     appVersion || null, co.expires_at, co.id, seat, phone ? 'mobile' : null, approvePc, sentKeyHash]);
 
   /* A race on first launch could lose the INSERT; read the winner. */
   const row = rows.length ? rows[0]
     : (await q(`SELECT * FROM licences WHERE device_id = $1`, [deviceId]))[0];
+  /* C7 — and the winner of such a race is somebody else's unless it holds this key */
+  if (!rows.length && !(await settleDeviceKey(row, sentKeyHash))) return deviceKeyRefused(deviceId, 'activate', sentKeyHash, row && row.company_id);
 
   await logEvent(deviceId, 'ACTIVATE',
-    { company, email, appVersion, companyId: co.id, seat, keyed: !!keyed });
+    { company, email, appVersion, companyId: co.id, seat, keyed: !!keyed, approved: !!row.approved_at });
   const usageNew = await companyUsage(row.company_id || null);
   return { httpStatus: 200,
     body: { token: issueToken(row), licence: describe(row, co, settings, usageNew), returning: false } };
@@ -582,6 +840,7 @@ export async function activate({ deviceId, deviceName, company, email, appVersio
 /** Every protected call goes through here. Re-reads the row every time —
  *  a token says who you are, the row says what you may do. */
 export async function authorise(request) {
+  if (!tokenSecretOk()) return { ok: false, httpStatus: 503, error: MISCONFIGURED };
   const auth = request.headers.get('authorization') || '';
   const token = auth.toLowerCase().startsWith('bearer ') ? auth.slice(7).trim() : '';
   const body = readToken(token);
@@ -666,8 +925,17 @@ export async function authorise(request) {
     if (!feats.mobile) return { ok: false, httpStatus: 403, error: { error: 'MOBILE_NOT_IN_PLAN', message: 'Nexora Mobile is part of the PRO plan.' } };
     if (!row.approved_at) return { ok: false, httpStatus: 403, error: { error: 'PHONE_PENDING', message: 'Your Nexora administrator has to approve this phone first.' } };
   }
+  /* 4.71.0 (audit) — a computer waiting for its administrator: the heartbeat (which says so, in
+     licence.device.approved), signing out, and SIGNING IN — an administrator who signs in on it approves
+     it (sync.js login); anybody else is refused there with this same answer. */
+  if (row.platform !== 'mobile' && !row.approved_at && !OPEN && pth !== '/v1/login') {
+    return { ok: false, httpStatus: 403, error: Object.assign({}, PC_PENDING) };
+  }
   return {
     ok: true, row, company: co, licence: lic, settings, usage, user, superseded,
+    /* 4.71.0 — the person the token names, signed in here or not, so /v1/logout can let go of a binding
+       that is still this machine's (sync.js releaseSession checks that it is) */
+    tokenUser: body.u ? Number(body.u) : null,
     /* Every data route must filter on this and nothing else. It comes
        from the database, so a client cannot ask for another company's
        rows by editing anything it holds. */

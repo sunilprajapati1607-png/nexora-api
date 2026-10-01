@@ -1,0 +1,371 @@
+# Nexora — nightly database backup
+# ======================================================================
+# Owner, 2026-10-01: the database is backed up to "GitHub (private,
+# encrypted)". A free Supabase project has no daily backups to fall back
+# on, and every company's masters, quotations, users and licences live in
+# this one database.
+#
+# Every night at 02:00 IST this:
+#
+#   1. dumps the schemas Nexora owns — public (licences, companies, users,
+#      every synced record, chat, feedback, enquiries, releases) and ops
+#      (the keepalive heartbeat) — with a PostgreSQL 17 pg_dump, custom
+#      format, so pg_restore can put back one table or all of them
+#   2. checks it is a real backup: not tiny, holds the core tables, has rows
+#   3. encrypts it with AES-256 under a passphrase only the owner holds,
+#      and proves the encrypted file opens again to the same bytes
+#   4. keeps the encrypted file as a run artifact for 30 days
+#   5. restores it into a throwaway PostgreSQL 17 on this runner and
+#      compares every table's row count — a backup nobody has restored is
+#      only a hope. This runs AFTER the upload on purpose: if the test
+#      itself trips on something, the night's backup is still kept, and
+#      the red run says so. The throwaway database is started inside that
+#      last step, not as a job service: a service starts before the first
+#      step, so a failed pull or a slow start there would have failed the
+#      whole job before the dump and kept nothing.
+#
+# Why only public + ops: the rest of the database belongs to Supabase
+# (auth, storage, realtime, vault, cron, net, ...). Nexora keeps nothing
+# it needs there, a new Supabase project creates those schemas itself, and
+# restoring them over its own copies fails table by table. The two pg_cron
+# jobs are one line each — docs/DB-BACKUP.md has them.
+#
+# Never printed: the connection string, the passphrase, any row of data.
+# Only sizes, table names and row counts reach the log. The database
+# password is masked on its own too: GitHub hides only a secret's whole
+# value, and a libpq error can quote just the password part of the URL.
+#
+# Restoring, the secrets to set once, and the monthly restore test:
+# docs/DB-BACKUP.md. The weekly commit made by keepalive.yml is also what
+# keeps this schedule from being switched off for inactivity.
+
+name: DB backup
+
+on:
+  schedule:
+    # 20:30 UTC = 02:00 IST — nobody is working, and Render is asleep, so
+    # the dump never waits on the service's start-up ALTER TABLEs.
+    - cron: '30 20 * * *'
+  workflow_dispatch:      # and a "Run workflow" button for a backup right now
+
+concurrency:
+  group: db-backup
+  cancel-in-progress: false
+
+permissions:
+  contents: read          # nothing is written to the repository; artifacts need no token scope
+
+defaults:
+  run:
+    shell: bash           # bash -eo pipefail: a failing pg_restore inside a pipe fails the step
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # pg_dump must be at least the server's major version. Supabase runs
+      # PostgreSQL 17; when the project is upgraded to 18 this run fails with
+      # "server version mismatch" — change this one line to postgres:18 (the
+      # restore test's throwaway database uses the same image).
+      PG_IMAGE: postgres:17
+
+    steps:
+      - name: Check the two secrets are set
+        env:
+          DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          PASS: ${{ secrets.BACKUP_PASSPHRASE }}
+        run: |
+          how="see docs/DB-BACKUP.md in this repository"
+          if [ -z "$DB_URL" ]; then
+            echo "::error::the secret SUPABASE_DB_URL is not set — $how"; exit 1; fi
+          if [ -z "$PASS" ]; then
+            echo "::error::the secret BACKUP_PASSPHRASE is not set — $how"; exit 1; fi
+
+          # Mask the database password ON ITS OWN before anything else can
+          # print. GitHub hides only the secret's whole value, but libpq, when
+          # it cannot read a URL, quotes the part it choked on — e.g. a
+          # password with a bare % comes back as
+          # invalid percent-encoded token: "<the password>". The mask holds
+          # for every later step of this job. Password = the text between
+          # the first ':' after the scheme and the last '@'.
+          rest=${DB_URL#*://}
+          pw=""
+          case "$rest" in
+            *@*) userinfo=${rest%@*}
+                 case "$userinfo" in *:*) pw=${userinfo#*:} ;; esac ;;
+          esac
+          if [ -n "$pw" ]; then echo "::add-mask::$pw"; fi
+
+          # A short passphrase is a backup anyone with the file can open.
+          if [ "${#PASS}" -lt 20 ]; then
+            echo "::error::BACKUP_PASSPHRASE is shorter than 20 characters — use a long random phrase; $how"; exit 1; fi
+          case "$DB_URL" in
+            postgres://*|postgresql://*) ;;
+            *) echo "::error::SUPABASE_DB_URL must start with postgresql:// — copy the Session pooler string; $how"; exit 1 ;;
+          esac
+          case "$DB_URL" in
+            *'[YOUR-PASSWORD]'*)
+              echo "::error::SUPABASE_DB_URL still contains [YOUR-PASSWORD] — put the database password in its place; $how"; exit 1 ;;
+          esac
+          # The doc asks for these to be written %-encoded; this makes sure,
+          # so libpq never has a reason to quote a piece of the password.
+          # A raw @ / ? # in the password splits the URL in the wrong place;
+          # a % must be followed by two hex digits.
+          case "$pw" in
+            *[@/?#]*)
+              echo "::error::the password inside SUPABASE_DB_URL has a raw @ / ? or # — write them as %40 %2F %3F %23; $how"; exit 1 ;;
+          esac
+          t=$DB_URL
+          while :; do
+            case "$t" in *%*) ;; *) break ;; esac
+            t=${t#*%}
+            case "$t" in
+              [0-9A-Fa-f][0-9A-Fa-f]*) ;;
+              *) echo "::error::SUPABASE_DB_URL has a % that is not followed by two hex digits — a % in the password must be written %25; $how"; exit 1 ;;
+            esac
+          done
+          # Now that every % is known to be %HH: mask the decoded password too
+          # (%40 → @ ...), in case anything quotes it. Backslashes are doubled
+          # first so printf %b reads only the \xHH it is given.
+          if [ -n "$pw" ]; then
+            dec=${pw//\\/\\\\}
+            dec=$(printf '%b' "${dec//%/\\x}" 2>/dev/null) || dec=""
+            if [ -n "$dec" ] && [ "$dec" != "$pw" ]; then echo "::add-mask::$dec"; fi
+          fi
+          # The transaction pooler (6543) cannot carry a pg_dump, and the
+          # direct host (db.<ref>.supabase.co) is IPv6-only, which GitHub's
+          # runners do not have. Only the session pooler works from here.
+          case "$DB_URL" in
+            *:6543/*|*:6543\?*|*:6543)
+              echo "::error::SUPABASE_DB_URL is the TRANSACTION pooler (port 6543) — pg_dump needs the SESSION pooler (port 5432); $how"; exit 1 ;;
+          esac
+          case "$DB_URL" in
+            *@db.*.supabase.co*)
+              echo "::warning::SUPABASE_DB_URL is the direct connection, which is IPv6-only — if the dump cannot connect, use the Session pooler string instead" ;;
+          esac
+          echo "both secrets are set (values not shown)"
+
+      - name: Fetch the PostgreSQL 17 tools
+        run: |
+          # The runner's own client is older than the server, and pg_dump
+          # refuses a newer server. The official image is exactly 17.
+          for attempt in 1 2 3; do
+            docker pull -q "$PG_IMAGE" >/dev/null && break
+            [ "$attempt" = 3 ] && { echo "::error::could not pull $PG_IMAGE"; exit 1; }
+            sleep 15
+          done
+          docker run --rm "$PG_IMAGE" pg_dump --version
+
+      - name: Dump the database (session pooler, read-only)
+        id: dump
+        env:
+          DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          mkdir -p backup out
+          day=$(TZ=Asia/Kolkata date '+%Y-%m-%d')
+          file="nexora-db-$(TZ=Asia/Kolkata date '+%Y-%m-%d_%H%M')IST.dump"
+          echo "date=$day"  >> "$GITHUB_OUTPUT"
+          echo "file=$file" >> "$GITHUB_OUTPUT"
+          # The URL goes into the container as an environment variable and is
+          # expanded INSIDE it (single quotes), so it is never on a command
+          # line. PGSSLMODE=require: the dump crosses the internet encrypted.
+          # --lock-wait-timeout: give up rather than hang behind a lock.
+          ok=""
+          for attempt in 1 2 3; do
+            if docker run --rm \
+                 -e DB_URL -e OUT="/backup/$file" \
+                 -e PGSSLMODE=require -e PGCONNECT_TIMEOUT=30 -e PGAPPNAME=nexora-db-backup \
+                 -v "$PWD/backup:/backup" "$PG_IMAGE" \
+                 sh -c 'exec pg_dump --dbname="$DB_URL" --file="$OUT" \
+                          --format=custom --no-owner --no-privileges \
+                          --schema=public --schema=ops --lock-wait-timeout=60s'; then
+              ok=1; break
+            fi
+            echo "attempt $attempt failed"
+            [ "$attempt" = 3 ] || sleep 30
+          done
+          if [ -z "$ok" ]; then
+            echo "::error::pg_dump failed three times — is the Supabase project paused, or was the database password changed? (docs/DB-BACKUP.md)"
+            exit 1
+          fi
+          echo "dumped: $(stat -c %s "backup/$file") bytes"
+
+      - name: Check it is a real backup (sizes, table names and row counts only)
+        env:
+          FILE: ${{ steps.dump.outputs.file }}
+        run: |
+          pgr() { docker run --rm -v "$PWD/backup:/backup:ro" "$PG_IMAGE" pg_restore "$@"; }
+
+          bytes=$(stat -c %s "backup/$FILE")
+          echo "dump size: $bytes bytes"
+          # Nexora's data compresses to far more than this; anything smaller
+          # is an empty or broken dump, not a quiet night.
+          if [ "$bytes" -lt 10240 ]; then
+            echo "::error::the dump is only $bytes bytes — far too small to be Nexora's database"; exit 1; fi
+
+          # The table of contents — object names only, never data.
+          pgr --list "/backup/$FILE" > toc.txt
+          echo "what the dump holds:"
+          for kind in 'SCHEMA' 'TABLE' 'TABLE DATA' 'SEQUENCE' 'INDEX' 'CONSTRAINT' 'FK CONSTRAINT' 'FUNCTION' 'ROW SECURITY'; do
+            printf '  %-14s %s\n' "$kind" "$(grep -c -E "^[0-9]+; [0-9]+ [0-9]+ $kind (public|ops|-) " toc.txt || true)"
+          done
+          for t in companies company_users licences sync_records; do
+            grep -q -E "^[0-9]+; [0-9]+ [0-9]+ TABLE DATA public $t " toc.txt || {
+              echo "::error::the dump has no data entry for public.$t"; exit 1; }
+          done
+
+          # Row counts: the data is streamed through awk, which counts the
+          # lines of each COPY block and prints only "table count". The end
+          # of a block is a line holding a backslash and a dot — built with
+          # sprintf so no escaping can go wrong.
+          pgr --data-only --file=- "/backup/$FILE" | awk '
+            BEGIN { endmark = sprintf("%c.", 92) }
+            !inside && /^COPY / { t = $2; gsub(/"/, "", t); n = 0; inside = 1; next }
+            inside && $0 == endmark { print t, n; inside = 0; next }
+            inside { n++ }' | sort > rows.txt
+          echo "rows per table:"
+          awk '{ printf "  %-32s %8d\n", $1, $2 }' rows.txt
+          companies=$(awk '$1 == "public.companies" { print $2 }' rows.txt)
+          if [ -z "$companies" ] || [ "$companies" -eq 0 ]; then
+            echo "::error::the dump holds no companies — a backup of an empty database is not a backup"; exit 1; fi
+
+      - name: Encrypt it (AES-256 — the passphrase is the only key)
+        env:
+          PASS: ${{ secrets.BACKUP_PASSPHRASE }}
+          FILE: ${{ steps.dump.outputs.file }}
+        run: |
+          # A keyring of its own, thrown away with the runner. The passphrase
+          # goes in on a pipe (never a command line); --no-symkey-cache so the
+          # check below really reads it again instead of trusting a cache.
+          # Plain OpenPGP (AES256, CFB + MDC): any GnuPG, Gpg4win included,
+          # opens it.
+          export GNUPGHOME="$(mktemp -d)"
+          gpgq() { gpg --batch --yes --quiet --no-symkey-cache --pinentry-mode loopback --passphrase-fd 0 "$@"; }
+          printf '%s' "$PASS" | gpgq --symmetric --cipher-algo AES256 \
+            --s2k-digest-algo SHA512 --s2k-count 65011712 --compress-algo none \
+            --output "out/$FILE.gpg" "backup/$FILE"
+          # Prove the encrypted file opens again, byte for byte.
+          want=$(sha256sum "backup/$FILE" | cut -d' ' -f1)
+          got=$(printf '%s' "$PASS" | gpgq --decrypt "out/$FILE.gpg" | sha256sum | cut -d' ' -f1) || got=""
+          gpgconf --kill gpg-agent 2>/dev/null || true
+          if [ "$want" != "$got" ]; then
+            echo "::error::the encrypted backup did not decrypt back to the same dump"; exit 1; fi
+          echo "encrypted: $(stat -c %s "out/$FILE.gpg") bytes (decrypt checked)"
+
+      - name: Keep it for 30 days
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: nexora-db-${{ steps.dump.outputs.date }}
+          path: out/${{ steps.dump.outputs.file }}.gpg     # the encrypted file only
+          retention-days: 30
+          if-no-files-found: error
+          compression-level: 0      # already compressed and encrypted
+          # An artifact name must be unique within a run, across attempts. So
+          # "Re-run failed jobs" on a night whose restore test went red would
+          # stop right here (409) and never reach the test again. With this,
+          # the earlier attempt's copy of the same name is deleted just before
+          # the new one goes up — and this step is only reached after the new
+          # dump has passed every check and its decrypt test.
+          overwrite: true
+
+      - name: Prove it restores (into the throwaway PostgreSQL 17 on this runner)
+        id: restore
+        env:
+          FILE: ${{ steps.dump.outputs.file }}
+        run: |
+          # A throwaway PostgreSQL 17, reachable only from this runner
+          # (127.0.0.1) and gone when the job ends. Started HERE, after the
+          # upload, so a failure to start it can never cost the backup.
+          if ! docker run -d --name nexora-scratch -p 127.0.0.1:5432:5432 \
+                 -e POSTGRES_PASSWORD=scratch "$PG_IMAGE" >/dev/null; then
+            echo "::error::could not start the throwaway PostgreSQL for the restore test — tonight's backup WAS kept; run the workflow again, or restore it by hand (docs/DB-BACKUP.md)"
+            exit 1
+          fi
+          # 127.0.0.1, not the socket: during first start-up the image runs a
+          # temporary server on the socket only, which would answer too early.
+          # Up to 150 s (30 x 5 s); a first start normally takes a few seconds.
+          ready=""
+          for i in $(seq 1 30); do
+            if docker exec nexora-scratch pg_isready -q -h 127.0.0.1 -U postgres; then ready=1; break; fi
+            sleep 5
+          done
+          if [ -z "$ready" ]; then
+            echo "::error::the throwaway PostgreSQL did not become ready in 150 s — tonight's backup WAS kept; run the workflow again, or restore it by hand (docs/DB-BACKUP.md)"
+            docker logs --tail 20 nexora-scratch 2>&1 || true    # its own start-up log; holds no Nexora data
+            exit 1
+          fi
+
+          # Left out of the test restore, and only of it:
+          #   SCHEMA public / its comment  — every database already has one
+          #   FUNCTION ops.* / comments    — the keepalive helpers; wake_render
+          #                                  calls pg_net, a Supabase extension
+          #                                  a plain PostgreSQL lacks. No data.
+          # Errors go to a file; only pg_restore's own error lines are shown,
+          # never a DETAIL or CONTEXT line, which can quote a row.
+          if ! docker run --rm --network host -e PGPASSWORD=scratch -e FILE \
+                 -v "$PWD/backup:/backup:ro" "$PG_IMAGE" sh -c '
+                   pg_restore --list "/backup/$FILE" \
+                     | grep -v -E "^[0-9]+; [0-9]+ [0-9]+ (SCHEMA - public|COMMENT - SCHEMA public|FUNCTION ops|COMMENT ops FUNCTION) " \
+                     > /tmp/restore.list
+                   exec pg_restore -h 127.0.0.1 -U postgres -d postgres \
+                     --no-owner --no-privileges --exit-on-error \
+                     --use-list=/tmp/restore.list "/backup/$FILE"' 2> restore-errors.txt; then
+            echo "::error::tonight's dump did NOT restore into a clean PostgreSQL 17 — the artifact is kept, but restore it by hand before trusting it (docs/DB-BACKUP.md)"
+            grep -E '^pg_restore: (error|warning)' restore-errors.txt | cut -c1-300 | head -20 || true
+            exit 1
+          fi
+
+          # Count every table in the restored copy and compare with the dump.
+          docker run --rm --network host -e PGPASSWORD=scratch "$PG_IMAGE" \
+            psql -h 127.0.0.1 -U postgres -d postgres -v ON_ERROR_STOP=1 -At -F ' ' -c "
+              SELECT table_schema || '.' || table_name,
+                     (xpath('/row/c/text()', query_to_xml(
+                        format('SELECT count(*) AS c FROM %I.%I', table_schema, table_name),
+                        false, true, '')))[1]::text
+                FROM information_schema.tables
+               WHERE table_schema IN ('public', 'ops') AND table_type = 'BASE TABLE'" \
+            | sort > restored.txt
+          if ! diff -q rows.txt restored.txt >/dev/null; then
+            echo "::error::the restored copy does not hold the same rows as the dump"
+            echo "dump (<) against restored copy (>) — table names and counts only:"
+            diff rows.txt restored.txt || true
+            exit 1
+          fi
+          echo "restored $(wc -l < restored.txt) tables; every row count matches the dump"
+
+      - name: Say what happened
+        if: always()
+        env:
+          FILE: ${{ steps.dump.outputs.file }}
+          DAY: ${{ steps.dump.outputs.date }}
+          UPLOAD: ${{ steps.upload.outcome }}
+          RESTORE: ${{ steps.restore.outcome }}
+        run: |
+          {
+            echo "### Nexora database backup — $(TZ=Asia/Kolkata date '+%Y-%m-%d %H:%M IST')"
+            echo ""
+            if [ "$UPLOAD" = "success" ]; then
+              echo "Kept: artifact **nexora-db-$DAY** — \`$FILE.gpg\`, $(stat -c %s "out/$FILE.gpg" 2>/dev/null || echo '?') bytes, for 30 days."
+            else
+              echo "**No backup was kept tonight** — open the red step above for the reason, and docs/DB-BACKUP.md for what to do."
+            fi
+            case "$RESTORE" in
+              success) echo ""; echo "Restore test: passed — every table restored with the same row count." ;;
+              failure) echo ""; echo "**Restore test: FAILED** — restore this backup by hand before trusting it (docs/DB-BACKUP.md)." ;;
+            esac
+            if [ -s rows.txt ]; then
+              echo ""
+              echo "| table | rows |"
+              echo "| --- | ---: |"
+              awk '{ printf "| %s | %s |\n", $1, $2 }' rows.txt
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove the readable copy from the runner
+        if: always()
+        run: |
+          # The runner is destroyed after the job anyway; this is belt and braces.
+          rm -rf backup
+          docker rm -f nexora-scratch >/dev/null 2>&1 || true

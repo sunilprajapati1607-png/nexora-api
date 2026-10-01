@@ -1049,7 +1049,7 @@ export async function chat(companyId, payload, lang, fetchImpl) {
    checked against what was sent: an unknown construction, field, process,
    route or material is dropped and said.
    ========================================================================== */
-export const ASSIST_VIEWS = ['dashboard', 'calculation', 'history', 'bom', 'bomrecords', 'routes', 'rm', 'structures', 'constants',
+export const ASSIST_VIEWS = ['dashboard', 'calculation', 'history', 'bom', 'bomrecords', 'routes', 'processes', 'rm', 'structures', 'constants',
   'quotation', 'quoterecords', 'compare', 'targetcost', 'priceimpact', 'workflows', 'settings', 'easycost',
   /* 4.68.3 — Marketing's windows */
   'mktdash', 'enquiry', 'enquiries', 'followups', 'customers', 'mktwork', 'mkttargets', 'mktsources'];

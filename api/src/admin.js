@@ -11,6 +11,7 @@
  * data beyond what the owner already has, and it can be replaced with
  * real accounts the day there is more than one operator.
  */
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { endSessionOn } from './waiters.js';
 import { q, getSettings, forgetSettings, logEvent } from './db.js';
 import { cleanPlan, cleanPlanFeatures, PLAN_FEATURES } from './plans.js';
@@ -18,13 +19,55 @@ import { hashPasscode, validPasscode, PASSCODE_MIN } from './passcode.js';
 import { newLicenceKey } from './licence.js';
 import { aiUsedToday, aiDefaultDaily } from './ai.js';
 import { forget as aiForget } from './aikey.js';
-import { ensureAdmin, usersSummary, userCap, listUsers, hashPin, validPin, nameKey, cleanEmail } from './sync.js';
+import { ensureAdmin, usersSummary, userCap, listUsers, hashPin, validPin, nameKey, cleanEmail, defaultPermissions, resendPrices } from './sync.js';
 
 const ADMIN_KEY = process.env.NEXORA_ADMIN_KEY || '';
 
+/* 4.71.0 (audit) — compared in constant time. `===` stops at the first
+   character that differs, so how long a wrong key took to refuse said how
+   much of it was right. Both sides are hashed first, so even the LENGTH of
+   the real key is never measured. */
+const digestOf = (s) => createHash('sha256').update(String(s)).digest();
 export function adminAuthorised(request) {
   const k = request.headers.get('x-admin-key') || '';
-  return !!ADMIN_KEY && k === ADMIN_KEY;
+  if (!ADMIN_KEY || !k) return false;
+  return timingSafeEqual(digestOf(k), digestOf(ADMIN_KEY));
+}
+
+/* 4.71.0 (audit) — FIVE WRONG KEYS FROM ONE ADDRESS AND IT IS SHUT OUT FOR
+   FIFTEEN MINUTES: every /admin/api call from it is refused (the right key
+   too), and the event log says so. One person runs this console, from a
+   handful of places; a sixth wrong key in a row is not that person. Kept in
+   memory: a restart forgives, which costs an attacker a restart they cannot
+   cause. The address is register.js remoteIp — Cloudflare's, never the
+   client's own x-forwarded-for. */
+const ADMIN_TRIES = 5;
+const ADMIN_LOCK_MS = 15 * 60 * 1000;
+const ADMIN_MISSES = new Map();
+export async function adminGate(request, ip) {
+  const who = ip || '-';
+  const now = Date.now();
+  const s = ADMIN_MISSES.get(who);
+  const shut = (until) => {
+    const sec = Math.max(1, Math.ceil((until - now) / 1000));
+    const m = Math.max(1, Math.ceil(sec / 60));
+    return { ok: false, httpStatus: 429, body: { error: 'TOO_MANY', retryAfter: sec,
+      message: 'Too many wrong admin keys from this address — try again in ' + m + ' minute' + (m === 1 ? '' : 's') + '.' } };
+  };
+  if (s && s.until > now) return shut(s.until);
+  if (adminAuthorised(request)) { if (s) ADMIN_MISSES.delete(who); return { ok: true }; }
+  const n = (s && !s.until ? s.n : 0) + 1;
+  if (n >= ADMIN_TRIES) {
+    const until = now + ADMIN_LOCK_MS;
+    ADMIN_MISSES.set(who, { n: 0, until });
+    await logEvent(null, 'ADMIN_KEY_LOCKED', { ip: who, tries: n });
+    return shut(until);
+  }
+  ADMIN_MISSES.set(who, { n, until: 0 });
+  if (ADMIN_MISSES.size > 5000) {
+    for (const [k, v] of ADMIN_MISSES) if (!(v.until > now)) ADMIN_MISSES.delete(k);
+  }
+  return { ok: false, httpStatus: 401, body: { error: 'UNAUTHORISED' } };
 }
 
 export async function listLicences() {
@@ -119,6 +162,10 @@ export async function listCompanies() {
   return rows;
 }
 
+/* 4.71.0 (C6, owner 2026-10-01) — the offline allowance a company gets when the owner licenses it
+   (companyAction 'create' and 'licence', and licenceAction 'licence', which licenses the machine's company) */
+export const LICENSED_GRACE_DAYS = 3;
+
 export async function companyAction(body) {
   const action = String(body.action || '');
   const days = Math.max(1, Math.min(3650, parseInt(body.days, 10) || 365));
@@ -130,7 +177,10 @@ export async function companyAction(body) {
     /* 4.48.0 — the plan. Seats are the owner's to set on either plan (4.48.1). */
     const plan = cleanPlan(body.plan);
     const seats = Math.max(1, Math.min(500, parseInt(body.seats, 10) || 1));
-    const grace = Math.max(0, Math.min(365, parseInt(body.graceDays, 10) || 0));
+    /* 4.71.0 (C6, owner 2026-10-01) — a licensed customer may work three days without the line (a demo or a
+       plant that registered itself stays at none). A company made here IS licensed, so none becomes three;
+       the owner can still set none afterwards (Offline days…). */
+    const grace = Math.max(0, Math.min(365, parseInt(body.graceDays, 10) || 0)) || LICENSED_GRACE_DAYS;
     for (let attempt = 0; attempt < 5; attempt++) {
       const key = newLicenceKey();
       try {
@@ -170,11 +220,14 @@ export async function companyAction(body) {
     await logEvent(null, 'ADMIN_COMPANY_EXTEND', { id, days });
 
   } else if (action === 'licence') {
+    /* 4.71.0 (C6) — and a demo turning into a customer gets the customer's offline allowance: none becomes
+       three days. One the owner already set is left as it is. */
     await q(`UPDATE companies
                 SET state = 'LICENSED', is_demo = false,
                     expires_at = nexora_eod(GREATEST(now(), expires_at) + make_interval(days => $2::int)),
-                    period_started_at = now()
-              WHERE id = $1`, [id, days]);
+                    period_started_at = now(),
+                    grace_days = CASE WHEN grace_days = 0 THEN $3::int ELSE grace_days END
+              WHERE id = $1`, [id, days, LICENSED_GRACE_DAYS]);
     await logEvent(null, 'ADMIN_COMPANY_LICENCE', { id, days });
 
   } else if (action === 'seats') {
@@ -339,11 +392,14 @@ export async function companyAction(body) {
       return { error: 'This company has ' + cap.max + ' seat(s) and ' + cap.count +
         ' person(s) on them. Give it more seats first, or remove someone who has left.' };
     }
+    /* 4.71.0 (audit) — an ordinary user starts with the least (sync.js defaultPermissions): no costs, no
+       prices, no deleting, no managing people. Their administrator ticks more inside the application. */
     const rows = await q(
-      `INSERT INTO company_users (company_id, name, name_key, pin_hash, role, scope, active, email)
-       VALUES ($1, $2, $3, $4, $5, $6, true, $7) RETURNING *`,
+      `INSERT INTO company_users (company_id, name, name_key, pin_hash, role, scope, active, email, permissions)
+       VALUES ($1, $2, $3, $4, $5, $6, true, $7, $8) RETURNING *`,
       [id, name, key, hashPin(body.pin), body.role === 'ADMIN' ? 'ADMIN' : 'USER',
-       body.scope === 'ALL' ? 'ALL' : 'OWN', cleanEmail(body.email)]);
+       body.scope === 'ALL' ? 'ALL' : 'OWN', cleanEmail(body.email),
+       body.role === 'ADMIN' ? null : JSON.stringify(defaultPermissions())]);
     await logEvent(null, 'ADMIN_USER_CREATE', { companyId: id, userId: rows[0].id, name });
     return { ok: true, warning: name + ' can now sign in. Tell them the PIN directly \u2014 it is not shown again.' };
 
@@ -385,6 +441,8 @@ export async function companyAction(body) {
     await q(`UPDATE company_users SET role = $3, scope = CASE WHEN $3 = 'ADMIN' THEN 'ALL' ELSE scope END
               WHERE company_id = $1 AND id = $2`, [id, u.id, want]);
     await logEvent(null, 'ADMIN_USER_ROLE', { companyId: id, userId: u.id, name: u.name, role: want });
+    /* 4.71.0 (C2) — an administrator sees costs: the prices they were sent empty come again */
+    if (want === 'ADMIN') await resendPrices(id);
     return { ok: true, warning: u.name + ' is now ' + (want === 'ADMIN' ? 'an administrator.' : 'an ordinary user.') };
 
   } else if (action === 'userpin') {
@@ -531,7 +589,7 @@ export async function licenceAction(body) {
     await q(`UPDATE companies
                 SET expires_at = nexora_eod(GREATEST(now(), expires_at) + make_interval(days => $2::int)),
                     period_started_at = now()
-                  ${action === 'licence' ? ", state = 'LICENSED', is_demo = false" : ''}
+                  ${action === 'licence' ? ", state = 'LICENSED', is_demo = false, grace_days = CASE WHEN grace_days = 0 THEN " + LICENSED_GRACE_DAYS + " ELSE grace_days END" : ''}
               WHERE id = $1`, [companyId, days]);
     await logEvent(deviceId, action === 'licence' ? 'ADMIN_LICENCE' : 'ADMIN_EXTEND',
       { days, scope: 'company', companyId });
@@ -548,14 +606,19 @@ export async function licenceAction(body) {
   } else if (action === 'approve') {
     /* Nexora Mobile — a phone waiting for its company's yes, given here by Nexora (the company's own
        administrator gives it from the desktop or another phone through /v1/devices/approve) */
+    /* 4.71.0 — and a computer waiting for its company's yes (licence.js activate) */
     const row = (await q(`SELECT platform FROM licences WHERE device_id = $1`, [deviceId]))[0];
     if (!row) return { error: 'No such installation.' };
-    if (row.platform !== 'mobile') return { error: 'Only a phone waits for approval.' };
     await q(`UPDATE licences SET approved_at = COALESCE(approved_at, now()), approved_by = COALESCE(approved_by, 'Nexora (console)')
               WHERE device_id = $1`, [deviceId]);
-    await logEvent(deviceId, 'ADMIN_PHONE_APPROVE', {});
+    await logEvent(deviceId, row.platform === 'mobile' ? 'ADMIN_PHONE_APPROVE' : 'ADMIN_PC_APPROVE', {});
   } else if (action === 'revoke') {
-    await q(`UPDATE licences SET state = 'REVOKED' WHERE device_id = $1`, [deviceId]);
+    /* 4.71.0 (audit) — marked as Nexora's: a company administrator takes a
+       machine away and gives it back through /v1/devices, but one the
+       console revoked stays revoked until the console restores it */
+    /* C7 — and its device key is let go (licence.js): it stays refused until the console restores it, and
+       the machine that joins after that holds a key of its own */
+    await q(`UPDATE licences SET state = 'REVOKED', revoked_by = 'NEXORA', device_key_hash = NULL WHERE device_id = $1`, [deviceId]);
     await logEvent(deviceId, 'ADMIN_REVOKE', {});
   } else if (action === 'restore') {
     /* 4.42.0 — no seat check: a machine takes no seat, so bringing one
@@ -563,7 +626,11 @@ export async function licenceAction(body) {
        in on it, and the people are counted where they are created. */
     const rows = await q(`SELECT company_id FROM licences WHERE device_id = $1`, [deviceId]);
     const companyId = rows.length ? rows[0].company_id : null;
-    await q(`UPDATE licences SET state = 'TRIAL' WHERE device_id = $1`, [deviceId]);
+    /* C7 — it comes back holding no device key (the revoke let it go), so it takes the first one it is
+       shown. The real machine kept its token through its heartbeat, and that heartbeat now tells it
+       licence.device.keyHeld = false (licence.js describe): it joins quietly once with its own key at its
+       next heartbeat, before anybody who merely knows its id is likely to. */
+    await q(`UPDATE licences SET state = 'TRIAL', revoked_by = NULL WHERE device_id = $1`, [deviceId]);
     await logEvent(deviceId, 'ADMIN_RESTORE', { companyId });
   } else if (action === 'delete') {
     /* 4.23.1 — one installation, removed outright. The company-level
@@ -928,7 +995,7 @@ button.primary{background:linear-gradient(120deg,#0A66E0,#1EA0FF);border-color:t
           <label>Plan<select id="nPlan"><option value="PRO">Pro — everything</option><option value="STANDARD">Standard — calculation &amp; costing</option></select></label>
           <label>Seats<input id="nSeats" type="number" min="1" max="500" value="1" style="width:80px"></label>
           <label>Licence days<input id="nDays" type="number" min="1" max="3650" value="365" style="width:90px"></label>
-          <label>Offline days<input id="nGrace" type="number" min="0" max="365" value="0" style="width:90px"></label>
+          <label>Offline days<input id="nGrace" type="number" min="0" max="365" value="3" style="width:90px"></label>
           <label>GSTIN<input id="nGst" placeholder="15 characters" maxlength="15" style="min-width:170px;text-transform:uppercase"></label>
           <label>Email<input id="nEmail" placeholder="address" style="min-width:170px"></label>
           <button class="primary" onclick="createCo()">Create licensed company</button>
@@ -1136,6 +1203,8 @@ async function api(path,opts){
   const r=await fetch(path,Object.assign({headers:{'x-admin-key':KEY,'content-type':'application/json'}},opts||{}));
   if(r.status===401)throw new Error('That admin key was not accepted.');
   let b={};try{b=await r.json()}catch(e){}
+  /* 4.71.0 — five wrong keys from this address: shut for fifteen minutes, and said so */
+  if(r.status===429)throw new Error(b.message||'Too many wrong admin keys from this address. Try again later.');
   if(!r.ok&&!b.error)throw new Error('Request failed ('+r.status+')');
   return b;
 }
@@ -2045,7 +2114,7 @@ function render(){
     let state=(l.state==='TRIAL'&&l.expired)?'EXPIRED':l.state;
     if(l.co_state==='SUSPENDED'&&state!=='REVOKED')state='SUSPENDED';
     return '<tr>'+
-      '<td><b>'+esc(l.co_name||l.company||'—')+'</b>'+(l.platform==='mobile'?' <code>📱 phone'+(l.approved_at?'':' · waiting for approval')+'</code>':(l.seat_no?' <code>computer '+l.seat_no+'</code>':''))+
+      '<td><b>'+esc(l.co_name||l.company||'—')+'</b>'+(l.platform==='mobile'?' <code>📱 phone'+(l.approved_at?'':' · waiting for approval')+'</code>':(l.seat_no?' <code>computer '+l.seat_no+(l.approved_at||l.state==='REVOKED'?'':' · waiting for approval')+'</code>':(l.approved_at||l.state==='REVOKED'?'':' <code>computer · waiting for approval</code>')))+
         (l.on_user
           ? '<br><span class="pill s-LICENSED">'+esc(l.on_user)+' is signed in</span>'
           : '<br><span class="why">nobody signed in — this machine shows its sign-in screen</span>')+
@@ -2059,7 +2128,7 @@ function render(){
       '<td><b>'+(+l.txn_count||0)+'</b>'+(l.usage_reset_at?'<br><code>reset '+fmt(l.usage_reset_at)+'</code>':'')+'</td>'+
       '<td>'+hoursText(l.usage_minutes)+'</td>'+
       '<td><div class="acts">'+
-        (l.platform==='mobile'&&!l.approved_at&&l.state!=='REVOKED'?'<button class="small primary" data-device="'+esc(l.device_id)+'" data-action="approve" onclick="act(this)" title="Let this phone sign in (Nexora Mobile)">Approve phone</button>':'')+
+        (!l.approved_at&&l.state!=='REVOKED'?'<button class="small primary" data-device="'+esc(l.device_id)+'" data-action="approve" onclick="act(this)" title="'+(l.platform==='mobile'?'Let this phone sign in (Nexora Mobile)':'Let this computer onto its company (it joined with the key or passcode)')+'">Approve '+(l.platform==='mobile'?'phone':'computer')+'</button>':'')+
         '<button class="small" data-device="'+esc(l.device_id)+'" data-action="resetusage" onclick="act(this)">Reset usage</button>'+
         (l.state==='REVOKED'
           ?'<button class="small" data-device="'+esc(l.device_id)+'" data-action="restore" onclick="act(this)">Restore</button>'
