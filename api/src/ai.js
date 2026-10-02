@@ -2227,7 +2227,11 @@ const DQ = {
      records ("top 100 bags", "the last 100 bags" are records) */
   qty: /(?<!\b(?:top|bottom|first|last|latest|newest|recent|oldest|chh?ell\w*|pichh?l\w*|aakh?ri)\s)\b\d[\d,]{2,}\s*(?:k\s+)?(?:bags?|sacks?|thel[ia]\w*|nang|nos|pcs|pieces)\b|\d[\d,]{2,}\s*(?:બેગ|થેલી|नग|बैग|बेग|थैल)/i,
   all: /\b(?:all|every|badh[aiu]|sab|saare?|sabhi)\b|બધ|सभी|सारे|सब\s/i,
-  show: /\b(?:show|list|display|batav\w*|batao|bataao|dikha\w*)\b|બતાવ|દેખાડ|बताओ|बताइए|दिखाओ|दिखाइए/i,
+  /* 4.74.0, live — and "saw me" as typed (owner: "from calcuation saw me 500 mm width bag") */
+  show: /\b(?:show|list|display|batav\w*|batao|bataao|dikha\w*)\b|\bsa+w\s+me\b|બતાવ|દેખાડ|बताओ|बताइए|दिखाओ|दिखाइए/i,
+  /* 4.74.0, live — the SAVED records named as where to look ("from calcuation saw me 500 mm width bag", "from records",
+     "in my saved bags", "ગણતરીમાંથી", "कैलकुलेशन में से"): a bag's sizes said there are a search of them, not a bag to make */
+  saved: /\bfrom\s+(?:the\s+|my\s+|our\s+|all\s+)?(?:saved\s+)?(?:calc\w*|records?|history|saved)\b|\b(?:in|among)\s+(?:the\s+|my\s+|our\s+)?(?:saved|records)\b|\bcalc\w*\s+records?\b|ગણતર\S*\s*મ(?:ાં|ા)(?:થી)?|ગણતરીઓ|સેવ\s*કરેલ|कैलकुलेशन\s*(?:में|मे)\s*(?:से)?|गणना\s*(?:में|मे)|सेव\s*कि/i,
   /* a piece of work, not a question ("call the customer today", "add a follow-up today") */
   work: /\b(?:add|make|create|note|remind|set|call|send|write|save|delete|remove|change|update|open|start|karo|kar\s*do|banavo|banao)\b|નોંધ|કરો|બનાવો|करो|बनाओ/i,
   /* something to make or send ("kul 5000 bag nu quotation banavo", "make the cheapest bag", "सबसे सस्ता बैग बनाओ") — not
@@ -2241,17 +2245,19 @@ const DQ = {
   /* a how-to, a place in the software, a conversion ("how many bags in one bale") */
   help: /\bhow\s+(?:do|to|can|should)\b|\bsteps?\s+(?:to|for)\b|\bwhere\b|\bmeaning\b|\bexplain|\bwindow|\bscreen\b|\bbutton|\bmenu\b|\bkem\b|kevi\s+rite|kai\s+rite|\bkaise\b|\bkahan\b|\bkaha\b|કેવી\s*રીતે|ક્યાં|कैसे|कहाँ|कहां|\b(?:how\s+many|ketl[aiuoe]|kitn[aeiy])\s+\S+\s+(?:per|in\s+(?:one|a|an|1|each))\s+(?:bale|bundle|box|roll|kg|kilo|ton|tonne|meter|metre|mtr|truck|container|lot|packet|pallet)s?\b|\b(?:ek|1)\s+(?:bale|bundle|gaanth|gansdi|kg|kilo|ton)\s+ma/i,
   money: /\b(?:amount|value|turnover|revenue|business|worth|costliest|dearest|priciest)\b|રકમ|रकम|વેલ્યુ|वैल्यू/i,
-  /* a calculation field asked about (its key is in FIELDS: input.<FIELD KEY>) */
-  fields: /\bwidth|\blength|\bgsm\b|\bmesh|meash|gusset|micron|denier|\bfold|\bliner|\bvalve|\bpatch|\bhandle|zipper|\bcoating|\bbopp\b|\bsize|પહોળ|લંબાઈ|लंबाई|चौड़|જીએસએમ|जीएसएम|સાઇઝ|साइज/i
+  /* a calculation field asked about (its key is in FIELDS: input.<FIELD KEY>) — 4.74.0, live: also run into a figure, as
+     typed ("500mmwidth bag") */
+  fields: /(?:\b|\d|mm)width|(?:\b|\d|mm)length|\bgsm\b|\bmesh|meash|gusset|micron|denier|\bfold|\bliner|\bvalve|\bpatch|\bhandle|zipper|\bcoating|\bbopp\b|\bsize|પહોળ|લંબાઈ|लंबाई|चौड़|જીએસએમ|जीएसएम|સાઇઝ|साइज/i
 };
 /** C21 — a question about saved records? → null, or { money: about a cost, a price or an amount; fields: about a
     calculation field } */
 export function dataAsked(text) {
   const x = asciiDigits(String(text || ''));
   if (!x.trim() || DQ.number.test(x) || DQ.onScreen.test(x) || DQ.help.test(x)) return null;
-  const when = DQ.when.test(x), filter = DQ.filter.test(x);
-  /* a bag described ("490x550 70 gram") or a recipe's figures: work — unless saved records are asked about */
-  if ((TW.calcSpec.test(x) || TW.recipeFig.test(x)) && !when && !filter) return null;
+  const when = DQ.when.test(x), filter = DQ.filter.test(x), saved = DQ.saved.test(x);
+  /* a bag described ("490x550 70 gram") or a recipe's figures: work — unless saved records are asked about (4.74.0, live:
+     "from calcuation saw me 500 mm width bag" is a search of the saved bags) */
+  if ((TW.calcSpec.test(x) || TW.recipeFig.test(x)) && !when && !filter && !saved) return null;
   /* something to make or send, unless it is a list or a summary of saved records */
   if (DQ.make.test(x) && !DQ.listish.test(x) && !when) return null;
   /* 4.74.0 review — an edit ("set the BOM total to 500 kg"), unless a list or something to show is asked for, and a
@@ -2260,7 +2266,7 @@ export function dataAsked(text) {
   if (DQ.qty.test(x) && !when && !filter && !DQ.whichNoun.test(x)) return null;
   const noun = DQ.noun.test(x);
   const strong = DQ.whichNoun.test(x) || (noun && (DQ.most.test(x) || filter || DQ.group.test(x)));
-  const weak = noun && (when || DQ.all.test(x) || (DQ.followish.test(x) && DQ.state.test(x))) && (DQ.show.test(x) || !DQ.work.test(x));
+  const weak = noun && (when || saved || DQ.all.test(x) || (DQ.followish.test(x) && DQ.state.test(x))) && (DQ.show.test(x) || !DQ.work.test(x));
   if (!strong && !weak) return null;
   if (DQ.advice.test(x) && !DQ.most.test(x)) return null;
   return { money: asksRates(x) || DQ.money.test(x), fields: DQ.fields.test(x) || TW.calcSpec.test(x) };
