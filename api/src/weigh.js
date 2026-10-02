@@ -268,6 +268,21 @@ export async function calcForm(companyId) {
   return { httpStatus: 200, body: formOf(desktopOver(await mastersOf(companyId))) };
 }
 
+/* 4.73.0 — C16: the same form for Nexora AI's enquiry paste (index.js /v1/ai/enquiry-paste): the plant's
+   constructions, fields and units. Kept a minute per company, so a run of pastes (or a person pressing again
+   while the company's AI day is used up) does not start the desktop's modules every time. */
+const FORM_TTL_MS = 60 * 1000;
+const formCache = new Map();   // companyId -> { at, form }
+export async function plantForm(companyId) {
+  const id = Number(companyId);
+  const hit = formCache.get(id);
+  if (hit && Date.now() - hit.at < FORM_TTL_MS) return hit.form;
+  const form = JSON.parse(JSON.stringify(formOf(desktopOver(await mastersOf(companyId)))));
+  formCache.set(id, { at: Date.now(), form });
+  if (formCache.size > 500) { for (const [k, v] of formCache) if (Date.now() - v.at >= FORM_TTL_MS) formCache.delete(k); }
+  return form;
+}
+
 export async function calcWeigh(companyId, calc) {
   return weighWith(desktopOver(await mastersOf(companyId)), calc);
 }

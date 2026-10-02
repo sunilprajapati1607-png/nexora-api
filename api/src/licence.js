@@ -21,7 +21,7 @@
  * lived on purpose — a stolen token is worth 24 hours, and every call that
  * matters re-reads the licence row anyway.
  */
-import { createHmac, createHash, timingSafeEqual, randomInt } from 'node:crypto';
+import { createHmac, createHash, timingSafeEqual, randomInt, hkdfSync } from 'node:crypto';
 import { q, getSettings, logEvent } from './db.js';
 import { cleanPlan, featuresFor } from './plans.js';
 
@@ -46,6 +46,14 @@ if (SECRET.length > 0 && SECRET.length < TOKEN_SECRET_MIN) {
 if (!SECRET.length) console.error('[nexora] NEXORA_TOKEN_SECRET is not set — every route that issues or reads a token answers 503 SERVICE_MISCONFIGURED until it is');
 export const MISCONFIGURED = { error: 'SERVICE_MISCONFIGURED',
   message: 'The Nexora service is not set up correctly just now. Your work is safe on this computer — Nexora has been told; try again later.' };
+
+/* 4.73.0 — C19: A KEY OF ITS OWN FOR EACH PURPOSE, made from the secret the tokens are signed with (HKDF-SHA256,
+   `info` naming the purpose — 'nexora-backup-secret-v1' for the backup passwords), so nothing new has to be set
+   on Render and the token secret itself never leaves this file. 32 bytes; null when there is no secret. */
+export function serviceKey(info) {
+  if (!tokenSecretOk()) return null;
+  return Buffer.from(hkdfSync('sha256', Buffer.from(SECRET, 'utf8'), Buffer.alloc(0), Buffer.from(String(info), 'utf8'), 32));
+}
 
 /* ---- licence keys ----------------------------------------------------
    NEX-4K2M-9QTX-7BWH. Read over the phone, typed by a plant clerk, so the

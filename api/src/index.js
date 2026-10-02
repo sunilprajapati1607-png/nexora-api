@@ -17,11 +17,14 @@ import { activate, authorise, touch, issueToken, reportUsage, companyUsage, desc
 import { runBom, missingRates } from './engine.js';
 import { adminGate, listLicences, licenceAction, companyAction, saveSettings, recentEvents, ADMIN_HTML,
   consoleCaller, dbStatus, purgeArchivedSoon } from './admin.js';
-import { login, listUsers, userAction, pull, push, describeUser, userCap, setCompanyPasscode, releaseSession, maxSeq, listDevices, deviceAction, canSeeCost, PRICE_MASTER } from './sync.js';
+import { login, listUsers, userAction, pull, push, describeUser, userCap, setCompanyPasscode, releaseSession, maxSeq, listDevices, deviceAction, canSeeCost, PRICE_MASTER,
+  hasRight, listRecycle, restoreRecycled } from './sync.js';
+import { secretState as backupSecretState, setSecret as setBackupSecret, showSecret as showBackupSecret } from './backupSecret.js';
 import { waitFor, wakeCompany, wakeChat, endSessionOn, WAIT_MS } from './waiters.js';
-import { calcForm, calcWeigh, calcNumbers, enquiryNumber } from './weigh.js';
+import { calcForm, calcWeigh, calcNumbers, enquiryNumber, plantForm } from './weigh.js';
 import { quoteForm, quoteSheet } from './quoteSheet.js';
-import { checkBom as aiCheckBom, planRoute as aiPlanRoute, fillCalc as aiFillCalc, editBom as aiEditBom, quoteLetter as aiQuoteLetter, help as aiHelp, chat as aiChat, assist as aiAssist, speak as aiSpeak, pickLang, aiStatus, withKey as aiWithKey, checkKey as aiCheckKey } from './ai.js';
+import { checkBom as aiCheckBom, planRoute as aiPlanRoute, fillCalc as aiFillCalc, editBom as aiEditBom, quoteLetter as aiQuoteLetter, help as aiHelp, chat as aiChat, assist as aiAssist, speak as aiSpeak, pickLang, aiStatus, withKey as aiWithKey, checkKey as aiCheckKey,
+  enquiryPaste as aiEnquiryPaste } from './ai.js';
 import { companyAi, keyInfo as aiKeyInfo, setKey as aiSetKey, clearKey as aiClearKey, canKeep as aiCanKeep } from './aikey.js';
 import { send as chatSend, since as chatSince, remove as chatRemove, clearBy as chatClearBy, listBroadcasts, broadcastAction } from './chat.js';
 import { ensureInkSchema, getModel, listModels, train as inkTrain, estimate as inkEstimate, reset as inkReset, restore as inkRestore } from './inkstore.js';
@@ -265,7 +268,9 @@ export default {
       if (path === '/enquiry' && method === 'POST') {
         await ensureSchema();
         const body = await readBody();
-        return json(await publicInquiry(body, remoteIp(request)));
+        /* 4.73.0 — C17: the website's form 2 missing a required field is told so (400 MISSING); all else as before */
+        const out = await publicInquiry(body, remoteIp(request));
+        return out && out.httpStatus ? json(out.body, out.httpStatus) : json(out);
       }
 
       /* ---- the app ------------------------------------------------- */
@@ -485,6 +490,37 @@ export default {
         if (pushed && pushed.applied && pushed.applied.length) wakeCompany(a.companyId, a.row.device_id);
         return json(pushed);
       }
+      /* 4.73.0 — C15: THE RECYCLE BIN, for the company's administrator. GET: every deleted calculation, BOM,
+         quotation, enquiry and customer still kept (RECYCLE_KEEP_DAYS) — kind, id, number/name, who, when, when it
+         goes — never a body. POST restore {binId}: that one written back as a fresh change (sync.js). */
+      if ((path === '/v1/recycle' && method === 'GET') || (path === '/v1/recycle/restore' && method === 'POST')) {
+        await ensureSchema();
+        const a = await authorise(request);
+        if (!a.ok) return json(a.error, a.httpStatus);
+        if (!a.user) return json({ error: 'SIGN_IN', message: 'Sign in to open the recycle bin.' }, 401);
+        if (a.user.role !== 'ADMIN') return json({ error: 'ADMIN_ONLY', message: 'Only your Nexora administrator can open the recycle bin.' }, 403);
+        if (!a.companyId) return json({ error: 'NO_COMPANY', message: 'Only a licensed company has a recycle bin.' }, 400);
+        if (method === 'GET') return json(await listRecycle(a.companyId));
+        /* putting a record back is a save: a licence that has ended keeps its records as they are */
+        if (!a.licence.canCalculate) return json({ error: 'LICENCE_REQUIRED', licence: a.licence, message: a.licence.message || 'This licence has ended — nothing can be put back until it is renewed.' }, 402);
+        const body = await readBody();
+        const out = await restoreRecycled(a.companyId, a.user, body.binId);
+        return json(out.body, out.httpStatus);
+      }
+      /* 4.73.0 — C19: THE BACKUP PASSWORD (backupSecret.js). state: anybody signed in; set and show: the
+         administrator, show (and replacing one) after their PIN, checked and locked exactly as a sign-in. */
+      if ((path === '/v1/backup/secret/state' && method === 'GET') ||
+          ((path === '/v1/backup/secret/set' || path === '/v1/backup/secret/show') && method === 'POST')) {
+        await ensureSchema();
+        const a = await authorise(request);
+        if (!a.ok) return json(a.error, a.httpStatus);
+        if (!a.user) return json({ error: 'SIGN_IN', message: 'Sign in first.' }, 401);
+        if (!a.companyId) return json({ error: 'NO_COMPANY', message: 'Only a licensed company keeps a backup password.' }, 400);
+        if (method === 'GET') { const st = await backupSecretState(a.companyId); return json(st.body, st.httpStatus); }
+        const body = await readBody();
+        const out = path.endsWith('/set') ? await setBackupSecret(a.companyId, a.user, body) : await showBackupSecret(a.companyId, a.user, body);
+        return json(out.body, out.httpStatus);
+      }
       /* 4.68.0 — Marketing: is this customer already with somebody? Names only who, and on what it matched. */
       /* 4.68.2 — Nexora Mobile: the next enquiry number (the computers find it from their own stubs) */
       if (path === '/v1/marketing/number' && method === 'GET') {
@@ -658,6 +694,28 @@ export default {
         if (!a.user) return json({ error: 'SIGN_IN', message: 'Sign in to use Nexora AI.' }, 401);
         const body = await readBody();
         const out = await runAi(a, () => aiFillCalc(a.companyId || a.row.device_id, body.fill, pickLang(body.lang)));
+        return json(out.body, out.httpStatus);
+      }
+      /* 4.73.0 — C16 (audit 55): AN ENQUIRY PASTED FROM WHATSAPP OR AN E-MAIL, read into the enquiry and its bag
+         sizes (ai.js enquiryPaste). For a person who may make enquiries (MKT_SAVE, read as the applications read
+         it; an administrator always); one Nexora AI question of the company's day. The plant's constructions,
+         fields and units (as the phone's form has them) and its enquiry sources are read here, on the service;
+         private names arrive as [C1]-style codes (C9) and go back as they came. Nothing is saved here. */
+      if (path === '/v1/ai/enquiry-paste' && method === 'POST') {
+        await ensureSchema();
+        const a = await authorise(request);
+        if (!a.ok) return json(a.error, a.httpStatus);
+        if (!a.user) return json({ error: 'SIGN_IN', message: 'Sign in to use Nexora AI.' }, 401);
+        if (!hasRight(a.user, 'MKT_SAVE')) {
+          return json({ error: 'NO_RIGHT', right: 'MKT_SAVE', message: 'You may not make enquiries — your administrator gives that right (Settings → Users & access).' }, 403);
+        }
+        const body = await readBody();
+        const out = await runAi(a, () => aiEnquiryPaste(a.companyId || a.row.device_id, body, pickLang(body.lang), undefined,
+          { loadPlant: async () => {
+            const form = a.companyId ? await plantForm(a.companyId) : null;
+            return { constructions: form ? form.constructions : [], fields: form ? form.fields : [], units: form ? form.units : null,
+              sources: a.companyId ? await sourcesOf(a.companyId) : [] };
+          } }));
         return json(out.body, out.httpStatus);
       }
       /* Nexora AI, phase 2 — a route or a saved workflow proposed from plain words */

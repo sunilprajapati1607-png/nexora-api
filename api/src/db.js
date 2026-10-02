@@ -526,9 +526,51 @@ export function ensureSchema() {
        Two new, empty columns: no existing row is touched. */
     await q(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ`);
     await q(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS deleted_state TEXT`);
+    /* 4.73.0 — C15 (owner: recycle bin "ha") — THE RECYCLE BIN. Before a push marks a calculation, a BOM, a
+       quotation, an enquiry or a customer deleted, the copy being deleted is written here (sync.js push, in the
+       same statement), and kept RECYCLE_KEEP_DAYS (30): the company's administrator puts one back
+       (/v1/recycle/restore), and the routine that erases a deleted company erases what is older (admin.js
+       purgeArchived, at most every six hours). `title` is the record's number / name, so the list never reads a
+       body; `deleted_by_name` keeps who deleted it readable after that person is removed. A new table: nothing
+       that exists is touched. */
+    await q(`
+      CREATE TABLE IF NOT EXISTS recycle_bin (
+        bin_id          BIGSERIAL PRIMARY KEY,
+        company_id      BIGINT NOT NULL,
+        kind            TEXT NOT NULL,
+        rec_id          TEXT NOT NULL,
+        body            JSONB,
+        owner_id        BIGINT,
+        title           TEXT,
+        deleted_by      BIGINT,
+        deleted_by_name TEXT,
+        deleted_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+      )`);
+    await q(`CREATE INDEX IF NOT EXISTS recycle_bin_company_idx ON recycle_bin (company_id, deleted_at DESC)`);
+    await q(`CREATE INDEX IF NOT EXISTS recycle_bin_age_idx ON recycle_bin (deleted_at)`);
+    /* 4.73.0 — C17 (owner: "location of manufacturing, website, product range … all information mandatory") —
+       what the website's enquiry form 2 adds (inquiry.js publicInquiry): the manufacturing location, the
+       website, the product ticks (a JSON list of the form's own names) and the words typed beside "Other".
+       Nullable, no default: an existing row reads NULL and nothing is rewritten. */
+    await q(`ALTER TABLE inquiries ADD COLUMN IF NOT EXISTS location TEXT`);
+    await q(`ALTER TABLE inquiries ADD COLUMN IF NOT EXISTS website TEXT`);
+    await q(`ALTER TABLE inquiries ADD COLUMN IF NOT EXISTS products JSONB`);
+    await q(`ALTER TABLE inquiries ADD COLUMN IF NOT EXISTS product_other TEXT`);
+    /* 4.73.0 — C19 (owner: a separate backup password; "admin can get that passward from software also only
+       admin") — ONE PER COMPANY, LOCKED: AES-256-GCM under a key derived from the token secret
+       (backupSecret.js), never the password itself. A table of its own, so no company row, licence answer,
+       pull, heartbeat or console listing can ever carry it; erased with the company (admin.js PURGE_SQL). */
+    await q(`
+      CREATE TABLE IF NOT EXISTS backup_secrets (
+        company_id BIGINT PRIMARY KEY,
+        secret_enc TEXT NOT NULL,
+        set_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+        set_by     BIGINT
+      )`);
     /* 4.72.0 — ink_model_history (inkstore.js, made with the ink tables) has row level security like
        sync_history; on a database where it does not exist yet it is skipped and done on a later start */
-    for (const t of ['chat_messages', 'feedback', 'inquiries', 'app_releases', 'ai_usage', 'sync_history', 'ink_model_history']) {
+    /* 4.73.0 — and the recycle bin and the backup passwords */
+    for (const t of ['chat_messages', 'feedback', 'inquiries', 'app_releases', 'ai_usage', 'sync_history', 'ink_model_history', 'recycle_bin', 'backup_secrets']) {
       try {
         await q(`DO $rls$ BEGIN
                    IF EXISTS (SELECT 1 FROM pg_tables WHERE schemaname = current_schema() AND tablename = '${t}' AND tableowner = current_user)

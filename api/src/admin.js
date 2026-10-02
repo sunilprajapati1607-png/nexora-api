@@ -20,7 +20,7 @@ import { newLicenceKey, maskKey, keylessRefused, forgetCompanies, DELETED_KEEP_D
 import { aiUsedTodayAll, aiDefaultDaily } from './ai.js';
 import { forget as aiForget } from './aikey.js';
 import { ensureAdmin, usersSummary, userCap, listUsers, hashPin, validPin, nameKey, cleanEmail, defaultPermissions, resendPrices,
-  signOutEverywhere, masterHistory, restoreMaster } from './sync.js';
+  signOutEverywhere, masterHistory, restoreMaster, purgeRecycleBin, RECYCLE_KEEP_DAYS } from './sync.js';
 import { ensureInkSchema } from './inkstore.js';
 
 const ADMIN_KEY = process.env.NEXORA_ADMIN_KEY || '';
@@ -1003,6 +1003,8 @@ const PURGE_SQL = `
        ch AS (DELETE FROM chat_messages     WHERE company_id IN (SELECT id FROM due) RETURNING 1),
        fb AS (DELETE FROM feedback          WHERE company_id IN (SELECT id FROM due) RETURNING 1),
        ai AS (DELETE FROM ai_usage          WHERE company_id IN (SELECT id::text FROM due) RETURNING 1),
+       rb AS (DELETE FROM recycle_bin       WHERE company_id IN (SELECT id FROM due) RETURNING 1),
+       bs AS (DELETE FROM backup_secrets    WHERE company_id IN (SELECT id FROM due) RETURNING 1),
        iq AS (UPDATE inquiries SET company_id = NULL WHERE company_id IN (SELECT id FROM due) RETURNING 1),
        co AS (DELETE FROM companies         WHERE id IN (SELECT id FROM due) RETURNING 1)
   SELECT (SELECT COUNT(*) FROM co)::int AS companies, (SELECT COUNT(*) FROM l)::int AS installations,
@@ -1010,13 +1012,19 @@ const PURGE_SQL = `
          (SELECT COUNT(*) FROM h)::int AS "masterHistory", (SELECT COUNT(*) FROM i)::int AS "inkModels",
          (SELECT COUNT(*) FROM ih)::int AS "inkHistory", (SELECT COUNT(*) FROM ch)::int AS chats,
          (SELECT COUNT(*) FROM fb)::int AS reports, (SELECT COUNT(*) FROM ai)::int AS "aiDays",
+         (SELECT COUNT(*) FROM rb)::int AS "recycleBin", (SELECT COUNT(*) FROM bs)::int AS "backupSecret",
          (SELECT COUNT(*) FROM iq)::int AS "enquiriesUnlinked"`;
+/* 4.73.0 — C15: the same run erases every company's recycle-bin copies older than RECYCLE_KEEP_DAYS (sync.js),
+   whether or not a company is due; `binErased` says how many went. C19: a company erased takes its backup
+   password with it (bs above) — while it is only deleted (restorable) the password stays, as everything does. */
 export async function purgeArchived() {
+  const binErased = await purgeRecycleBin();
+  if (binErased) await logEvent(null, 'RECYCLE_PURGE', { erased: binErased, keepDays: RECYCLE_KEEP_DAYS });
   const due = await q(`SELECT id, name FROM companies
                         WHERE deleted_at IS NOT NULL AND deleted_at < now() - make_interval(days => $1::int)
                         ORDER BY deleted_at LIMIT 20`, [DELETED_KEEP_DAYS]);
   const purged = [];
-  if (!due.length) return { purged };
+  if (!due.length) return { purged, binErased };
   await ensureInkSchema();   /* ink_models / ink_model_history exist before they are named */
   for (const c of due) {
     const r = (await q(PURGE_SQL, [c.id, DELETED_KEEP_DAYS]))[0];
@@ -1026,7 +1034,7 @@ export async function purgeArchived() {
       purged.push({ id: Number(c.id), name: c.name, erased });
     }
   }
-  return { purged };
+  return { purged, binErased };
 }
 const PURGE_EVERY_MS = 6 * 60 * 60 * 1000;
 let purgeLast = 0, purgeRunning = null;
@@ -2412,11 +2420,26 @@ function qPill(state){
   const map={NEW:'TRIAL',CONTACTED:'SELF',DEMO:'EXPIRED',QUOTED:'EXPIRED',WON:'LICENSED',LOST:'REVOKED'};
   return map[state]||'SELF';
 }
+/* 4.73.0 — C17: the website form 2's manufacturing location, website and product ticks. A website is a link only
+   when it is an ordinary web address (http, https, or a bare www.example.com); anything else is shown as text. */
+function siteLink(w){
+  const s=String(w==null?'':w).trim();if(!s)return '';
+  const l=s.toLowerCase();
+  const href=(l.indexOf('http://')===0||l.indexOf('https://')===0)?s:(s.indexOf(' ')<0&&s.indexOf(':')<0&&s.indexOf('.')>0?'https://'+s:'');
+  return href?'<a href="'+esc(href)+'" target="_blank" rel="noopener noreferrer">'+esc(s)+'</a>':esc(s);
+}
+function form2Lines(q){
+  const out=[];
+  if(q.location)out.push('<span class="why">Location: '+esc(q.location)+'</span>');
+  if(q.products&&q.products.length)out.push('<span class="why">Makes: '+esc(q.products.map(p=>p==='Other'&&q.productOther?'Other ('+q.productOther+')':p).join(', '))+'</span>');
+  if(q.website)out.push('<span class="why">Website: '+siteLink(q.website)+'</span>');
+  return out.length?'<br>'+out.join('<br>'):'';
+}
 function renderInquiries(){
   const term=(document.getElementById('qq').value||'').toLowerCase();
   const all=QDATA.inquiries||[];
   const rows=all.filter(q=>(!QSTATE||q.state===QSTATE)&&(!term||
-    [q.name,q.company,q.phone,q.email,q.product,q.message,q.notes].some(v=>String(v||'').toLowerCase().includes(term))));
+    [q.name,q.company,q.phone,q.email,q.product,q.message,q.notes,q.location,q.website,(q.products||[]).join(' '),q.productOther].some(v=>String(v||'').toLowerCase().includes(term))));
   document.getElementById('qsub').textContent='— '+rows.length+' of '+all.length;
   const jq=document.getElementById('jump-q');if(jq){const nn=all.filter(q=>q.state==='NEW').length;jq.textContent=nn;jq.className=nn?'hot':'zero';}
 
@@ -2436,7 +2459,7 @@ function renderInquiries(){
     if(q.email)reach.push('<a href="'+esc(mailHref(q.email))+'"><code>'+esc(q.email)+'</code></a>');
     return '<tr>'+
       '<td><b>'+esc(q.name)+'</b>'+(q.company?'<br><span class="why">'+esc(q.company)+'</span>':'')+'</td>'+
-      '<td>'+esc(q.product||'—')+'</td>'+
+      '<td>'+esc(q.product||'—')+form2Lines(q)+'</td>'+
       '<td><span class="pill s-'+qPill(q.state)+'">'+esc(String(q.state).toLowerCase())+'</span></td>'+
       '<td class="why">'+esc(String(q.source||'').toLowerCase())+'<br>'+fmt(q.createdAt)+'</td>'+
       '<td>'+(reach.join('<br>')||'<span class="why">nothing given</span>')+'</td>'+

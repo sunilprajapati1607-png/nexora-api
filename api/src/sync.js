@@ -621,6 +621,10 @@ const ADMIN_ONLY_MASTERS = { 'nexora.rm.price.v1': 1, 'nexora.constants.v1': 1, 
    "admin can give permision to marketing manager to see all user data or can select several user data". */
 const KINDS = { master: true, calc: true, bom: true, quote: true, enquiry: true, customer: true };
 const MKT_KINDS = { enquiry: true, customer: true };
+/* 4.73.0 — C15: THE RIGHT EACH DELETION NEEDS (the desktop's own Delete ticks; an administrator has every one),
+   and so the kinds whose deleted copy the recycle bin keeps. A master is not one: sync_history keeps those (C12). */
+const DELETE_RIGHT = { calc: 'DELETE_CALC', bom: 'BOM_DELETE', quote: 'QUOTE_DELETE', enquiry: 'MKT_DELETE', customer: 'MKT_DELETE' };
+export const RECYCLE_KEEP_DAYS = 30;
 /* 4.70.4 — the records a stale push is answered for (see the push below) */
 const STALE_KINDS = { quote: true, enquiry: true, customer: true };
 const PAGE = 200;
@@ -684,6 +688,27 @@ function mktCanSee(user, row) {
   if (mktSeesPerson(user, row.owner_id)) return true;
   const b = row.body || {};
   return row.kind === 'enquiry' && b.assignedTo != null && b.assignedTo !== '' && mktSeesPerson(user, b.assignedTo);
+}
+
+/* ---- 4.73.0 — A RIGHT, READ THE WAY THE APPLICATIONS READ IT -------------------
+   The desktop (syncClient.js installUsers + app.js can / PERM_INHERITS) and the phone (Perms.kt on) read a
+   person's ticks the same way, and the service now reads them so too wherever it decides by one (C15's delete
+   rights, C16's MKT_SAVE): an administrator has every right; a row never ticked (permissions NULL — every
+   person made before 4.71.0) has every right but the ones only ever GIVEN; a key the row carries is what it
+   says; a key the row predates takes what it was split from. Change these together with app.js and Perms.kt. */
+const PERM_INHERITS = { BOM_SAVE: 'BOM_ACCESS', BOM_DELETE: 'BOM_ACCESS', QUOTE_ACCESS: true, QUOTE_SAVE: true, VIEW_CONSTANTS: true,
+  EDIT_PROCESS: 'EDIT_ROUTE', EDIT_WORKFLOW: 'BOM_SAVE', MKT_ACCESS: true, MKT_SAVE: true };
+const GIVEN_ONLY = { VIEW_COST: 1, MANAGE_USERS: 1, MOBILE_SCREENSHOT: 1, EXPORT_EXCEL: 1 };
+const ticked = (v) => v === true || String(v).toLowerCase() === 'true';
+export function hasRight(user, key) {
+  if (!user) return false;
+  if (user.role === 'ADMIN') return true;
+  let p = user.permissions;
+  if (typeof p === 'string') { try { p = JSON.parse(p); } catch (e) { p = null; } }
+  if (!p || typeof p !== 'object' || Array.isArray(p)) return !GIVEN_ONLY[key];
+  if (Object.prototype.hasOwnProperty.call(p, key)) return ticked(p[key]);
+  const from = PERM_INHERITS[key];
+  return from === true ? true : from ? ticked(p[from]) : false;
 }
 
 /** A calculation another person owns is sent as a STUB — number, code and
@@ -1112,6 +1137,19 @@ export async function push(companyId, user, records) {
       [companyId, kind, id]))[0] || null;
     let deleted = rec.deleted === true, trimmed = false;
 
+    /* 4.73.0 — C15: DELETING A CALCULATION, A BOM, A QUOTATION, AN ENQUIRY OR A CUSTOMER NEEDS ITS RIGHT
+       (DELETE_RIGHT; an administrator always). Without it the push is refused NO_DELETE_RIGHT and nothing
+       changes — the application pulls the company's copy back, as it does for ADMIN_ONLY. What counts as a
+       deletion is what would take the record away: "deleted" in any truthy form, or no body at all (a null body
+       used to be stored as an empty, undeleted record — gone from every pull, kept by nobody). Both are now a
+       real deletion, so the record's last copy goes to the recycle bin (below) and every computer hears it.
+       A BOM also goes with its calculation: a person who may delete calculations deletes the BOM of one that is
+       deleted (the desktop's Delete takes "its costed BOM with it"). */
+    if (DELETE_RIGHT[kind] && (rec.deleted || rec.body == null)) {
+      deleted = true; bodyText = null;
+      if (!(await mayDelete(companyId, user, kind, id))) { refused.push({ id, kind, reason: 'NO_DELETE_RIGHT' }); continue; }
+    }
+
     /* 4.66.3 — prices, constants and the company details are changed by an
        ADMINISTRATOR; anybody else asks through an approval. The application
        has always held these back from other people's pushes — the service
@@ -1153,10 +1191,10 @@ export async function push(companyId, user, records) {
       /* 4.68.0 — marketing. Whoever is given an enquiry may work on it (a follow-up by the person it is assigned
          to, the manager's note); only its owner, an administrator or scope ALL may delete it. */
       if (cur && !cur.deleted && cur.owner_id != null && Number(cur.owner_id) !== Number(user.id)) {
-        const may = rec.deleted ? (user.role === 'ADMIN' || user.scope === 'ALL') : mktCanSee(user, { kind, owner_id: cur.owner_id, body: cur.body });
+        const may = deleted ? (user.role === 'ADMIN' || user.scope === 'ALL') : mktCanSee(user, { kind, owner_id: cur.owner_id, body: cur.body });
         if (!may) { refused.push({ id, kind, reason: 'NOT_YOURS' }); continue; }
       }
-      if (kind === 'enquiry' && !rec.deleted && rec.body && rec.body.enquiryNumber) {
+      if (kind === 'enquiry' && !deleted && rec.body && rec.body.enquiryNumber) {
         const n = String(rec.body.enquiryNumber);
         const clash = await q(
           `SELECT id FROM sync_records WHERE company_id = $1 AND kind = 'enquiry' AND deleted = false
@@ -1172,7 +1210,7 @@ export async function push(companyId, user, records) {
       if (cur && cur.owner_id != null && Number(cur.owner_id) !== Number(user.id) && user.scope !== 'ALL') {
         refused.push({ id, kind, reason: 'NOT_YOURS' }); continue;
       }
-      if (kind === 'calc' && !rec.deleted) {
+      if (kind === 'calc' && !deleted) {
         const n = calcNumberOf(rec.body);
         if (n) {
           const clash = await q(
@@ -1193,12 +1231,12 @@ export async function push(companyId, user, records) {
        A push without baseSeq (an older client) is taken as before: the last save wins. */
     /* 4.72.0 (audit 2) — a BOM or a quotation coming back with its costs held back (it was sent so): every
        null money figure is filled again from the company's copy before it is stored, and the marks go */
-    if (COST_STRIP[kind] && !rec.deleted && hasHiddenMark(rec.body)) {
+    if (COST_STRIP[kind] && !deleted && hasHiddenMark(rec.body)) {
       restoreHiddenCosts(kind, rec.body, cur && !cur.deleted ? cur.body : null);
       bodyText = JSON.stringify(rec.body);
     }
 
-    if (STALE_KINDS[kind] && !rec.deleted && cur && !cur.deleted && rec.baseSeq != null &&
+    if (STALE_KINDS[kind] && !deleted && cur && !cur.deleted && rec.baseSeq != null &&
         Number(cur.seq) > Number(rec.baseSeq) && JSON.stringify(cur.body) !== bodyText) {
       /* 4.72.0 (audit 2) — answered with the copy this person may see */
       conflicts.push({ kind, id, seq: Number(cur.seq), body: !canSeeCost(user) && COST_STRIP[kind] ? COST_STRIP[kind](cur.body) : cur.body, reason: 'STALE' });
@@ -1211,21 +1249,173 @@ export async function push(companyId, user, records) {
     }
 
     const owner = kind === 'master' ? null : (cur && cur.owner_id != null ? cur.owner_id : user.id);
-    const rows = await q(
-      `INSERT INTO sync_records (company_id, kind, id, body, owner_id, deleted, updated_at, updated_by)
-       VALUES ($1, $2, $3, $4::jsonb, $5, $6, now(), $7)
+    const upsert = `INSERT INTO sync_records (company_id, kind, id, body, owner_id, deleted, updated_at, updated_by)
+       VALUES ($1::bigint, $2::text, $3::text, $4::jsonb, $5::bigint, $6::boolean, now(), $7::bigint)
        ON CONFLICT (company_id, kind, id) DO UPDATE
          SET body = EXCLUDED.body, deleted = EXCLUDED.deleted, updated_at = now(), updated_by = EXCLUDED.updated_by,
              owner_id = COALESCE(sync_records.owner_id, EXCLUDED.owner_id),
              seq = nextval(pg_get_serial_sequence('sync_records', 'seq'))
-       RETURNING seq, owner_id`,
-      [companyId, kind, id, bodyText, owner, deleted, user.id]);
+       RETURNING seq, owner_id`;
+    const params = [companyId, kind, id, bodyText, owner, deleted, user.id];
+    /* 4.73.0 — C15: the copy a deletion takes away goes to the recycle bin IN THE SAME STATEMENT (the stored row
+       as it stands, read by the statement that marks it deleted), so a record is never deleted without its copy
+       being kept, nor kept without being deleted */
+    const rows = deleted && DELETE_RIGHT[kind] && cur && !cur.deleted
+      ? await q(`WITH binned AS (
+                   INSERT INTO recycle_bin (company_id, kind, rec_id, body, owner_id, title, deleted_by, deleted_by_name)
+                   SELECT company_id, kind, id, body, owner_id, $8::text, $7::bigint, $9::text FROM sync_records
+                    WHERE company_id = $1::bigint AND kind = $2::text AND id = $3::text AND deleted = false AND body IS NOT NULL
+                   RETURNING 1)
+                 ${upsert}`, params.concat([titleOf(kind, cur.body, id), user.name == null ? null : String(user.name)]))
+      : await q(upsert, params);
     const done = { kind, id, seq: Number(rows[0].seq), ownerId: rows[0].owner_id == null ? null : Number(rows[0].owner_id) };
     /* 4.71.0 — part of what was sent was left out (C4): the next pull brings the company's copy */
     if (trimmed) done.trimmed = true;
     applied.push(done);
   }
   return { applied, conflicts, refused, me: describeUser(user) };
+}
+
+/* ---- 4.73.0 — C15: THE RECYCLE BIN -----------------------------------------------
+   Owner 2026-10-02: recycle bin "ha"; the lead's defaults: kept 30 days, the administrator puts one back.
+   Every deletion a push makes of a calculation, BOM, quotation, enquiry or customer keeps the copy it takes
+   away (push, above). The company's administrator lists them (GET /v1/recycle — no bodies) and puts one back
+   (POST /v1/recycle/restore): written as a fresh change, so every computer and phone pulls it, exactly as if
+   it had been saved again. RECYCLE_KEEP_DAYS after the deletion the copy is erased (purgeRecycleBin, run by
+   admin.js purgeArchived at most every six hours). */
+
+/** May this person delete this record? Their own right for its kind — or, for a BOM, the right to delete
+ *  calculations when its calculation is deleted (or was never on the service): it goes with it. */
+async function mayDelete(companyId, user, kind, id) {
+  if (hasRight(user, DELETE_RIGHT[kind])) return true;
+  if (kind === 'bom' && hasRight(user, 'DELETE_CALC')) {
+    const c = (await q(`SELECT deleted FROM sync_records WHERE company_id = $1 AND kind = 'calc' AND id = $2`, [companyId, id]))[0];
+    return !c || c.deleted === true;
+  }
+  return false;
+}
+
+/** What the recycle bin calls a record: its number, and the name that goes with it. */
+export function titleOf(kind, body, id) {
+  const b = plainObject(body) || {};
+  const s = (v) => (v == null || typeof v === 'object' ? '' : String(v).replace(/[\u0000-\u001f\u007f]+/g, ' ').trim());
+  const nameOf = (v) => (plainObject(v) ? s(v.name) : s(v));
+  const pair = (a, c) => [s(a), c].filter(Boolean).join(' · ');
+  let t = '';
+  if (kind === 'calc') t = pair(b.calcNumber, s(b.itemName));
+  else if (kind === 'bom') t = pair(b.bomNumber || b.calcNumber, s(b.itemName));
+  else if (kind === 'quote') t = pair(b.quoteNumber, nameOf(b.customer) || s(b.buyer) || s(b.customerName));
+  else if (kind === 'enquiry') t = pair(b.enquiryNumber, nameOf(b.customer) || s(b.customerName));
+  else if (kind === 'customer') t = s(b.name);
+  return (t || String(id || '')).slice(0, 200);
+}
+
+const isoOfMs = (ms) => (ms == null ? null : new Date(Number(ms)).toISOString());
+
+/** GET /v1/recycle — the company's recycle bin, newest first, without a body: up to 1000, and how many in all. */
+export async function listRecycle(companyId) {
+  const rows = await q(
+    `SELECT r.bin_id, r.kind, r.rec_id, r.title, COALESCE(u.name, r.deleted_by_name) AS by_name,
+            FLOOR(EXTRACT(EPOCH FROM r.deleted_at) * 1000)::bigint AS at_ms,
+            FLOOR(EXTRACT(EPOCH FROM (r.deleted_at + make_interval(days => $2::int))) * 1000)::bigint AS purge_ms,
+            GREATEST(0, CEIL(EXTRACT(EPOCH FROM (r.deleted_at + make_interval(days => $2::int) - now())) / 86400))::int AS days_left
+       FROM recycle_bin r
+       LEFT JOIN company_users u ON u.id = r.deleted_by AND u.company_id = r.company_id
+      WHERE r.company_id = $1
+      ORDER BY r.deleted_at DESC, r.bin_id DESC
+      LIMIT 1000`, [companyId, RECYCLE_KEEP_DAYS]);
+  const total = Number(((await q(`SELECT COUNT(*)::int AS n FROM recycle_bin WHERE company_id = $1`, [companyId]))[0] || {}).n) || 0;
+  return {
+    items: rows.map((r) => ({ binId: Number(r.bin_id), kind: r.kind, id: r.rec_id, title: r.title || r.rec_id,
+      deletedBy: r.by_name || null, deletedAt: isoOfMs(r.at_ms), purgeAt: isoOfMs(r.purge_ms), daysLeft: Number(r.days_left) })),
+    total, keepDays: RECYCLE_KEEP_DAYS
+  };
+}
+
+/** One kept copy written back as a fresh, not-deleted change, and taken out of the bin — in one statement, and
+ *  only while the record is still deleted (a record saved again since is never overwritten). → { seq } or null. */
+async function putBack(companyId, byUserId, binId) {
+  const r = (await q(
+    `WITH b AS (SELECT kind, rec_id, body, owner_id FROM recycle_bin WHERE bin_id = $1::bigint AND company_id = $2::bigint),
+          up AS (INSERT INTO sync_records (company_id, kind, id, body, owner_id, deleted, updated_at, updated_by)
+                 SELECT $2::bigint, b.kind, b.rec_id, b.body, b.owner_id, false, now(), $3::bigint FROM b
+                 ON CONFLICT (company_id, kind, id) DO UPDATE
+                   SET body = EXCLUDED.body, deleted = false, updated_at = now(), updated_by = EXCLUDED.updated_by,
+                       owner_id = COALESCE(sync_records.owner_id, EXCLUDED.owner_id),
+                       seq = nextval(pg_get_serial_sequence('sync_records', 'seq'))
+                   WHERE sync_records.deleted = true
+                 RETURNING seq),
+          gone AS (DELETE FROM recycle_bin WHERE bin_id = $1::bigint AND company_id = $2::bigint AND EXISTS (SELECT 1 FROM up) RETURNING 1)
+     SELECT (SELECT seq FROM up) AS seq, (SELECT COUNT(*) FROM gone)::int AS removed`,
+    [binId, companyId, byUserId == null ? null : byUserId]))[0];
+  return r && r.seq != null ? { seq: Number(r.seq) } : null;
+}
+
+/** A calculation or an enquiry comes back only under a number nobody has taken since (a push is held to the
+ *  same rule: NUMBER_TAKEN). → the number taken, or null. */
+async function numberTaken(companyId, kind, id, body) {
+  const field = kind === 'calc' ? 'calcNumber' : kind === 'enquiry' ? 'enquiryNumber' : null;
+  const n = field && plainObject(body) && body[field] ? String(body[field]) : null;
+  if (!n) return null;
+  const clash = await q(`SELECT 1 FROM sync_records WHERE company_id = $1 AND kind = $2 AND deleted = false AND id <> $3 AND body->>'${field}' = $4 LIMIT 1`,
+    [companyId, kind, id, n]);
+  return clash.length ? n : null;
+}
+
+const WHAT = { calc: 'calculation', bom: 'BOM', quote: 'quotation', enquiry: 'enquiry', customer: 'customer' };
+
+/** POST /v1/recycle/restore {binId} — the administrator puts one back. A calculation brings back its BOM with it
+ *  when that sits in the bin too (they were deleted together). → { httpStatus, body } */
+export async function restoreRecycled(companyId, user, binId) {
+  const id = /^\d{1,18}$/.test(String(binId == null ? '' : binId).trim()) ? String(binId).trim() : null;
+  const notHere = { httpStatus: 404, body: { error: 'NOT_IN_BIN',
+    message: 'That is not in this company’s recycle bin — it may have been put back already, or erased ' + RECYCLE_KEEP_DAYS + ' days after it was deleted.' } };
+  if (!id) return notHere;
+  const b = (await q(`SELECT bin_id, kind, rec_id, title, body, deleted_at FROM recycle_bin WHERE bin_id = $1 AND company_id = $2`, [id, companyId]))[0];
+  if (!b) return notHere;
+  const what = WHAT[b.kind] || 'record';
+  const name = b.title || b.rec_id;
+  const live = () => ({ httpStatus: 409, body: { error: 'RECORD_EXISTS', kind: b.kind, id: b.rec_id,
+    message: 'This ' + what + ' (' + name + ') has been saved again since it was deleted, so the copy in the bin cannot go over it. Nothing was changed.' } });
+  const now = (await q(`SELECT deleted FROM sync_records WHERE company_id = $1 AND kind = $2 AND id = $3`, [companyId, b.kind, b.rec_id]))[0];
+  if (now && now.deleted === false) return live();
+  const taken = await numberTaken(companyId, b.kind, b.rec_id, b.body);
+  if (taken) {
+    return { httpStatus: 409, body: { error: 'NUMBER_TAKEN', kind: b.kind, id: b.rec_id, number: taken,
+      message: taken + ' has been given to another ' + what + ' since this one was deleted, so it cannot come back under it. Nothing was changed.' } };
+  }
+  const put = await putBack(companyId, user && user.id, b.bin_id);
+  if (!put) {
+    /* something happened in between: saved again, or put back by somebody else */
+    const again = (await q(`SELECT deleted FROM sync_records WHERE company_id = $1 AND kind = $2 AND id = $3`, [companyId, b.kind, b.rec_id]))[0];
+    return again && again.deleted === false ? live() : notHere;
+  }
+  const out = { ok: true, kind: b.kind, id: b.rec_id, seq: put.seq };
+  if (b.kind === 'calc') {
+    /* 4.73.0, the review — only a BOM deleted WITH it: the desktop's Delete sends the calculation and then its BOM
+       (the same push, or the next one), so that BOM's copy is never older than the calculation's. One deleted on its
+       own before (its own Delete, days ago) stays in the bin — it is put back by itself if it is wanted. */
+    const bb = (await q(
+      `SELECT r.bin_id FROM recycle_bin r
+        WHERE r.company_id = $1 AND r.kind = 'bom' AND r.rec_id = $2
+          AND r.deleted_at >= $3::timestamptz - interval '10 minutes'
+          AND NOT EXISTS (SELECT 1 FROM sync_records s WHERE s.company_id = r.company_id AND s.kind = 'bom' AND s.id = r.rec_id AND s.deleted = false)
+        ORDER BY r.deleted_at DESC, r.bin_id DESC LIMIT 1`, [companyId, b.rec_id, b.deleted_at]))[0];
+    const pb = bb ? await putBack(companyId, user && user.id, bb.bin_id) : null;
+    if (pb) out.bom = { binId: Number(bb.bin_id), seq: pb.seq };
+  }
+  await logEvent(null, 'RECYCLE_RESTORE', { companyId, by: user ? Number(user.id) : null, kind: b.kind, id: b.rec_id, binId: Number(b.bin_id),
+    bom: out.bom ? out.bom.binId : undefined });
+  /* every computer and phone of the company pulls it now */
+  try { wakeCompany(Number(companyId), null); } catch (e) { /* they pull it at their next turn */ }
+  return { httpStatus: 200, body: out };
+}
+
+/** RECYCLE_KEEP_DAYS after a deletion its copy is erased (admin.js purgeArchived). → how many went. */
+export async function purgeRecycleBin() {
+  const r = (await q(`WITH gone AS (DELETE FROM recycle_bin WHERE deleted_at < now() - make_interval(days => $1::int) RETURNING 1)
+                      SELECT COUNT(*)::int AS n FROM gone`, [RECYCLE_KEEP_DAYS]))[0];
+  return Number(r && r.n) || 0;
 }
 
 /** For the console: how many people, and who the admins are. */

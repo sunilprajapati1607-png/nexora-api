@@ -83,10 +83,71 @@ function describe(r) {
     notes: r.notes,
     followUp: r.follow_up,
     companyId: r.company_id ? Number(r.company_id) : null,
+    /* 4.73.0 — C17: the website's form 2 (null on every enquiry from before it, and on one typed in by hand) */
+    location: r.location || null,
+    website: r.website || null,
+    products: Array.isArray(r.products) ? r.products : null,
+    productOther: r.product_other || null,
     createdAt: r.created_at,
     updatedAt: r.updated_at
   };
 }
+
+/* ---- 4.73.0 — C17: THE WEBSITE'S ENQUIRY FORM 2 ----------------------------------
+   Owner 2026-10-02: "location of manufacturing, website, product range … all information mandatory", and
+   (the same day) "E-mail રાખો, પણ ફરજિયાત નહીં" — keep the e-mail, not required. The form adds three things
+   and posts { …as before…, form: 2, location, website, products: [ticks], productOther }. With form 2 the
+   service requires what the page requires — the fields it always required (name, company, phone, interest,
+   message) and the three new ones (location, website, at least one product tick; the words beside "Other"
+   when Other is ticked) — answering 400 { error: 'MISSING', field, message } for the first one missing, in the
+   page's own order (fields: every one). The e-mail may be left empty; one that is given must be a plain
+   address (register.js plainEmail, as the page checks it too) or it is 400 { error: 'BAD_EMAIL', field:
+   'email', message }. A post without `form` is a page cached from before (or another form) and is taken
+   exactly as before. Plain text only: control characters become spaces, each field is cut to its length (the
+   page's own maxlength or more); a tick is kept only if it is one of the form's own (FORM_PRODUCTS, matched
+   whatever its case or spacing), each once, in the form's order. */
+export const FORM_PRODUCTS = ['BOPP bags', 'Tape', 'Fabric', 'BOPP printing', 'Block bottom bags', 'Pinch bottom bags', 'Other'];
+const productKey = (v) => String(v == null ? '' : v).replace(CONTROL, ' ').trim().replace(/\s+/g, ' ').toLowerCase();
+export function formProducts(v) {
+  const sent = (Array.isArray(v) ? v : (v == null || v === '' ? [] : [v])).slice(0, 40).map(productKey);
+  return FORM_PRODUCTS.filter((p) => sent.indexOf(p.toLowerCase()) > -1);
+}
+/* the page's order and its words (D:\nexora-website assets/js/site.js NEED) */
+const FORM2_WORDS = {
+  name: 'Please enter your name.',
+  company: 'Please enter your company or plant name.',
+  phone: 'Please enter your WhatsApp / mobile number.',
+  email: 'Please enter a valid email address, like name@company.com — or leave it empty.',
+  location: 'Please enter your manufacturing location — city and state.',
+  website: 'Please enter your company website.',
+  products: 'Please tick at least one product in your range.',
+  productOther: 'Please write your other products.',
+  interest: 'Please choose what you are interested in.',
+  message: 'Please write a short message.'
+};
+/** form 2, read and checked → { ok: true, location, website, products, productOther } or
+ *  { ok: false, error: 'MISSING' | 'BAD_EMAIL', field, fields } (the first, and every missing one) */
+export function readForm2(body) {
+  const b = body && typeof body === 'object' ? body : {};
+  const out = { location: clean(b.location, 160), website: clean(b.website, 300), products: formProducts(b.products),
+    productOther: clean(b.productOther, 160) };
+  const missing = [];
+  if (!clean(b.name, 120)) missing.push('name');
+  if (!clean(b.company, 160)) missing.push('company');
+  if (!clean(b.phone, 40)) missing.push('phone');
+  if (!out.location) missing.push('location');
+  if (!out.website) missing.push('website');
+  if (!out.products.length) missing.push('products');
+  else if (out.products.indexOf('Other') > -1 && !out.productOther) missing.push('productOther');
+  if (!clean(b.interest || b.product, 80)) missing.push('interest');
+  if (!cleanText(b.message, 4000)) missing.push('message');
+  if (missing.length) return { ok: false, error: 'MISSING', field: missing[0], fields: missing };
+  /* optional — but one that is typed must be an address that can be written to */
+  const typed = clean(b.email, 160);
+  if (typed && !plainEmail(typed)) return { ok: false, error: 'BAD_EMAIL', field: 'email', fields: ['email'] };
+  return Object.assign({ ok: true }, out);
+}
+const isForm2 = (v) => v === 2 || v === '2';
 
 /* ---- the owner's side -------------------------------------------------- */
 
@@ -232,6 +293,17 @@ export async function publicInquiry(body, ip) {
      field, so anything in it is a robot and the row is simply not written. */
   if (clean(body._gotcha, 40)) return { ok: true };
 
+  /* 4.73.0 — C17: form 2's fields are required here as on the page (readForm2). Said before anything is
+     counted against the address, so a visitor who left one out and sends again is not throttled for it.
+     → { httpStatus: 400, body } (index.js answers it as it is); every other answer is the 200 { ok: true }. */
+  let form2 = null;
+  if (isForm2(body.form)) {
+    form2 = readForm2(body);
+    if (!form2.ok) {
+      return { httpStatus: 400, body: { error: form2.error, field: form2.field, fields: form2.fields, message: FORM2_WORDS[form2.field] } };
+    }
+  }
+
   const name = clean(body.name, 120);
   const phone = clean(body.phone, 40);
   const typedEmail = clean(body.email, 160);
@@ -254,8 +326,9 @@ export async function publicInquiry(body, ip) {
   if (typedEmail && !email) message = (message ? message + '\n\n' : '') + 'E-mail as typed: ' + typedEmail;
 
   const rows = await q(
-    `INSERT INTO inquiries (name, company, phone, email, product, message, source, source_page, channel, remote_ip)
-     VALUES ($1,$2,$3,$4,$5,$6,'WEBSITE',$7,$8,$9) RETURNING id`,
+    `INSERT INTO inquiries (name, company, phone, email, product, message, source, source_page, channel, remote_ip,
+                            location, website, products, product_other)
+     VALUES ($1,$2,$3,$4,$5,$6,'WEBSITE',$7,$8,$9,$10,$11,$12::jsonb,$13) RETURNING id`,
     [
       name,
       clean(body.company, 160),
@@ -265,9 +338,14 @@ export async function publicInquiry(body, ip) {
       message,
       clean(body.source_page || body.sourcePage, 300),
       clean(body.channel_chosen || body.channel, 40),
-      ip || null
+      ip || null,
+      /* 4.73.0 — C17: form 2's fields (NULL from an older page) */
+      form2 ? form2.location : null,
+      form2 ? form2.website : null,
+      form2 ? JSON.stringify(form2.products) : null,
+      form2 ? form2.productOther : null
     ]
   );
-  await logEvent(null, 'INQUIRY_WEBSITE', { id: Number(rows[0].id), name });
+  await logEvent(null, 'INQUIRY_WEBSITE', { id: Number(rows[0].id), name, form: form2 ? 2 : 1 });
   return { ok: true };
 }
