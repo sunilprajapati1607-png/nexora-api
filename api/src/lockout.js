@@ -24,10 +24,54 @@
  * instead, so that a lock never says "this name is real" — the refusal for
  * a stranger reads exactly as it does for a person.
  */
+import { scryptSync, randomBytes } from 'node:crypto';
 import { q } from './db.js';
 
 export const LOCK_TRIES = 3;
 export const LOCK_MINUTES = 15;
+
+/* ---- 4.72.0 review (audit 4) — THE TIME AN ATTEMPT TAKES, NOT ITS CPU ----------
+   A name or company id that is not there must take as long to refuse as a real
+   one with the wrong PIN or passcode, or the time says which are real. 4.72.0
+   first did that by running the same scrypt against a hash of nobody — which
+   handed anybody on the internet a way to keep this service's processor busy:
+   every made-up company id at the open /v1/activate cost one scrypt (tens of
+   milliseconds of a full core; the free instance has a tenth of one), so a few
+   requests a second, each with a new made-up id, stalled every plant at once.
+   A real id costs at most three before its lock; a made-up one had no end.
+   So the time is now WAITED, not spent: every real attempt measures itself, from
+   claiming its turn to the end of its compare (attemptClock), the service keeps
+   a running figure of that (noteAttemptTime — seeded at start with one scrypt
+   of its own), and an unknown name or id waits that long (strangerPause) on
+   exactly the attempts a real one compares on. The same answer, the same time,
+   no processor. */
+const ATTEMPT_MS_MAX = 3000;
+let attemptMs = 0;
+export function noteAttemptTime(ms) {
+  const v = Number(ms);
+  if (!(v > 0) || !isFinite(v)) return;
+  const c = Math.min(v, ATTEMPT_MS_MAX);
+  attemptMs = attemptMs ? attemptMs * 0.8 + c * 0.2 : c;
+}
+/** The running figure (ms) an unknown name or id waits. */
+export function attemptTime() { return attemptMs; }
+/** Started just before a real attempt claims its turn; called once its compare is done. */
+export function attemptClock() {
+  const t0 = process.hrtime.bigint();
+  return () => noteAttemptTime(Number(process.hrtime.bigint() - t0) / 1e6);
+}
+/** An unknown name or company id: as long as a real attempt takes, without its scrypt. */
+export function strangerPause() {
+  const ms = attemptMs;
+  return ms > 0 ? new Promise((resolve) => setTimeout(resolve, ms)) : Promise.resolve();
+}
+{
+  /* the figure starts from one scrypt with the PIN's and the passcode's own settings (sync.js hashPin,
+     passcode.js hashPasscode: node's defaults, 32 bytes) */
+  const t0 = process.hrtime.bigint();
+  scryptSync(randomBytes(16).toString('hex'), randomBytes(16).toString('hex'), 32);
+  noteAttemptTime(Number(process.hrtime.bigint() - t0) / 1e6);
+}
 
 /* table and column names are this file's own constants, never input */
 const TARGETS = {
@@ -88,17 +132,23 @@ export async function clearAttempts(kind, id) {
 const STRANGERS = new Map();
 /** One more wrong attempt on a name (or company id) that is not there.
  *  Answers exactly as takeAttempt + failedAttempt would for a real one:
- *  { locked: true, retryAfter } from the third on, for fifteen minutes. */
+ *  { locked: true, retryAfter } from the third on, for fifteen minutes.
+ *  4.72.0 (audit 4) — `started: true` on the one attempt that STARTS the lock:
+ *  a real name compares its PIN on that attempt (and on none after it), so a
+ *  caller that pauses for a stranger (strangerPause) does it exactly then. Read
+ *  from retryAfter instead, an attempt in the same second after the lock began
+ *  looked like the one that started it, and paid a compare a real name does not. */
 export function strangerAttempt(key) {
   const now = Date.now();
   let s = STRANGERS.get(key);
   if (s && s.until && s.until > now) return { locked: true, retryAfter: Math.ceil((s.until - now) / 1000) };
   if (!s || (s.until && s.until <= now)) s = { n: 0, until: 0 };
   s.n++;
-  if (s.n >= LOCK_TRIES) { s.until = now + LOCK_MINUTES * 60000; s.n = 0; }
+  let started = false;
+  if (s.n >= LOCK_TRIES) { s.until = now + LOCK_MINUTES * 60000; s.n = 0; started = true; }
   STRANGERS.set(key, s);
   if (STRANGERS.size > 5000) {
     for (const [k, v] of STRANGERS) if (!(v.until > now)) STRANGERS.delete(k);
   }
-  return s.until > now ? { locked: true, retryAfter: Math.ceil((s.until - now) / 1000) } : { locked: false };
+  return s.until > now ? { locked: true, retryAfter: Math.ceil((s.until - now) / 1000), started } : { locked: false };
 }

@@ -144,6 +144,16 @@ export async function releaseAction(body) {
 
     const name = clean(body.versionName, 40) || String(code);
 
+    /* 4.72.0 (audit 9) — THE APK'S SHA-256 IS REQUIRED. The phone checks the file
+       it downloaded against it before installing (console Updates.kt), and a
+       release with none skipped that check: a changed or swapped file at the
+       address would have been installed as the console. 64 hex characters,
+       stored in small letters (the phone compares either way). */
+    const sha = String(body.sha256 == null ? '' : body.sha256).trim().toLowerCase();
+    if (!/^[0-9a-f]{64}$/.test(sha)) {
+      return { error: 'The APK’s SHA-256 is required — 64 characters, 0-9 and a-f (for example: certutil -hashfile file.apk SHA256). The phone checks the download against it before installing.' };
+    }
+
     /* Re-publishing the same code replaces it, which is what somebody
        means when they fix the link five minutes after pasting it. */
     const rows = await q(
@@ -163,7 +173,7 @@ export async function releaseAction(body) {
         name,
         url,
         clean(body.notes, 4000),
-        clean(body.sha256, 64),
+        sha,
         parseInt(body.sizeBytes, 10) || null,
         body.mandatory === true
       ]);

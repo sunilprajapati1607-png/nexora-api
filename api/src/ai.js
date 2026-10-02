@@ -29,6 +29,10 @@ import { AsyncLocalStorage } from 'node:async_hooks';
  * vadharvanu"; the console raises it for one company) and the service sends at
  * most AI_PER_MINUTE (default 10) a minute; beyond that it says "busy"
  * with the seconds to wait. The day is counted in memory AND in the database (ai_usage, 4.71.0); the higher counts.
+ * 4.72.0: one company takes at most its fair share of the minute; when Google's own DAILY allowance of Nexora's key
+ * is used up, every question is told so at once (AI_GOOGLE_DAILY) until Google's day turns; each question carries
+ * only the parts of the plant and the rules it needs (AI_PROMPT_MAX_TOKENS); the answer's JSON shape goes with it
+ * (GEMINI_SCHEMA=off to stop that); private names arrive as [C1]-style codes and are copied, never expanded.
  */
 
 const API = 'https://generativelanguage.googleapis.com/v1beta';
@@ -58,13 +62,23 @@ function bestOf(names) {
   return names.filter((n) => !blocked.has(n) && rankOf(n) !== null).sort((a, b) => rankOf(b) - rankOf(a))[0] || null;
 }
 export function _blocked() { return blocked; }
+/* 4.72.0 review — Google counts each model's free DAY apart (QuotaFailure "…PerDayPerProjectPerModel…"). A backup
+   model whose own day is used up rests until Google's day turns, and the question goes on with the others; only the
+   usual model's day is Nexora's day (AI_GOOGLE_DAILY, finding 47 / C13). */
+const dayRestAt = new Map();         // model -> until when it rests
+function resting(n) {
+  const u = dayRestAt.get(n);
+  if (u === undefined) return false;
+  if (Date.now() >= u) { dayRestAt.delete(n); return false; }
+  return true;
+}
 /* 4.67.7 — "haju strong generative ai jevu banavo": the newest plain Flash the key lists (not
    Lite); GEMINI_MODEL_STRONG names another, or "off" keeps every question on the Lite model */
 export function strongOf(names) {
   const env = String(process.env.GEMINI_MODEL_STRONG || '').trim().replace(/^models\//, '');
   if (env.toLowerCase() === 'off') return null;
-  if (env) return names.indexOf(env) > -1 && !blocked.has(env) ? env : null;
-  return names.filter((n) => !blocked.has(n) && /-flash(?:-\d{3})?$/.test(n) && rankOf(n) !== null).sort((a, b) => rankOf(b) - rankOf(a))[0] || null;
+  if (env) return names.indexOf(env) > -1 && !blocked.has(env) && !resting(env) ? env : null;
+  return names.filter((n) => !blocked.has(n) && !resting(n) && /-flash(?:-\d{3})?$/.test(n) && rankOf(n) !== null).sort((a, b) => rankOf(b) - rankOf(a))[0] || null;
 }
 const MODEL_TTL_MS = 6 * 60 * 60 * 1000;
 const TIMEOUT_MS = 60000;              /* 4.67.6 — a question with the plant's whole memory takes longer */
@@ -168,31 +182,64 @@ export function aiStatus() {
   if (aiConfigured() && (!model.at || Date.now() - model.at > MODEL_TTL_MS)) resolveModel(false).catch(() => {});
   /* 4.67.17 — which models this key can use (their public names only), so a busy day can be read */
   return { configured: aiConfigured(), model: model.name, note: model.error || null, lastAudio: lastAudio, lastContext: lastContext, recent: recentCalls.slice(-12),
+    /* 4.72.0 — when Google's daily allowance of Nexora's key is used up: until when Nexora AI says so without asking */
+    googleDailyUntil: googleDayLeft() ? new Date(googleDayUntil).toISOString() : null,
     models: (genNames.length ? genNames : model.available || []).filter((n) => /gemini|gemma/i.test(n) && !/tts|embedding|image|audio|live|native/i.test(n)).slice(0, 60) };
 }
 
 /* ---- limits ------------------------------------------------------------- */
 const perCompany = new Map();        // companyId -> { day, n }
-let recent = [];                     // times of the last minute's calls
+let recent = [];                     // the last minute's calls: { t, k } (when, which company)
 const daily = () => companyDaily() || Math.max(1, parseInt(process.env.AI_DAILY_PER_COMPANY, 10) || 30);
 const perMinute = () => Math.max(1, parseInt(process.env.AI_PER_MINUTE, 10) || 10);
 /* 4.67.17 — the day is India's (the plants' own midnight, not 05:30 in the morning) */
 function today() { return new Date(Date.now() + 330 * 60000).toISOString().slice(0, 10); }
+/* 4.72.0 — finding 44, A FAIR SHARE OF THE MINUTE. The minute's AI_PER_MINUTE is shared by every company on Nexora's
+   key, and one busy person (or a scripted client) could take all of it while every other plant heard "busy". Now one
+   company may take at most max(2, ceil(AI_PER_MINUTE / the companies active in the last minute)) of it. "Active" is
+   every company that ASKED in the last minute, answered or refused, so a company that was turned away once is counted
+   in the next share. Alone, a company still has the whole minute. Over its share: 429 AI_BUSY with the seconds until
+   its own oldest question of the minute leaves it.
+   4.72.0 review — a company whose DAY is used up is told so (AI_DAILY) before the minute is looked at, and is not
+   counted as asking: it cannot use the minute, so it must not shrink the others' share all day. And a company holding
+   MORE than its share (the share shrinks when others come) waits until it is under its share, not only until its
+   oldest question leaves. */
+const askedAt = new Map();           // company -> the last time it asked (answered or refused)
+export function minuteShare(list, asked, k, limit, now) {
+  const active = new Set(list.map((x) => x.k));
+  asked.forEach((t, c) => { if (now - t < 60000) active.add(c); });
+  active.add(k);
+  return Math.max(2, Math.ceil(limit / active.size));
+}
+/** seconds until a company holding `mine` (oldest first) of the minute is under `share` again */
+export function shareWait(mine, share, now) {
+  const at = mine[Math.max(0, mine.length - share)];
+  return Math.max(1, Math.ceil((60000 - (now - at.t)) / 1000));
+}
 function take(companyId) {
   if (ownKey()) return { left: null, own: true };   /* 4.67.18 — the company's own key: Google's limits, not Nexora's */
   const now = Date.now();
-  recent = recent.filter((t) => now - t < 60000);
-  if (recent.length >= perMinute()) return { busy: Math.ceil((60000 - (now - recent[0])) / 1000) };
   const k = String(companyId || 'none');
   const c = perCompany.get(k);
   const d = today();
   const used = c && c.day === d ? c.n : 0;
   if (used >= daily()) return { spent: true, used };
+  recent = recent.filter((x) => now - x.t < 60000);
+  askedAt.forEach((t, c2) => { if (now - t >= 60000) askedAt.delete(c2); });
+  const share = minuteShare(recent, askedAt, k, perMinute(), now);
+  askedAt.set(k, now);
+  if (recent.length >= perMinute()) return { busy: Math.max(1, Math.ceil((60000 - (now - recent[0].t)) / 1000)) };
+  const mine = recent.filter((x) => x.k === k);
+  if (mine.length >= share) return { busy: shareWait(mine, share, now), share: share, asked: mine.length };
   perCompany.set(k, { day: d, n: used + 1 });
-  recent.push(now);
+  recent.push({ t: now, k: k });
   return { left: daily() - used - 1 };
 }
-export function _resetLimits() { perCompany.clear(); recent = []; }
+/** the minute's place taken by this company is given back (its question was not asked after all) */
+function dropMinute(k) {
+  for (let i = recent.length - 1; i >= 0; i--) if (recent[i].k === k) { recent.splice(i, 1); return; }
+}
+export function _resetLimits() { perCompany.clear(); recent = []; askedAt.clear(); googleDayUntil = 0; dayRestAt.clear(); }
 /** 4.67.21 — the console: how many questions each company has asked today (Nexora's key; this service's memory) */
 export function aiUsedToday(companyId) { const c = perCompany.get(String(companyId || 'none')); return c && c.day === today() ? c.n : 0; }
 
@@ -208,18 +255,29 @@ function inTime(p) {
   return Promise.race([Promise.resolve(p), new Promise((_, no) => { t = setTimeout(() => no(new Error('slow')), usageWait()); })])
     .finally(() => clearTimeout(t));
 }
+/* 4.72.0 review — one company's questions reach the database one at a time, in the order they were taken: each says
+   "I am at least the n-th of the day", which is only right in that order (two at once, the second's 2 landing first,
+   counted three). The queue waits at most AI_USAGE_WAIT_MS per question, as before. */
+const addQueue = new Map();          // company -> its last database add
 async function takeCounted(companyId) {
   const t = take(companyId);         // the minute's limit, and the day as this process counts it (this question included)
   if (t.busy || t.spent || t.own || !usageStore) return t;
   const k = String(companyId || 'none'), d = today();
-  const mine = perCompany.get(k);
+  const at = perCompany.get(k).n;    // this question is the at-th of the day
+  const wait = inTime((addQueue.get(k) || Promise.resolve()).then(() => usageStore.add(k, d, at)));
+  const tail = wait.then(() => {}, () => {});
+  addQueue.set(k, tail);
+  tail.then(() => { if (addQueue.get(k) === tail) addQueue.delete(k); });
   let n;
-  try { n = Number(await inTime(usageStore.add(k, d, mine.n))); } catch (e) { return t; }
+  try { n = Number(await wait); } catch (e) { return t; }
   if (!(n > 0)) return t;
+  /* the count as it is NOW (take() puts a new entry for every question, and the day may have turned while waiting) */
+  const mine = perCompany.get(k);
+  if (!mine || mine.day !== d) return t;
   if (n > mine.n) mine.n = n;        // the database knew more (the service restarted): the higher count is the count
   if (n > daily()) {                 // over the day after all: this question is not asked, and is taken off again
     mine.n = n - 1;
-    recent.pop();
+    dropMinute(k);
     Promise.resolve().then(() => usageStore.back(k, d)).catch(() => {});
     return { spent: true, used: n - 1 };
   }
@@ -239,6 +297,46 @@ function giveBack(companyId) {
   if (c && c.day === today() && c.n > 0) c.n--;
   /* 4.71.0 — and in the database too, or the next question would take the higher (unreturned) count back */
   if (usageStore) Promise.resolve().then(() => usageStore.back(String(companyId || 'none'), today())).catch(() => {});
+}
+
+/* 4.72.0 — finding 47, GOOGLE'S OWN DAY. When Google says the free DAILY allowance of Nexora's key is used up (a 429
+   whose quota is per day), asking again — another model, another round — only burns calls and keeps the person
+   waiting for nothing. The question stops at once with AI_GOOGLE_DAILY (C13), and the service remembers it, so every
+   later question is answered at once without asking Google, until India's midnight — or Google's own midnight
+   (Pacific time, about 12:30–13:30 IST) when that comes first, since that is when Google's day starts again. A
+   company's own key is its own Google project: its day is never Nexora's. */
+let googleDayUntil = 0;
+export const GOOGLE_DAILY_MESSAGE = 'Nexora AI has used all of today’s free answers from Google. It comes back tomorrow.';
+export function _setGoogleDay(ms) { googleDayUntil = ms; }
+export function googleDayLeft() { return googleDayUntil > Date.now() ? googleDayUntil : 0; }
+/** ms of the next 00:00 in a time zone (Asia/Kolkata has no summer time; America/Los_Angeles has) */
+export function nextMidnight(tz, nowMs) {
+  const now = new Date(nowMs || Date.now());
+  if (tz === 'Asia/Kolkata') { const ist = now.getTime() + 330 * 60000; return now.getTime() + (86400000 - (ist % 86400000)); }
+  const parts = new Intl.DateTimeFormat('en-US', { timeZone: tz, hourCycle: 'h23', hour: '2-digit', minute: '2-digit', second: '2-digit' }).formatToParts(now);
+  const get = (t) => Number((parts.filter((p) => p.type === t)[0] || {}).value || 0);
+  const into = ((get('hour') % 24) * 3600 + get('minute') * 60 + get('second')) * 1000 + now.getMilliseconds();
+  return now.getTime() + (86400000 - into);
+}
+export function googleDayTurns(nowMs) {
+  const ist = nextMidnight('Asia/Kolkata', nowMs);
+  /* never throws (it is also worked out inside a question's race): without time-zone data, India's midnight */
+  try { return Math.min(ist, nextMidnight('America/Los_Angeles', nowMs)); } catch (e) { return ist; }
+}
+/** A 429 that names a per-day quota (Google's QuotaFailure details, else its message). */
+export function isDailyQuota(body) {
+  const err = (body && body.error) || {};
+  const ids = [];
+  (Array.isArray(err.details) ? err.details : []).forEach((d) => (d && Array.isArray(d.violations) ? d.violations : [])
+    .forEach((v) => ids.push(String((v && v.quotaId) || '') + ' ' + String((v && v.quotaMetric) || ''))));
+  return /PerDay|per[_ -]?day|daily/i.test(ids.join(' ')) || (!ids.join('').trim() && /per[_ -]?day|PerDay|requests per day|daily (?:limit|quota)/i.test(String(err.message || '')));
+}
+/** Google's RetryInfo ("37s", "37.6s") in whole seconds, or null */
+export function retryDelayOf(body) {
+  const err = (body && body.error) || {};
+  const ri = (Array.isArray(err.details) ? err.details : []).filter((d) => d && d.retryDelay)[0];
+  const m = /^(\d+(?:\.\d+)?)s$/.exec(String((ri && ri.retryDelay) || '')) || /retry in (\d+(?:\.\d+)?)\s*s/i.exec(String(err.message || ''));
+  return m ? Math.max(1, Math.min(3600, Math.ceil(Number(m[1])))) : null;
 }
 
 /* ---- what may be sent ---------------------------------------------------- */
@@ -277,11 +375,18 @@ export function clean(p) {
   };
 }
 
+/* 4.72.0 — C9 (finding 45), PRIVATE NAMES AS CODES. Before anything goes to a /v1/ai/* route, the application (the
+   computer, the phone) swaps the customer and buyer names, item names and codes, GSTINs, phone numbers and e-mail
+   addresses the person typed for [C1] [I1] [G1] [M1] [E1], and puts them back in the answer on the device. The legend
+   never leaves the device: this service never sees what a code stands for, so it can neither log nor send it. Every
+   system prompt tells the model to copy the codes exactly. */
+export const PRIVATE_LINE = 'PRIVATE NAMES: codes in square brackets — [C1] [C2]… (a customer or buyer), [I1]… (an item), [G1]… (a GSTIN), [M1]… (a phone or mobile number), [E1]… (an e-mail address) — stand for private names that stay on the person’s computer. Wherever you mean that name, copy its code exactly as written (with the brackets); never guess, expand or translate what a code stands for, and never make up a code that was not given.';
 const SYSTEM = [
   'You are Nexora AI, inside Nexora, software that plans PP/PE woven sack production (tape, weaving, BOPP printing and slitting, lamination, backseam, block/pinch bottom, stitching, finishing, packing).',
   'You are given the SHAPE of one bill of materials: its stages in route order, where each stage takes its input from, what kinds of material it adds, its waste %, and the kilograms each stage makes. You also see the recipe lines of each stage (material, group, basis, value, kg). You never see prices, rates or costs, and you must not guess any.',
   'Find planning problems and things worth checking, for example: a BOPP stage taking the woven fabric instead of film; BOPP printing with no BOPP film; lamination missing its fabric or its film; a stage that makes nothing; a stage whose input is only "assumed"; an unusually high waste (above about 8 %) or zero waste where the process always loses some; a part with no route; a stage bought in part way through; steps in an odd order; recipe problems — % of gross lines on one stage adding to well over or under 100 together with its earlier-stage rows, a coating or lamination stage with no granule, a tape stage with no masterbatch or filler where one is usual, the same material twice on one stage.',
   'Never recompute or correct the numbers — the engine is right about arithmetic. Say what to look at and what to change in Nexora (Edit section, Earlier stage row, Choose components, waste %).',
+  PRIVATE_LINE,
   'Answer ONLY with JSON: {"summary": string, "findings": [{"level": "problem" | "check" | "ok", "stage": number or null, "title": string, "detail": string, "fix": string}]}. At most 8 findings, most important first. If all looks right, one "ok" finding.'
 ].join(' ');
 
@@ -307,6 +412,66 @@ function readAnswer(body) {
   };
 }
 
+
+/* ---- 4.72.0 — finding 48: THE ANSWER'S SHAPE, TOLD TO GOOGLE ----------------
+   Each answer's JSON is described to Gemini (generationConfig.responseJsonSchema), so it writes that shape and no
+   other: a "do" outside the step list, a misspelt key or a cut-out object no longer costs a whole second question.
+   Every property is named (no free-form objects): a calculation's inputs are this plant's own field keys. The
+   tolerant reader (readJson) and the checks after it stay as the second gate. Gemma gets no schema (it takes no JSON
+   mode); a model that refuses one (a 400 naming the schema) is asked again at once without it, and remembered;
+   GEMINI_SCHEMA=off switches them all off without a release. */
+const JS = { s: { type: 'string' }, n: { type: 'number' }, b: { type: 'boolean' } };
+const jo = (props, required) => Object.assign({ type: 'object', properties: props }, required && required.length ? { required: required } : {});
+const ja = (items, max) => Object.assign({ type: 'array', items: items }, max ? { maxItems: max } : {});
+const je = (values) => ({ type: 'string', enum: values });
+const schemaOn = () => String(process.env.GEMINI_SCHEMA || '').toLowerCase() !== 'off';
+/** a plant's fields as the properties of "inputs": numbers, or one of an enum field's options */
+function inputsSchema(fields) {
+  const props = {};
+  (fields || []).slice(0, 80).forEach((f) => {
+    if (!f || !f.key) return;
+    const opts = Array.isArray(f.options) ? f.options.slice(0, 12).map(String).filter((o, i, a) => o && a.indexOf(o) === i) : [];
+    props[f.key] = f.type === 'enum' && opts.length ? je(opts) : (f.type === 'enum' ? JS.s : JS.n);
+  });
+  return jo(props);
+}
+export const SCHEMAS = {
+  'check-bom': () => jo({ summary: JS.s, findings: ja(jo({ level: je(['problem', 'check', 'ok']), stage: JS.n, title: JS.s, detail: JS.s, fix: JS.s }, ['level', 'title']), 8) }, ['summary', 'findings']),
+  help: () => jo({ transcript: JS.s, answer: JS.s, topics: ja(JS.s, 5) }, ['answer']),
+  chat: () => jo({ transcript: JS.s, answer: JS.s }, ['answer']),
+  'quote-letter': () => jo({ answer: JS.s, subject: JS.s, letter: JS.s, whatsapp: JS.s }, ['answer']),
+  'plan-route': () => jo({ answer: JS.s, summary: JS.s, choice: je(['workflow', 'route', 'new', 'none']), workflowId: JS.s, routeId: JS.s,
+    route: jo({ name: JS.s, steps: ja(jo({ code: JS.s, why: JS.s }, ['code']), 30) }), notes: ja(JS.s, 6) }, ['answer', 'choice']),
+  'edit-bom': () => jo({ answer: JS.s, summary: JS.s, transcript: JS.s, changes: ja(jo({ op: je(['waste', 'add', 'set', 'remove']), stage: JS.n, line: JS.n, material: JS.s,
+    basis: je(['PCT', 'PERBAG_G', 'PER1000', 'ABS']), value: JS.n }, ['op', 'stage']), 20), notes: ja(JS.s, 6) }, ['answer', 'changes']),
+  'fill-calc': (fields) => jo({ answer: JS.s, transcript: JS.s, construction: JS.s, inputs: inputsSchema(fields), bagQuantity: JS.n, targetWeight: JS.n,
+    missing: ja(jo({ key: JS.s, question: JS.s }, ['key']), 20), summary: JS.s }, ['answer']),
+  /* every key the question's steps may carry (read from the step list itself), so the model can write each step whole */
+  assist: (fields, partKeys, stepTexts) => {
+    const parts = (partKeys && partKeys.length ? partKeys : ['BODY', 'TOP PATCH', 'BOTTOM PATCH', 'PATCH', 'VALVE', 'LINER', 'BOPP', 'HANDLE', 'ZIPPER']).slice(0, 16);
+    const tabs = {}, proutes = {};
+    parts.forEach((k) => { tabs[k] = JS.b; proutes[k] = JS.s; });
+    const texts = stepTexts && stepTexts.length ? stepTexts : STEP_LIST;
+    const ALL = {
+      construction: JS.s, inputs: inputsSchema(fields), targetWeight: JS.n, bagQuantity: JS.n, fresh: JS.b,
+      name: JS.s, steps: ja(JS.s, 30), mode: je(['WHOLE', 'SPLIT', 'PRICE', 'COST']), tabs: jo(tabs), routes: jo(proutes),
+      stage: JS.s, add: JS.b, remove: JS.b, clear: JS.b, part: JS.s,
+      lines: ja(jo({ material: JS.s, value: JS.n, basis: je(['PCT', 'PERBAG_G', 'PER1000', 'ABS', 'PART_G']), part: JS.s, earlier: JS.b, stage: JS.s, figure: JS.s }), 12),
+      wastePct: JS.n, pct: JS.n, from: JS.s, action: je(['add', 'set', 'remove']), type: JS.s, basis: JS.s, rate: JS.n, perBags: JS.n, forAll: JS.b,
+      after: JS.s, shared: JS.b, material: JS.s, change: JS.n, set: JS.n, quantity: JS.n, margin: JS.n, buyer: JS.s,
+      what: je(['calc', 'bom', 'quote']), number: JS.s, q: JS.s, open: JS.b, a: JS.s, b: JS.s, calc: JS.s, price: JS.n, cost: JS.n,
+      changes: ja(jo({ material: JS.s, change: JS.n, pct: JS.n, set: JS.n }), 20),
+      value: JS.n, group: JS.s, code: JS.s, uom: JS.s, text: JS.s, view: je(ASSIST_VIEWS), button: JS.s, say: JS.s
+    };
+    const props = { do: je(texts.map((x) => (/^\{"do":"(\w+)"/.exec(x) || [])[1]).filter((n, i, a) => n && a.indexOf(n) === i)) };
+    texts.forEach((x) => { (x.match(/"(\w+)":/g) || []).forEach((m) => { const k = m.slice(1, -2); if (ALL[k] && !props[k]) props[k] = ALL[k]; }); });
+    /* a calculation step whose question named no fields: no inputs to describe */
+    if (props.inputs && !(fields && fields.length)) delete props.inputs;
+    return jo({ transcript: JS.s, lang: je(['en', 'gu', 'hi']), answer: JS.s, steps: ja(jo(props, ['do']), 24), remember: JS.s, forget: ja(JS.s, 10), next: ja(JS.s, 3), run: JS.b }, ['answer', 'steps']);
+  }
+};
+const noSchema = new Set();
+export function _noSchema() { return noSchema; }
 
 /* ---- one call to Gemini, shared by every Nexora AI question ------------- */
 /* 4.67.12 — "even in typing not responding": the strong model, busy (429) or slow on a large question,
@@ -362,8 +527,11 @@ export function payloadFor(base, name) {
      Gemma takes no system instruction, no JSON mode and no thinking setting: the instructions go first in
      the person's first turn, and the answer's JSON is cut out of its words. */
   if (/^gemma-/.test(String(name || ''))) {
-    const contents = JSON.parse(JSON.stringify(base.contents || []));
-    const sys = ((base.systemInstruction && base.systemInstruction.parts) || []).map((p) => p.text || '').join('\n');
+    /* 4.72.0 — finding 49: a question that brings its own lean version for Gemma (assist: the few rules that matter
+       and a smaller context) sends that one; any other sends what Gemini would get */
+    const lean = base.gemma && typeof base.gemma === 'object' ? base.gemma : null;
+    const contents = JSON.parse(JSON.stringify((lean && lean.contents) || base.contents || []));
+    const sys = lean && typeof lean.system === 'string' ? lean.system : ((base.systemInstruction && base.systemInstruction.parts) || []).map((p) => p.text || '').join('\n');
     const first = contents.filter((c) => c.role === 'user')[0];
     const lead = { text: 'INSTRUCTIONS (follow them exactly; answer with the JSON asked for and nothing else):\n' + sys + '\n\n' };
     if (first) first.parts = [lead].concat(first.parts || []); else contents.unshift({ role: 'user', parts: [lead] });
@@ -375,8 +543,15 @@ export function payloadFor(base, name) {
   g.temperature = 0.2;
   const th = thinkingFor(name);
   if (th) g.thinkingConfig = th;
-  return JSON.stringify(Object.assign({}, base, { generationConfig: g }));
+  /* 4.72.0 — finding 48: the answer's shape, unless this model refused one, or GEMINI_SCHEMA=off */
+  if (g.responseJsonSchema && (noSchema.has(name) || !schemaOn())) delete g.responseJsonSchema;
+  const out = Object.assign({}, base, { generationConfig: g });
+  delete out.gemma; delete out.classic;
+  return JSON.stringify(out);
 }
+/** 4.72.0 — finding 49: Gemma only for a question its small window can take (AI_GEMMA_MAX_CHARS, default 30,000) */
+const gemmaMax = () => Math.max(2000, parseInt(process.env.AI_GEMMA_MAX_CHARS, 10) || 30000);
+export function gemmaFits(base) { return !base || payloadFor(base, 'gemma-x').length <= gemmaMax(); }
 /* 4.67.17 — THE LEAST THINKING, FOR EVERY MODEL. Measured in Nexora Jobwork (2.0.1, same key family): the
    same small question took 8 s, then 42 s an hour later — the newer Flash-Lite models think before they
    answer, and a longer prompt (the help's 25 KB of topics) makes them think longer; with thinkingLevel
@@ -393,13 +568,17 @@ export function thinkingFor(name) {
 }
 /** One model, asked once. → {ok:true, json, name} or {ok:false, why, status, r, name, named} */
 async function tryModel(name, base, fetchImpl, ms, kind, cancel) {
-  const first = await tryModelOnce(name, base, fetchImpl, ms, kind, cancel);
-  /* a model that does not take the thinking setting: asked again at once without it */
-  if (!first.ok && first.status === 400 && thinkingFor(name) && /think/i.test(String((first.r && first.r.body && first.r.body.error && first.r.body.error.message) || ''))) {
-    noThinking.add(name);
-    return tryModelOnce(name, base, fetchImpl, ms, kind, cancel);
+  let res = await tryModelOnce(name, base, fetchImpl, ms, kind, cancel);
+  for (let i = 0; i < 2 && !res.ok && res.status === 400; i++) {
+    const msg = String((res.r && res.r.body && res.r.body.error && res.r.body.error.message) || '');
+    /* a model that does not take the thinking setting: asked again at once without it */
+    if (thinkingFor(name) && /think/i.test(msg)) noThinking.add(name);
+    /* 4.72.0 — nor the answer's shape (an older model, or a shape too big for it): again without it, remembered */
+    else if (base.generationConfig && base.generationConfig.responseJsonSchema && !noSchema.has(name) && schemaOn() && /schema|too many states/i.test(msg)) noSchema.add(name);
+    else break;
+    res = await tryModelOnce(name, base, fetchImpl, ms, kind, cancel);
   }
-  return first;
+  return res;
 }
 async function tryModelOnce(name, base, fetchImpl, ms, kind, cancel) {
   const payload = base.classic
@@ -431,14 +610,16 @@ async function tryModelOnce(name, base, fetchImpl, ms, kind, cancel) {
     const msg = String((r.body && r.body.error && r.body.error.message) || '');
     /* 4.67.17 — only a 404 or "no longer available" retires a model; a 400 about a file type is not the model's fault */
     const gone = r.status === 404 || /no longer available|deprecated/i.test(msg);
-    rec.outcome = gone ? 'retired' : r.status === 429 ? 'busy' : 'http';
+    /* 4.72.0 — finding 47: Google's DAILY allowance used up is not "busy" — nothing will answer until its day turns */
+    const day = r.status === 429 && isDailyQuota(r.body);
+    rec.outcome = gone ? 'retired' : day ? 'daily' : r.status === 429 ? 'busy' : 'http';
     /* a quota refusal names its metric and limit (tokens or requests, per minute or per day): kept whole */
     rec.code = r.status === 429 ? scrub(msg, 600).replace(/\s+/g, ' ') : scrub(msg).slice(0, 80);
     noteCall(rec);
     if (gone) blocked.add(name);
     /* 4.67.1 — Google names the model to use instead: that one is asked next */
     const named = gone ? ((msg.match(/models\/(gemini-[\w.\-]+)/g) || []).map((x) => x.replace(/^models\//, '')).filter((n) => n !== name && !blocked.has(n))[0] || null) : null;
-    return { ok: false, why: rec.outcome, status: r.status, r: r, name: name, named: named };
+    return { ok: false, why: rec.outcome, status: r.status, r: r, name: name, named: named, retryAfter: r.status === 429 ? retryDelayOf(r.body) : null };
   }
   const json = readJson(r);
   const refused = (r.body && r.body.promptFeedback && r.body.promptFeedback.blockReason) ||
@@ -457,12 +638,13 @@ async function tryModelOnce(name, base, fetchImpl, ms, kind, cancel) {
 function gemmaRank(n) { const m = /^gemma-(\d+)(?:\.(\d+))?-(\d+)b/.exec(n); return m ? Number(m[1]) * 1e4 + Number(m[2] || 0) * 100 + Number(m[3]) : 0; }
 export function candidatesOf(first, names, skip, base) {
   const not = [first].concat(skip || []);
-  const pool = (names || []).filter((n) => not.indexOf(n) < 0 && !blocked.has(n) && (rankOf(n) !== null || /^gemma-\d/.test(n)));
+  const pool = (names || []).filter((n) => not.indexOf(n) < 0 && !blocked.has(n) && !resting(n) && (rankOf(n) !== null || /^gemma-\d/.test(n)));
   const lites = pool.filter((n) => /flash-lite(?:-\d{3})?$/.test(n)).sort((a, b) => rankOf(b) - rankOf(a));
   const flashes = pool.filter((n) => /-flash(?:-\d{3})?$/.test(n)).sort((a, b) => rankOf(b) - rankOf(a));
-  /* Gemma last — only where nothing but words goes (it hears no recording and reads no file) */
+  /* Gemma last — only where nothing but words goes (it hears no recording and reads no file), and (4.72.0, finding
+     49) only a question its small window can take: a whole-plant question it would refuse or answer badly */
   const words = !JSON.stringify(base || {}).includes('"inlineData"');
-  const gemma = words ? pool.filter((n) => /^gemma-\d/.test(n)).sort((a, b) => gemmaRank(b) - gemmaRank(a)) : [];
+  const gemma = words && gemmaFits(base) ? pool.filter((n) => /^gemma-\d/.test(n)).sort((a, b) => gemmaRank(b) - gemmaRank(a)) : [];
   return [first].concat(lites, flashes, gemma);
 }
 /** The second model for a slow or failing question. */
@@ -499,7 +681,7 @@ function race(first, payload, fetchImpl, kind, deadline, skip) {
         if (at < 0) order.splice(nextAt, 0, prefer);
         else if (at > nextAt) { order.splice(at, 1); order.splice(nextAt, 0, prefer); }
       }
-      while (nextAt < order.length && blocked.has(order[nextAt])) nextAt++;
+      while (nextAt < order.length && (blocked.has(order[nextAt]) || resting(order[nextAt]))) nextAt++;
       return nextAt < order.length ? order[nextAt++] : null;
     };
     const askNext = (prefer) => {
@@ -525,6 +707,11 @@ function race(first, payload, fetchImpl, kind, deadline, skip) {
         running--;
         if (done) return;
         if (res.ok) { finish(res); return; }
+        /* 4.72.0 — finding 47 / C13: Google's daily allowance is used up — no other model, no other round */
+        if (res.why === 'daily' && name === first) { finish(res); return; }
+        /* 4.72.0 review — a BACKUP's own day (Google counts each model's day apart): it rests until the day turns, and
+           the question goes on — a usual model still out, or the next one down the list, may answer */
+        if (res.why === 'daily') { dayRestAt.set(name, googleDayTurns()); res = Object.assign({}, res, { why: 'busy' }); }
         /* what is said when nothing answers: the usual model's failure, unless it was only retired */
         if (!last || (name === first && res.why !== 'retired') || last.why === 'retired') last = res;
         /* 4.67.17 — seen live 22:28: the usual model HUNG 70-98 s while every other one said 503 — so a failure
@@ -533,8 +720,10 @@ function race(first, payload, fetchImpl, kind, deadline, skip) {
         else if (!running) finish(last);
       });
     };
-    /* slow, not failed: the next model is asked beside it */
-    timer = setTimeout(() => { if (!done && running && tries === 1) askNext(null); }, hedgeMs);
+    /* slow, not failed: the next model is asked beside it. 4.72.0 — finding 46(d): a large question (over 40,000
+       characters) is given 25 s first — asking it twice at once doubles what it costs of the free minute */
+    const size = JSON.stringify(payload.contents || []).length + JSON.stringify(payload.systemInstruction || '').length;
+    timer = setTimeout(() => { if (!done && running && tries === 1) askNext(null); }, size > 40000 ? Math.max(hedgeMs, 25000) : hedgeMs);
     run(first);
   });
 }
@@ -554,7 +743,7 @@ async function askClassic(companyId, t, name, payload, fetchImpl, opts, kind) {
     strongTried = strong;
     const rs = await tryModel(strong, payload, fetchImpl, STRONG_MS, kind + '/strong');
     if (rs.ok) return { json: rs.json, model: strong, left: t.left };
-    strongRestUntil = Date.now() + STRONG_REST_MS;
+    strongRestUntil = rs.why === 'daily' ? googleDayTurns() : Date.now() + STRONG_REST_MS;
   }
   let res = await tryModel(name, payload, fetchImpl, strongTried ? 58000 : TIMEOUT_MS, kind + '/classic');
   /* 4.67.1 — a retired model: the one Google names is asked, as before */
@@ -570,8 +759,13 @@ async function askClassic(companyId, t, name, payload, fetchImpl, opts, kind) {
 async function ask(companyId, system, prompt, fetchImpl, opts) {
   opts = opts || {};
   if (!aiConfigured()) return { fail: { httpStatus: 503, body: { error: 'AI_OFF', message: 'Nexora AI is not switched on at the service yet.' } } };
+  /* 4.72.0 — finding 47 / C13: Google's day is over for Nexora's key — said at once; nothing asked, nothing counted */
+  if (!ownKey() && googleDayLeft()) return { fail: googleDailyFail() };
   const t = await takeCounted(companyId);
-  if (t.busy) return { fail: { httpStatus: 429, body: { error: 'AI_BUSY', retryAfter: t.busy, message: 'Nexora AI is busy — try again in ' + t.busy + ' seconds.' } } };
+  if (t.busy) return { fail: { httpStatus: 429, body: { error: 'AI_BUSY', retryAfter: t.busy, message: t.share
+    /* 4.72.0 — finding 44: this company's share of the minute (the others still get theirs) */
+    ? 'Nexora AI is shared by every company — yours has asked ' + (t.asked || t.share) + ' questions this minute (its share is ' + t.share + '). Try again in ' + t.busy + ' seconds.'
+    : 'Nexora AI is busy — try again in ' + t.busy + ' seconds.' } } };
   /* 4.71.0 — owner: "puru thay etle nexora msg aape k tamaro ai quota khatam thai gyo che" */
   if (t.spent) return { fail: { httpStatus: 429, body: { error: 'AI_DAILY', limit: daily(), message: 'Your company’s Nexora AI quota for today (' + daily() + ') is used up. It comes back tomorrow — ask Nexora to raise it.' } } };
   const deadline = Date.now() + deadlineMs;
@@ -585,6 +779,9 @@ async function ask(companyId, system, prompt, fetchImpl, opts) {
     generationConfig: { responseMimeType: 'application/json', maxOutputTokens: opts.maxTokens || (classicMode ? 2048 : 8192) }
   };
   if (classicMode) payload.classic = true;
+  /* 4.72.0 — finding 48: the answer's shape; finding 49: a lean version of the question for Gemma */
+  else if (opts.schema && schemaOn()) payload.generationConfig.responseJsonSchema = opts.schema;
+  if (opts.gemma && !classicMode) payload.gemma = opts.gemma;
   let res;
   if (classicMode) {
     res = await askClassic(companyId, t, name, payload, fetchImpl, opts, kind);
@@ -595,7 +792,9 @@ async function ask(companyId, system, prompt, fetchImpl, opts) {
     if (strong && strong !== name) {
       const rs = await tryModel(strong, payload, fetchImpl, STRONG_MS, kind + '/strong');
       if (rs.ok) return { json: rs.json, model: strong, left: t.left };
-      strongRestUntil = Date.now() + STRONG_REST_MS;
+      /* 4.72.0 — the stronger model's own day used up: it rests until Google's day turns (not even a backup); the usual one answers */
+      strongRestUntil = rs.why === 'daily' ? googleDayTurns() : Date.now() + STRONG_REST_MS;
+      if (rs.why === 'daily') dayRestAt.set(strong, strongRestUntil);
     }
     res = await race(name, payload, fetchImpl, kind, deadline, strong ? [strong] : []);
   }
@@ -610,24 +809,32 @@ async function ask(companyId, system, prompt, fetchImpl, opts) {
     if ((res.status === 400 || res.status === 401 || res.status === 403) && /api[ _]?key|permission|denied|billing/i.test(gm)) {
       return { fail: { httpStatus: 502, body: { error: 'AI_KEY_BAD', message: 'Google refused your company’s own Gemini key (' + scrub(gm, 120) + '). An administrator can correct it in Settings → Features → Nexora AI key, or remove it to use Nexora’s.' } } };
     }
-    if (res.why === 'busy') return { fail: { httpStatus: 429, body: { error: 'AI_KEY_QUOTA', retryAfter: 60, message: 'Your company’s own Gemini key has reached its Google limit (quota) for now. Try again later, or raise the limit in Google AI Studio (billing).' } } };
+    /* 4.72.0 — the company's own key at its Google DAILY limit: said so, never retried, and never Nexora's day */
+    if (res.why === 'daily') return { fail: { httpStatus: 429, body: { error: 'AI_KEY_QUOTA', message: 'Your company’s own Gemini key has used Google’s daily allowance. It comes back when Google’s day starts again (about 12:30–13:30 IST), or raise the limit in Google AI Studio (billing).' } } };
+    if (res.why === 'busy') return { fail: { httpStatus: 429, body: { error: 'AI_KEY_QUOTA', retryAfter: res.retryAfter || 60, message: 'Your company’s own Gemini key has reached its Google limit (quota) for now. Try again later, or raise the limit in Google AI Studio (billing).' } } };
   }
+  /* 4.72.0 — finding 47 / C13: Nexora's key has used Google's daily allowance — remembered until the day turns */
+  if (res.why === 'daily') { googleDayUntil = googleDayTurns(); return { fail: googleDailyFail() }; }
   if (res.why === 'refused') return { fail: { httpStatus: 422, body: { error: 'AI_REFUSED', message: 'Google declined to answer that question — put it another way.' } } };
   if (res.why === 'timeout' || res.why === 'cancelled') return { fail: { httpStatus: 504, body: { error: 'AI_TIMEOUT', message: 'Nexora AI did not answer in time — Google was slow just now. Try again.' } } };
   if (res.why === 'network') return { fail: { httpStatus: 502, body: { error: 'AI_UNREACHABLE', message: 'Nexora AI could not reach Google just now. Try again in a moment.' } } };
   if (res.why === 'http' && res.status >= 500) return { fail: { httpStatus: 503, body: { error: 'AI_OVERLOADED', retryAfter: 60, message: 'Google’s AI is overloaded just now (it says “high demand”) — Nexora AI asked it several times. Try again in a minute.' } } };
   if (res.why === 'unreadable') return { fail: { httpStatus: 502, body: { error: 'AI_UNREADABLE', message: res.finish === 'MAX_TOKENS' ? 'Nexora AI’s answer ran too long and was cut off. Ask a narrower question.' : 'Nexora AI answered in a form Nexora could not read. Try again.' } } };
   const busy = res.why === 'busy';
-  return { fail: { httpStatus: busy ? 429 : 502, body: { error: busy ? 'AI_BUSY' : 'AI_FAILED', retryAfter: busy ? 60 : undefined,
-    message: busy ? 'Nexora AI is busy (Google’s limit) — try again in a minute.' : 'Nexora AI could not answer (' + res.status + '): ' + scrub(res.r && res.r.body && res.r.body.error && res.r.body.error.message) } } };
+  /* 4.72.0 — Google's own RetryInfo says how long when it says (else a minute) */
+  const wait = busy ? (res.retryAfter || 60) : undefined;
+  return { fail: { httpStatus: busy ? 429 : 502, body: { error: busy ? 'AI_BUSY' : 'AI_FAILED', retryAfter: wait,
+    message: busy ? (wait < 60 ? 'Nexora AI is busy (Google’s limit) — try again in ' + wait + ' seconds.' : 'Nexora AI is busy (Google’s limit) — try again in a minute.') : 'Nexora AI could not answer (' + res.status + '): ' + scrub(res.r && res.r.body && res.r.body.error && res.r.body.error.message) } } };
 }
+/** C13 — the body every client shows as it is */
+function googleDailyFail() { return { httpStatus: 429, body: { error: 'AI_GOOGLE_DAILY', message: GOOGLE_DAILY_MESSAGE } }; }
 
 /** POST /v1/ai/check-bom — phase 1 */
 export async function checkBom(companyId, payload, lang, fetchImpl) {
   if (!aiConfigured()) return { httpStatus: 503, body: { error: 'AI_OFF', message: 'Nexora AI is not switched on at the service yet.' } };
   const p = clean(payload);
   if (!p.stages.length) return { httpStatus: 400, body: { error: 'NOTHING', message: 'There is no route on this BOM to check yet.' } };
-  const a = await ask(companyId, SYSTEM, promptFor(p, lang), fetchImpl, { kind: 'check-bom' });
+  const a = await ask(companyId, SYSTEM, promptFor(p, lang), fetchImpl, { kind: 'check-bom', schema: SCHEMAS['check-bom']() });
   if (a.fail) return a.fail;
   const ans = readAnswer({ candidates: [{ content: { parts: [{ text: JSON.stringify(a.json) }] } }] });
   if (!ans) return { httpStatus: 502, body: { error: 'AI_UNREADABLE', message: 'Nexora AI answered in a form Nexora could not read. Try again.' } };
@@ -682,6 +889,7 @@ const PLAN_SYSTEM = [
   'A new route is an ordered list of process CODES taken ONLY from the process master, each code at most twice. Follow the material: each step should consume what an earlier step produces, or raw material (RM). A bag has BOPP printing and slitting stages only if it is BOPP laminated; the fabric (tape, weaving) and the film (BOPP printing, slitting) meet at lamination. Put lamination after both lines, then backseam or bottom forming, finishing and packing as the bag needs. Do not invent processes; if one is missing, say so in notes.',
   'You do not choose materials, quantities, prices or costs.',
   ANSWER_LINE + ' A question only: choice "none".',
+  PRIVATE_LINE,
   'Answer ONLY with JSON: {"answer": string, "summary": string, "choice": "workflow" | "route" | "new" | "none", "workflowId": string or null, "routeId": string or null, "route": {"name": string, "steps": [{"code": string, "why": string}]} or null, "notes": [string]}.'
 ].join(' ');
 
@@ -695,7 +903,7 @@ export async function planRoute(companyId, payload, lang, fetchImpl) {
   if (m.error) return m.error;
   const prompt = langLine(lang, 'answer, summary, why and notes') +
     (m.audio ? 'The person describes the bag in the attached recording.\n' : '') + 'INPUT:\n' + JSON.stringify(p) + convoText(convoOf(payload));
-  const a = await ask(companyId, PLAN_SYSTEM, m.parts.concat([{ text: prompt }]), fetchImpl, { kind: 'plan-route' });
+  const a = await ask(companyId, PLAN_SYSTEM, m.parts.concat([{ text: prompt }]), fetchImpl, { kind: 'plan-route', schema: SCHEMAS['plan-route']() });
   if (a.fail) return a.fail;
   const j = a.json || {};
   const codes = {};
@@ -761,13 +969,20 @@ export function cleanFill(p) {
 const FILL_SYSTEM = [
   'You are Nexora AI, inside Nexora, software that weighs PP/PE woven sacks.',
   'A person describes one bag, by voice or in writing, in English, Gujarati or Hindi (often mixed). Place what they say on the CONSTRUCTIONS and FIELDS given — nothing else.',
-  'Units: every field is in the unit FIELDS gives it — this plant\u2019s own (UNITS: sizes and mesh as the plant types them). Put what the person says EXACTLY in those units ("32 by 32" mesh → M.WARP 32, M.WEFT 32; "490 by 550" → width 490, length 550); convert only when the person names a different unit, and say so. GSM in g/m², micron in µm. Width and length are the bag\u2019s flat width and length. Bag quantity is "bagQuantity".',
-  'Choose the construction from the list by what they say (layers, laminated or not, block bottom, stitched, valve, liner, pinch). An enum field takes one of its options exactly.',
-  'Put in "inputs" only what was actually said, never a guess. List in "missing" each field of the chosen construction that is required but not said, with a short question to ask.',
+  'Units: every field is in the unit FIELDS gives it — this plant’s own (UNITS: sizes and mesh as the plant types them). Put what the person says EXACTLY in those units ("32 by 32" mesh → M.WARP 32, M.WEFT 32; "490 by 550" → width 490, length 550); convert only when the person names a different unit, and say so. GSM in g/m², micron in µm. Width and length are the bag’s flat width and length. Bag quantity is "bagQuantity".',
+  /* 4.72.0 — C10: a bag weight in grams is the target (the phone then opens Weight → GSM) */
+  'A bag WEIGHT said in grams ("70 gram", "70 g bag", "target 70", "૭૦ ગ્રામ", "70 ग्राम") is the TARGET WEIGHT: put it in "targetWeight" (grams) and leave BD FAB GSM out — Nexora finds the body fabric GSM for that weight. A number is a GSM only when the person says gsm or g/m².',
+  'Choose the construction from the list by what they say (layers, laminated or not, block bottom, stitched, valve, liner, pinch); the ones the words name come with their fields, the others by name only. An enum field takes one of its options exactly.',
+  'Put in "inputs" only what was actually said, never a guess. List in "missing" each field of the chosen construction that is required but not said, with a short question to ask (never the GSM when a target weight was said).',
   ANSWER_LINE + ' A question only: construction null, no inputs, no missing.',
-  'Answer ONLY with JSON: {"answer": string, "transcript": string, "construction": string or null, "inputs": {"FIELD KEY": number or string}, "bagQuantity": number or null, "missing": [{"key": string, "question": string}], "summary": string}.'
+  PRIVATE_LINE,
+  'Answer ONLY with JSON: {"answer": string, "transcript": string, "construction": string or null, "inputs": {"FIELD KEY": number or string}, "bagQuantity": number or null, "targetWeight": grams or null, "missing": [{"key": string, "question": string}], "summary": string}.'
 ].join(' ');
 
+/** 4.72.0 — "gsm" said (typed, earlier in the conversation, or heard) */
+const GSM_SAID = /\bgsm\b|g\s*\/\s*m|gram(?:s)?\s+per\s+(?:sq|square)|જીએસએમ|जीएसएम/i;
+/** 4.72.0 review — figures that are not a bag weight: a size or a mesh (450 x 750, 10x10), or a number with another unit */
+const NOT_WEIGHT = /\d+(?:\.\d+)?\s*(?:x|\*|×|by)\s*\d+(?:\.\d+)?|\d+(?:\.\d+)?\s*(?:gsm\b|g\s*\/\s*m|mic(?:ron)?s?\b|µ|mm\b|cm\b|inch\w*|"|mesh\b|%|taka\b|જીએસએમ|जीएसएम|ટકા|टका)/gi;
 export async function fillCalc(companyId, payload, lang, fetchImpl) {
   if (!aiConfigured()) return { httpStatus: 503, body: { error: 'AI_OFF', message: 'Nexora AI is not switched on at the service yet.' } };
   const p = cleanFill(payload);
@@ -776,12 +991,19 @@ export async function fillCalc(companyId, payload, lang, fetchImpl) {
   if (m.error) return m.error;
   if (!m.parts.length && !p.text) return { httpStatus: 400, body: { error: 'NOTHING', message: 'Say, type or show the bag first.' } };
   if (!p.constructions.length || !p.fields.length) return { httpStatus: 400, body: { error: 'NOTHING', message: 'This plant has no constructions to choose from.' } };
+  const convo = convoOf(payload);
+  /* 4.72.0 — finding 46: the constructions the words name (by name, or by layers and bottom) go with their fields, the
+     rest by name — every one with its fields only when none is named; a recording or a photo is not read here: all go */
+  const named = m.parts.length ? [] : consNamed(p, [p.text].concat(convo.filter((h) => h.role === 'user').slice(-1).map((h) => h.text)).join(' ')).concat(p.current.structure ? [p.current.structure] : []);
+  const keys = {};
+  const consSent = named.length ? p.constructions.map((c) => (named.indexOf(c.name) > -1 ? (c.fields.forEach((k) => { keys[k] = 1; }), c) : { name: c.name, description: c.description })) : p.constructions;
+  const fieldsSent = named.length ? p.fields.filter((f) => keys[f.key] || f.required) : p.fields;
   const intro = langLine(lang, 'summary and questions') +
     (m.audio ? 'The bag is described in the attached recording.\n' : '') +
     (m.files ? 'The bag is also shown in the attached ' + m.files + ' photo(s) or document(s) — a drawing, a specification sheet or a sample bag: read its sizes and specification carefully; a size printed on a drawing is in the unit written beside it.\n' : '') +
     (p.text ? 'The person typed: ' + p.text + '\n' : '') +
-    'CONTEXT:\n' + JSON.stringify({ units: p.units, constructions: p.constructions, fields: p.fields, current: p.current }) + convoText(convoOf(payload));
-  const a = await ask(companyId, FILL_SYSTEM, m.parts.concat([{ text: intro }]), fetchImpl, { kind: 'fill-calc' });
+    'CONTEXT:\n' + JSON.stringify({ units: p.units, constructions: consSent, fields: fieldsSent, current: p.current }) + convoText(convo);
+  const a = await ask(companyId, FILL_SYSTEM, m.parts.concat([{ text: intro }]), fetchImpl, { kind: 'fill-calc', schema: SCHEMAS['fill-calc'](fieldsSent) });
   if (a.fail) return a.fail;
   const j = a.json || {};
   /* checked against what was sent */
@@ -802,21 +1024,35 @@ export async function fillCalc(companyId, payload, lang, fetchImpl) {
       if (isFinite(n) && n >= 0) inputs[k] = Math.round(n * 1000) / 1000; else dropped.push(k);
     }
   });
+  /* 4.72.0 — C10: the target weight (grams), only a figure the person said — typed, earlier in this window, or heard
+     (or read off an attached drawing) — and then no body fabric GSM unless the person said "gsm" */
+  const words = asciiDigits([p.text, m.audio ? str(j.transcript, 800) : ''].concat(convo.filter((h) => h.role === 'user').map((h) => h.text)).join(' '));
+  /* 4.72.0 review — a number said only as a size (450 x 750), a mesh (10x10) or with another unit (20 micron, 72 gsm,
+     5 %) is not a bag weight: the target can only be a number said otherwise ("75 gram", "75g", "target 75") */
+  const said = (words.replace(/,/g, '').replace(NOT_WEIGHT, ' ').match(/\d+(?:\.\d+)?/g) || []).map(Number);
+  const tw = Number(String(j.targetWeight == null ? '' : j.targetWeight).replace(/,/g, ''));
+  let targetWeight = j.targetWeight != null && String(j.targetWeight).trim() !== '' && isFinite(tw) && tw > 0 && tw < 100000 ? Math.round(tw * 1000) / 1000 : null;
+  if (targetWeight !== null && !m.files && !said.some((n) => Math.abs(n - targetWeight) < 1e-9)) { dropped.push('targetWeight'); targetWeight = null; }
+  if (targetWeight !== null && inputs['BD FAB GSM'] !== undefined && !GSM_SAID.test(words)) delete inputs['BD FAB GSM'];
+  /* the model put "75 gram" in the GSM after all (and nobody said gsm): it is the bag's weight, so it goes as the target */
+  const gram = /(\d+(?:\.\d+)?)\s*(?:g|gm|gms|grams?|ગ્રામ|ग्राम)(?![a-z/])/i.exec(words);
+  if (targetWeight === null && gram && !GSM_SAID.test(words) && inputs['BD FAB GSM'] === Number(gram[1])) { delete inputs['BD FAB GSM']; targetWeight = Number(gram[1]); }
   const asked = {};
   list(j.missing, 20).forEach((m) => { if (m && fieldOf[m.key]) asked[m.key] = str(m.question, 200); });
   const missing = [];
-  const onlyAnswer = !!str(j.answer, 3000) && !con && !Object.keys(inputs).length;
+  const onlyAnswer = !!str(j.answer, 3000) && !con && !Object.keys(inputs).length && !targetWeight;
   if (!con && !onlyAnswer) missing.push({ key: '__construction', question: lang === 'gu' ? 'કયું construction?' : lang === 'hi' ? 'कौन सा construction?' : 'Which construction is it?', type: 'enum', options: p.constructions.map((c) => c.name) });
   (con ? con.fields : []).forEach((k) => {
     const f = fieldOf[k];
     if (!f || inputs[k] !== undefined || (p.current.inputs[k] !== undefined && p.current.structure === (con && con.name))) return;
+    if (k === 'BD FAB GSM' && targetWeight) return;    /* the weight gives the GSM: never asked for both */
     if (f.required || asked[k]) missing.push({ key: k, label: f.label, unit: f.unit, type: f.type, options: f.options, question: asked[k] || f.label + (f.unit ? ' (' + f.unit + ')' : '') + '?' });
   });
   const qty = Number(j.bagQuantity);
   return { httpStatus: 200, body: {
     ok: true, model: a.model, left: a.left, answer: str(j.answer, 3000), transcript: str(j.transcript, 800), summary: str(j.summary, 400),
     construction: con ? con.name : null, inputs: inputs, bagQuantity: isFinite(qty) && qty > 0 ? Math.round(qty) : null,
-    missing: missing, dropped: dropped
+    targetWeight: targetWeight, missing: missing, dropped: dropped
   } };
 }
 
@@ -902,6 +1138,7 @@ const EDIT_SYSTEM = [
   'A person tells you, by voice or in writing (English, Gujarati or Hindi), how to change the bill of materials whose STAGES are given (each with its recipe lines and waste). Turn it into changes.',
   'Changes you may make: {"op":"waste","stage":n,"value":percent}; {"op":"add","stage":n,"material":CODE,"basis":"PCT"|"PERBAG_G"|"PER1000"|"ABS","value":number}; {"op":"set","stage":n,"line":k,"value":number}; {"op":"remove","stage":n,"line":k}.',
   'Use only material CODES from the MATERIALS list (match by name or code, e.g. "LD" or "LD granule"), only stages and lines that exist. "percent" of a material is basis PCT (percent of the stage gross). Do not change anything that was not asked. Never invent a price.',
+  PRIVATE_LINE,
   ANSWER_LINE + ' A question only: no changes (e.g. "is the recipe 100 % now?" — add the stage\u2019s PCT lines and say).',
   'Answer ONLY with JSON: {"answer": string, "summary": string, "transcript": string, "changes": [ ... ], "notes": [string]}.'
 ].join(' ');
@@ -914,7 +1151,7 @@ export async function editBom(companyId, payload, lang, fetchImpl) {
   if (!p.text && !m.parts.length) return { httpStatus: 400, body: { error: 'NOTHING', message: 'Say or type the change first.' } };
   const intro = langLine(lang, 'summary and notes') + (m.audio ? 'The change is said in the attached recording.' + (p.text ? ' Also typed: ' + p.text : '') : 'The change, typed: ' + p.text) +
     '\nBOM:\n' + JSON.stringify({ stages: p.stages, materials: p.materials }) + convoText(convoOf(payload));
-  const a = await ask(companyId, EDIT_SYSTEM, m.parts.concat([{ text: intro }]), fetchImpl, { kind: 'edit-bom' });
+  const a = await ask(companyId, EDIT_SYSTEM, m.parts.concat([{ text: intro }]), fetchImpl, { kind: 'edit-bom', schema: SCHEMAS['edit-bom']() });
   if (a.fail) return a.fail;
   const j = a.json || {};
   const stageOf = {}; p.stages.forEach((s) => { stageOf[s.n] = s; });
@@ -968,6 +1205,7 @@ const QUOTE_SYSTEM = [
   'Address the buyer as {{CUSTOMER}} (the application puts the name in); sign as the seller given, or {{SELLER}} if none.',
   'The person may ask for the letter again with a change ("make it shorter", "add early delivery"): write it again, whole, from the QUOTATION and the conversation.',
   ANSWER_LINE + ' A question only: subject, letter and whatsapp "".',
+  PRIVATE_LINE,
   'Answer ONLY with JSON: {"answer": string, "subject": string, "letter": string, "whatsapp": string}.'
 ].join(' ');
 export async function quoteLetter(companyId, payload, lang, fetchImpl) {
@@ -978,7 +1216,7 @@ export async function quoteLetter(companyId, payload, lang, fetchImpl) {
   if (!p.quote.items.length) return { httpStatus: 400, body: { error: 'NOTHING', message: 'This quotation has no items yet.' } };
   const intro = langLine(lang, 'the letter and the message') + (m.audio ? 'The person also said what to stress, in the attached recording.' : '') +
     (p.text ? ' The person asks: ' + p.text : '') + '\nQUOTATION:\n' + JSON.stringify(p.quote) + convoText(convoOf(payload));
-  const a = await ask(companyId, QUOTE_SYSTEM, m.parts.concat([{ text: intro }]), fetchImpl, { kind: 'quote-letter' });
+  const a = await ask(companyId, QUOTE_SYSTEM, m.parts.concat([{ text: intro }]), fetchImpl, { kind: 'quote-letter', schema: SCHEMAS['quote-letter']() });
   if (a.fail) return a.fail;
   const j = a.json || {};
   return { httpStatus: 200, body: { ok: true, model: a.model, left: a.left, answer: str(j.answer, 3000), subject: str(j.subject, 200), letter: str(j.letter, 4000), whatsapp: str(j.whatsapp, 1500) } };
@@ -993,10 +1231,54 @@ export function cleanHelp(p) {
     glossary: list(x.glossary, 200).map((g) => ({ term: str(g && g.term, 60), meaning: str(g && g.meaning, 400) })).filter((g) => g.term)
   };
 }
+/* 4.72.0 — finding 46(c): the whole of Nexora's help (about 35,000 characters) went with every question. Now the topics
+   are ranked here by the question's own words (and its Gujarati or Hindi words for the same things): the best ones go
+   whole, every other topic by its title and where it is, so the model can still point at the nearest one. A question
+   whose words match nothing gets every topic, each cut short. The glossary is small and goes whole (ranked when big). */
+const HELP_WORDS = [[/કોટેશન|ક્વોટેશન|कोटेशन|kotesan|quotation|quote/i, 'quotation'], [/બીઓએમ|बीओएम|\bbom\b/i, 'bom'], [/ભાવ|भाव|\bbhav|કિંમત|कीमत|\bkimat|price|rate/i, 'price'],
+  [/ખર્ચ|કોસ્ટ|लागत|कॉस्ट|kharch|\bcost/i, 'cost'], [/યુઝર|यूजर|user/i, 'user'], [/પિન|पिन|\bpin\b/i, 'pin'], [/બેકઅપ|बैकअप|backup/i, 'backup'], [/પ્રિન્ટ|प्रिंट|print/i, 'print'],
+  [/રૂટ|रूट|route/i, 'route'], [/રેસીપી|रेसिपी|reciepy|recipie|recipe/i, 'recipe'], [/સેટિંગ|सेटिंग|setting/i, 'settings'], [/ગણતરી|गणना|ganatri|calcul/i, 'calculation'],
+  [/વજન|वजन|vajan|wajan|weight/i, 'weight'], [/ગ્રાહક|ग्राहक|grahak|customer/i, 'customer'], [/ફોલો|फॉलो|follow/i, 'follow'], [/ટાર્ગેટ|टारगेट|target/i, 'target'],
+  [/અપડેટ|अपडेट|update/i, 'update'], [/લાઇસન્સ|लाइसेंस|licen[cs]e/i, 'licence'], [/વર્કફ્લો|वर्कफ़्लो|workflow/i, 'workflow'], [/એન્ક્વાયરી|ઇન્ક્વાયરી|पूछताछ|enquir|inquir/i, 'enquiry'],
+  [/સરખામણી|तुलना|compare/i, 'compare'], [/માર્કેટિંગ|मार्केटिंग|marketing/i, 'marketing'], [/સ્ટ્રક્ચર|स्ट्रक्चर|structure|construction/i, 'structure'], [/ભાષા|भाषा|language/i, 'language']];
+const HELP_STOP = { how: 1, do: 1, does: 1, the: 1, and: 1, for: 1, what: 1, where: 1, when: 1, can: 1, you: 1, this: 1, that: 1, with: 1, from: 1, into: 1, kem: 1, kevi: 1, rite: 1,
+  karvu: 1, karvo: 1, vaprvu: 1, che: 1, chhe: 1, nu: 1, ni: 1, no: 1, mate: 1, kya: 1, hai: 1, kaise: 1, karna: 1, karte: 1, kare: 1, aap: 1, mujhe: 1, mane: 1, have: 1, use: 1 };
+export function helpWords(text) {
+  const t = String(text || '');
+  const words = t.toLowerCase().split(/[^a-z0-9_.]+/).filter((w) => w.length >= 3 && !HELP_STOP[w]);
+  HELP_WORDS.forEach((p) => { if (p[0].test(t) && words.indexOf(p[1]) < 0) words.push(p[1]); });
+  return words;
+}
+export function rankHelp(p, convo, keep) {
+  const k = keep || 6;
+  const lastUser = (convo || []).filter((h) => h.role === 'user').slice(-1)[0];
+  const words = helpWords(p.text + ' ' + (String(p.text || '').length < 60 && lastUser ? lastUser.text : ''));
+  const screen = String(p.screen || '').toLowerCase();
+  /* two words together ("target cost", "price impact") count far more than each alone */
+  const pairs = words.slice(1).map((w, i) => words[i] + ' ' + w);
+  const scored = p.topics.map((t, i) => {
+    const title = t.title.toLowerCase(), where = t.where.toLowerCase(), body = t.body.toLowerCase();
+    let score = 0;
+    words.forEach((w) => { if (title.indexOf(w) > -1) score += 8; if (where.indexOf(w) > -1) score += 3; if (body.indexOf(w) > -1) score += 1; });
+    pairs.forEach((w) => { if (title.indexOf(w) > -1 || where.indexOf(w) > -1) score += 12; else if (body.indexOf(w) > -1) score += 3; });
+    if (score && screen && (where.indexOf(screen) > -1 || title.indexOf(screen) > -1)) score += 2;
+    return { t: t, i: i, score: score };
+  });
+  const best = scored.filter((x) => x.score > 0).sort((a, b) => b.score - a.score || a.i - b.i).slice(0, k).map((x) => x.i);
+  let topics;
+  if (p.topics.length <= k) topics = p.topics;
+  else if (best.length) topics = p.topics.map((t, i) => best.indexOf(i) > -1 ? t : { title: t.title, where: t.where });
+  else topics = p.topics.map((t) => ({ title: t.title, where: t.where, body: t.body.length > 700 ? t.body.slice(0, 700) + ' …' : t.body }));
+  const gl = JSON.stringify(p.glossary).length <= 6000 ? p.glossary
+    : p.glossary.filter((g) => words.some((w) => g.term.toLowerCase().indexOf(w) > -1 || w.indexOf(g.term.toLowerCase()) > -1)).concat(p.glossary).filter((g, i, a) => a.indexOf(g) === i).slice(0, 60);
+  return { topics: topics, glossary: gl, whole: best.length };
+}
 const HELP_SYSTEM = [
   'You are Nexora AI, the helper inside Nexora (bag weight, BOM, costing and quotation software for PP/PE woven sacks).',
   'Answer the person’s question ONLY from the HELP TOPICS and GLOSSARY given. Say where in Nexora to go (menu, window, button). Keep it short, in steps when it is a how-to.',
+  'The topics that fit the question are given whole; the others by their title and where they are (or cut short) — point at one of those by its title when it is the nearest.',
   'If the answer is not in what is given, say so plainly and suggest the nearest topic — never invent a feature.',
+  PRIVATE_LINE,
   'Answer ONLY with JSON: {"transcript": string, "answer": string, "topics": [string]}.'
 ].join(' ');
 export async function help(companyId, payload, lang, fetchImpl) {
@@ -1005,9 +1287,13 @@ export async function help(companyId, payload, lang, fetchImpl) {
   const m = mediaParts(payload);
   if (m.error) return m.error;
   if (!p.text && !m.parts.length) return { httpStatus: 400, body: { error: 'NOTHING', message: 'Say or type the question first.' } };
-  const intro = langLine(lang, 'the answer') + (m.audio ? 'The question is in the attached recording.' + (p.text ? ' Also typed: ' + p.text : '') : 'The question: ' + p.text) +
-    (p.screen ? '\nThe person is on the ' + p.screen + ' window.' : '') + '\nHELP:\n' + JSON.stringify({ topics: p.topics, glossary: p.glossary }) + convoText(convoOf(payload));
-  const a = await ask(companyId, HELP_SYSTEM, m.parts.concat([{ text: intro }]), fetchImpl, { kind: 'help' });
+  const convo = convoOf(payload);
+  const r = rankHelp(p, convo);
+  /* 4.72.0 — the help first and the question after it, so a question like the last one starts the same way */
+  const intro = 'HELP:\n' + JSON.stringify({ topics: r.topics, glossary: r.glossary }) + '\n' + langLine(lang, 'the answer') +
+    (m.audio ? 'The question is in the attached recording.' + (p.text ? ' Also typed: ' + p.text : '') : 'The question: ' + p.text) +
+    (p.screen ? '\nThe person is on the ' + p.screen + ' window.' : '') + convoText(convo);
+  const a = await ask(companyId, HELP_SYSTEM, m.parts.concat([{ text: intro }]), fetchImpl, { kind: 'help', schema: SCHEMAS.help() });
   if (a.fail) return a.fail;
   const j = a.json || {};
   const titles = {}; p.topics.forEach((t) => { titles[t.title] = true; });
@@ -1022,13 +1308,154 @@ export async function help(companyId, payload, lang, fetchImpl) {
    with the whole conversation so far and the same CONTEXT the window
    started from — cleaned by the same functions, so a follow-up can never
    carry a price, a rate, a cost or a name the first question could not. */
+/* 4.72.0 — finding 51: the Nexora phone app's lists, as the kind "phone" — its saved calculations, BOMs and
+   quotations by NUMBER and technical figures, and Marketing as figures, in `context` (never in the conversation, so
+   the conversation's limit never cuts them). The same fields as the computer's RECORDS / BOMS / QUOTES / MARKETING;
+   never a name, a rate or a cost. Each list goes only when the question is about it (all of them when it names none). */
+/* 4.72.0 — C14: `canCost` (the person has "costs and prices", VIEW_COST): each saved BOM's cost per bag and per kg
+   (perBag, perKg — Rs, the saved BOM's totals) and each quotation's amount (Rs, its total before tax) are kept, as
+   the phone sent them; for anybody else they never are */
+export function cleanPhone(d, canCost) {
+  const x = d && typeof d === 'object' ? d : {};
+  const c = x.counts && typeof x.counts === 'object' ? x.counts : {};
+  const yes = canCost === true;
+  return {
+    about: str(x.about, 700),
+    counts: { calcs: nr(c.calcs), boms: nr(c.boms), quotes: nr(c.quotes), enquiries: nr(c.enquiries) },
+    calcs: list(x.calcs, 150).map((r) => ({ n: str(r && r.n, 30), construction: str(r && r.construction, 60), width: nr(r && r.width), length: nr(r && r.length),
+      gsm: nr(r && r.gsm), weight: nr(r && r.weight), target: nr(r && r.target), bags: nr(r && r.bags), status: str(r && r.status, 16), date: str(r && r.date, 10),
+      bom: r && r.bom != null ? !!r.bom : null, rev: nr(r && r.rev) })).filter((r) => r.n),
+    boms: list(x.boms, 120).map((b) => Object.assign({ n: str(b && b.n, 30), calc: str(b && b.calc, 30), construction: str(b && b.construction, 60), route: str(b && b.route, 80),
+      mode: str(b && b.mode, 10), date: str(b && b.date, 10) }, yes ? { perBag: money(b && b.perBag), perKg: money(b && b.perKg) } : {})).filter((b) => b.n),
+    quotes: list(x.quotes, 120).map((q) => Object.assign({ n: str(q && q.n, 30), calcs: list(q && q.calcs, 10).map((v) => str(v, 30)), bags: nr(q && q.bags), items: nr(q && q.items),
+      status: str(q && q.status, 16), date: str(q && q.date, 10) }, yes ? { amount: money(q && q.amount) } : {})).filter((q) => q.n),
+    marketing: cleanMarketing(x.marketing)
+  };
+}
+
+/* ==========================================================================
+   4.72.0 — C14, RATES ON THE PHONE (owner 2026-10-02, audit #34 part 3: "yes, only when asked")
+   --------------------------------------------------------------------------
+   Only a person with "costs and prices" (VIEW_COST — index.js passes canSeeCost) is ever given a rate or a cost
+   figure by the phone's Nexora AI. For anybody else, before anything else, every cost or rate field is taken out of
+   the phone's lists at any depth (perBag, perKg, amount, rate, price, cost and their compounds), money written in
+   the lists' or the conversation's words is held back, and the instructions say plainly that costs and prices are
+   not open to them. For a person who has the right, the phone's own perBag / perKg / amount are kept; and when the
+   question — or the conversation a short follow-up continues (as topicsOf) — asks about a rate, a price or a cost,
+   and only then, the company's price list is read (the route's loader) and its current rates go as RATES: code,
+   name, rate, unit and the date it applies from, the materials the question names first, at most 60 and within the
+   question's budget (AI_PROMPT_MAX_TOKENS). Material names are not private (C9); customer and item names stay
+   coded by the phone. Every other kind, and the computer's /v1/ai/assist, is as before.
+   ========================================================================== */
+/** a money figure as given (to 4 places — a rate of 0.125 Rs/pc stays 0.125); none for an empty value */
+function money(v) {
+  if (v === null || v === undefined || v === '' || typeof v === 'boolean' || typeof v === 'object') return null;
+  const x = Number(v);
+  return isFinite(x) ? Math.round(x * 10000) / 10000 : null;
+}
+/** a field that holds money: perBag, perKg, amount, rate, price, cost and their compounds (costPerBag, sellingPrice …) */
+const MONEY_FIELD = /rate|price|cost|amount|perbag|perkg|rupee|margin|profit/i;
+/** money written in words: "Rs 7.85", "₹ 1,20,000", "450/-", "120 rupees", "રૂ. 95", "120 रुपये" */
+const MONEY_WORDS = /(?:₹|\brs\b\.?|\binr\b|\brupees?\b|\brupiya\b|\brupaye\b|રૂ\.|રૂપિયા|रु\.|रुपय[ेा]?|रुपए)\s*\d[\d,]*(?:\.\d+)?|\d[\d,]*(?:\.\d+)?\s*(?:₹|\/-|\brs\b\.?|\binr\b|\brupees?\b|\brupiya\b|\brupaye\b|રૂ\.?|રૂપિયા|रु\.?|रुपय[ेा]?|रुपए)/gi;
+export function hideMoneyWords(s) { return String(s == null ? '' : s).replace(MONEY_WORDS, '(figure held back)'); }
+/** the phone's context with no money in it, at any depth: money fields dropped, money in words held back */
+export function stripMoney(v, depth) {
+  const d = depth || 0;
+  if (d > 12) return null;
+  if (typeof v === 'string') return hideMoneyWords(v);
+  if (Array.isArray(v)) return v.map((x) => stripMoney(x, d + 1));
+  if (!v || typeof v !== 'object') return v;
+  const o = {};
+  Object.keys(v).forEach((k) => { if (!MONEY_FIELD.test(String(k).replace(/[\s_-]+/g, ''))) o[k] = stripMoney(v[k], d + 1); });
+  return o;
+}
+/** a question about a rate, a price or a cost — English, Gujarati and Hindi, in either script ("PP no bhav shu che?",
+    "LD ની કિંમત", "कीमत क्या है", "Rs", "₹"); a "win rate" or a "conversion rate" is not money */
+export const RATE_WORDS = new RegExp([
+  /* "bhav", "bhavo", "bhave" — not the names Bhavesh, Bhavna, Bhavin (people in Marketing) */
+  '\\b(?:rates?|prices?|pricing|priced|costs?|costing|costly|cheap\\w*|expensive|bhaa?v[aeiou]?|bhaw|kimm?at\\w*|keemat\\w*|qeemat\\w*|kharch\\w*|lagat|daam|' +
+    'rupees?|rupiya|rupaye|rupaiya|rs|inr|sast[aiuy]\\w*|mongh?[aiuo]\\w*|meh?ng[aei]\\w*|mahang[aei]\\w*|profit\\w*|margin\\w*|naf[ao]|munaf[ae]\\w*)\\b',
+  '₹|\\d\\s*\\/-',
+  'ભાવ(?!ેશ|ના|િન|િક)|કિંમત|કીમત|ખર્ચ|કોસ્ટ|રેટ|પ્રાઇસ|પ્રાઈસ|રૂપિયા|મોંઘ|સસ્ત|નફો|નફા|માર્જિન',
+  'भाव(?!ेश|ना|िन|िक)|कीमत|क़ीमत|खर्च|ख़र्च|लागत|दाम|रेट|प्राइस|कॉस्ट|रुपय|रुपए|रुपया|महंग|महँग|सस्त|मुनाफ|मार्जिन'
+].join('|'), 'i');
+const NOT_MONEY_RATE = /\b(?:win(?:ning)?|success|conversion|hit|strike|close|closing|follow-?up|response|reply|visit)\s+rates?\b/gi;
+export function asksRates(text) { return RATE_WORDS.test(String(text || '').replace(NOT_MONEY_RATE, ' ')); }
+/** which of the phone's lists a text names */
+function phoneWants(t) {
+  return { calcs: /calc|bag|weight|gsm|વજન|बैग|बेग|બેગ|ગણતરી|\bCAL-/i.test(t), boms: /\bbom\b|BOM-|બીઓએમ/i.test(t), quotes: /quot|કોટેશન|ક્વોટેશન|कोटेशन|\bQT-/i.test(t),
+    marketing: /enquir|inquir|follow|lead|won|lost|target|customer|visit|call|source|ENQ-|ફોલો|ગ્રાહક|फॉलो|ग्राहक|ટાર્ગેટ|टारगेट|baki|બાકી|बाकी/i.test(t) };
+}
+/** C14 — is this question about rates, prices or costs: its own words, or (a short follow-up, "and LD?") the nearest
+    earlier question that names anything (up to four back), as topicsOf carries a conversation's kinds */
+export function phoneRatesAsked(text, asked) {
+  if (asksRates(text)) return true;
+  if (String(text || '').length >= 60) return false;
+  const users = asked || [];
+  for (let i = users.length - 1; i >= 0 && i >= users.length - 4; i--) {
+    const u = String(users[i] && users[i].text || '');
+    if (asksRates(u)) return true;
+    const w = phoneWants(u);
+    if (w.calcs || w.boms || w.quotes || w.marketing) return false;
+  }
+  return false;
+}
+/** the price list from the route's loader, as it may be sent: code, name, rate, unit, since */
+export function cleanRates(rows) {
+  return list(rows, 5000).map((r) => (r && typeof r === 'object' ? { code: str(r.code, 30).trim(), name: str(r.name, 60).trim(), rate: money(r.rate),
+    unit: str(r.unit, 8).trim().toUpperCase(), since: str(r.since, 10) } : null)).filter((r) => r && r.code && r.rate !== null);
+}
+/** the price list, the materials a text names first (by code, by name, then by a word of the name — "granule"),
+    then those the conversation named, then the rest in the price list's own order → { rows, named } */
+export function rankRates(rates, text, convo) {
+  const up = (s) => ' ' + asciiDigits(String(s || '')).toUpperCase().replace(/\s+/g, ' ') + ' ';
+  const T = up(text), C = up(convo);
+  const word = (U, w) => w.length >= 2 && new RegExp('(^|[^A-Z0-9])' + w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '([^A-Z0-9]|$)').test(U);
+  const hit = (U, r) => {
+    const code = r.code.toUpperCase(), name = r.name.toUpperCase();
+    if (word(U, code) || (name.length >= 3 && U.indexOf(name) > -1)) return 2;
+    return name.split(/[^A-Z0-9]+/).some((w) => w.length >= 4 && /[A-Z]/.test(w) && word(U, w)) ? 1 : 0;
+  };
+  const scored = rates.map((r, i) => { const t = hit(T, r); return { r: r, i: i, s: t ? 2 + t : hit(C, r) ? 1 : 0 }; });
+  scored.sort((a, b) => b.s - a.s || a.i - b.i);
+  return { rows: scored.map((x) => x.r), named: scored.filter((x) => x.s >= 3).length };
+}
+/** the phone's lists the question asks about (all of them when it names none), as tables.
+    C14 — `o.rates`: the question is about rates, prices or costs — a list it does not name does not go for that; for
+    a person who may see costs (`o.costs`) the BOMs go with the bags (they hold each bag's cost), and with no list and
+    no material named ("kharch ketlo?") the BOMs and the quotations go (their costs and amounts) */
+export function phoneContext(c, text, opts) {
+  const t = String(text || '');
+  const op = opts || {};
+  const want = phoneWants(t);
+  const any = want.calcs || want.boms || want.quotes || want.marketing;
+  const all = !any && !op.rates;
+  const costBoms = !!op.costs && (want.calcs || (!any && !op.materialNamed));
+  const costQuotes = !!op.costs && !any && !op.materialNamed;
+  const o = { about: c.about, counts: c.counts };
+  if (all || want.calcs) o.calcs = asTable(lean(c.calcs));
+  else if (want.quotes || want.boms) {
+    /* 4.72.0 review — a quotation's or a BOM's items are bags: the calculations they name go with them */
+    const named = {};
+    if (want.quotes) c.quotes.forEach((q) => (q.calcs || []).forEach((n) => { named[n] = 1; }));
+    if (want.boms) c.boms.forEach((b) => { if (b.calc) named[b.calc] = 1; });
+    const rows = c.calcs.filter((r) => named[r.n]);
+    if (rows.length) o.calcs = asTable(lean(rows));
+  }
+  if (all || want.boms || costBoms) o.boms = asTable(lean(c.boms));
+  if (all || want.quotes || costQuotes) o.quotes = asTable(lean(c.quotes));
+  if (c.marketing && (all || want.marketing)) o.marketing = Object.assign({}, c.marketing, { enquiries: asTable(lean(c.marketing.enquiries)) });
+  return lean(o);
+}
 const CHAT_KINDS = {
   bom: (d) => clean(d),
   plan: (d) => cleanPlan(d),
   calc: (d) => cleanFill(d),
   edit: (d) => cleanEdit(d),
   quote: (d) => cleanQuote(d).quote,
-  help: (d) => { const h = cleanHelp(d); return { topics: h.topics, glossary: h.glossary, screen: h.screen }; }
+  help: (d) => { const h = cleanHelp(d); return { topics: h.topics, glossary: h.glossary, screen: h.screen }; },
+  /* C14 — for a person who may not see costs, every money field and figure is taken out FIRST, whatever the phone sent */
+  phone: (d, canCost) => cleanPhone(canCost === true ? d : stripMoney(d), canCost === true)
 };
 const CHAT_WHAT = {
   bom: 'the bill of materials (its stages, sources, recipes and waste)',
@@ -1036,35 +1463,102 @@ const CHAT_WHAT = {
   calc: 'this bag, the plant’s constructions and their fields',
   edit: 'the bill of materials being changed',
   quote: 'this quotation (selling figures only) and its letter',
-  help: 'Nexora’s own help topics and glossary'
+  help: 'Nexora’s own help topics and glossary',
+  phone: 'what the Nexora phone app holds — the saved calculations, BOMs and quotations by NUMBER and technical figures, and Marketing as figures (a list {"cols","rows"} is a table: each row in the order of "cols"). Answer from these lists; never tell the person to open a computer for what they show'
 };
-const CHAT_SYSTEM = [
+const CHAT_HEAD = [
   'You are Nexora AI, inside Nexora, software for PP/PE woven sack plants (bag weight, BOM, costing, quotation).',
-  'You are in a conversation that began in one Nexora window. Answer the person’s latest question using the CONTEXT and the conversation so far. Be short and practical; say where in Nexora to go when it helps.',
-  'You never see prices, rates or costs and must not guess any. Never recompute weights or costs — Nexora’s engines do that. If the question needs something not in the CONTEXT, say so plainly.',
-  'Answer ONLY with JSON: {"transcript": string, "answer": string}.'
-].join(' ');
-export function cleanChat(p) {
+  'You are in a conversation that began in one Nexora window. Answer the person’s latest question using the CONTEXT and the conversation so far. Be short and practical; say where in Nexora to go when it helps.'
+];
+const CHAT_NO_PRICES = 'You never see prices, rates or costs and must not guess any. Never recompute weights or costs — Nexora’s engines do that. If the question needs something not in the CONTEXT, say so plainly.';
+const CHAT_JSON = 'Answer ONLY with JSON: {"transcript": string, "answer": string}.';
+const CHAT_SYSTEM = CHAT_HEAD.concat([CHAT_NO_PRICES, PRIVATE_LINE, CHAT_JSON]).join(' ');
+/* 4.72.0 — C14: the phone's instructions, by whether the person may see costs */
+const PHONE_COSTS_CLOSED = 'COSTS AND PRICES ARE NOT OPEN TO THIS PERSON: their administrator has not given them the "costs and prices" right, and nothing here holds a rate, a price, a cost or an amount in rupees. When they ask for one — a material’s rate or price (bhav, kimat, ભાવ, કિંમત, भाव, कीमत), a bag’s or a BOM’s cost (kharch, ખર્ચ, खर्च, lagat), a quotation’s value or margin — answer plainly, in their language, that costs and prices are not open to them in Nexora and that their administrator can give them the "costs and prices" right. Never give a figure, a guess, an estimate or a range. Their other questions are answered as usual.';
+const PHONE_COSTS_OPEN = 'COSTS AND PRICES ARE OPEN TO THIS PERSON (their administrator gave them the "costs and prices" right). In the CONTEXT, boms "perBag" and "perKg" are each saved BOM’s cost in Rs per bag and per kg, and quotes "amount" is each quotation’s total in Rs before tax. RATES, sent when the question is about rates, prices or costs, are the raw materials’ current rates from the company’s price master: code, name, rate, unit, since (the date that rate applies from). Rates are Rs per kg unless a unit is given (then Rs per that unit). Quote every figure exactly as given, with its unit and its date — never round it, convert it, work out a new one, estimate or guess. A material not in RATES has no rate here: say so (when RATES_LEFT_OUT is given, more materials have rates than were sent — ask for the material by its name or code). Never recompute weights or costs — Nexora’s engines do that. If the question needs something not in the CONTEXT, say so plainly.';
+export function phoneSystem(canCost) {
+  return CHAT_HEAD.concat(canCost === true ? [PHONE_COSTS_OPEN] : [CHAT_NO_PRICES, PHONE_COSTS_CLOSED], [PRIVATE_LINE, CHAT_JSON]).join(' ');
+}
+const RATES_MAX = 60;
+/** C14 — RATES for the phone's CONTEXT: the ranked price list, at most 60, the named ones always, the rest while the
+    question stays within its budget (`room`, in tokens) → { RATES, RATES_LEFT_OUT? } */
+export function ratesBlock(ranked, room) {
+  const out = [];
+  let left = room;
+  for (const r of ranked.rows) {
+    if (out.length >= RATES_MAX) break;
+    const t = estTokens(JSON.stringify([r.code, r.name, r.rate, r.unit, r.since])) + 1;
+    if (out.length >= ranked.named && t > left) break;
+    out.push(r); left -= t;
+  }
+  const o = { RATES: asTable(lean(out)) };
+  if (ranked.rows.length > out.length) o.RATES_LEFT_OUT = ranked.rows.length - out.length;
+  return o;
+}
+export function cleanChat(p, canCost) {
   const x = p && typeof p === 'object' ? p : {};
   const kind = (typeof x.kind === 'string' && Object.prototype.hasOwnProperty.call(CHAT_KINDS, x.kind)) ? x.kind : 'help';
+  /* 4.72.0 — finding 51: the phone (0.9.x) sends its lists as "primer" pairs at the FRONT of the conversation (each a
+     person's turn answered "Understood. Ask me."), and the conversation's limit cut those first — on the 4th question the
+     phone's AI had lost its quotations and calculations. Up to six such pairs at the front are kept whole; the limit
+     takes only the conversation after them. */
+  const raw = Array.isArray(x.history) ? x.history : [];
+  let lead = 0;
+  while (lead < 12 && lead + 1 < raw.length && raw[lead] && raw[lead].role !== 'model' && raw[lead + 1] && raw[lead + 1].role === 'model' &&
+    /^understood\.?\s*ask me\.?$/i.test(String(raw[lead + 1].text || '').trim())) lead += 2;
+  /* 4.72.0 review — a conversation with no lists in front (the computer's windows) keeps its last 16 turns, as before */
+  const kept = raw.slice(0, lead).concat(raw.slice(lead).slice(lead ? -12 : -16));
+  /* 4.72.0 — C14: on the phone, for a person who may not see costs, money written in the conversation (a list text in
+     front, an answer from before the right was taken away) is held back too */
+  const hide = kind === 'phone' && canCost !== true;
   return {
     kind: kind,
     text: str(x.text, 800),
-    context: CHAT_KINDS[kind](x.context || {}),
-    history: list(Array.isArray(x.history) ? x.history.slice(-16) : [], 16).map((h) => ({ role: h && h.role === 'model' ? 'model' : 'user', text: str(h && h.text, 1500) })).filter((h) => h.text)
+    context: CHAT_KINDS[kind](x.context || {}, canCost === true),
+    history: list(kept, 24).map((h) => ({ role: h && h.role === 'model' ? 'model' : 'user', text: str(hide ? hideMoneyWords(h && h.text) : h && h.text, 1500) })).filter((h) => h.text)
   };
 }
-export async function chat(companyId, payload, lang, fetchImpl) {
+/** POST /v1/ai/chat. `who` (4.72.0, C14 — index.js): { canCost: canSeeCost(the person), loadRates: () => the company's
+    current price list [{code, name, rate, unit, since}] } — read only for a phone question about rates, prices or costs
+    from a person who may see costs. Without it nobody is taken to see costs. */
+export async function chat(companyId, payload, lang, fetchImpl, who) {
   if (!aiConfigured()) return { httpStatus: 503, body: { error: 'AI_OFF', message: 'Nexora AI is not switched on at the service yet.' } };
-  const p = cleanChat(payload);
+  const canCost = !!(who && who.canCost === true);
+  const p = cleanChat(payload, canCost);
   const m = mediaParts(payload);
   if (m.error) return m.error;
   if (!p.text && !m.parts.length) return { httpStatus: 400, body: { error: 'NOTHING', message: 'Say or type the question first.' } };
-  const contents = [{ role: 'user', parts: [{ text: 'CONTEXT — ' + CHAT_WHAT[p.kind] + ':\n' + JSON.stringify(p.context) }] },
+  /* 4.72.0 review — the phone's lists follow the WHOLE conversation (once asked about, a list stays — "and its bags?" two
+     questions after "my latest quotation?" still has the quotations); a list text in front ("Understood. Ask me.") is not a question */
+  const asked = p.history.filter((h, i, a) => h.role === 'user' && !(a[i + 1] && a[i + 1].role === 'model' && /^understood\.?\s*ask me\.?$/i.test(a[i + 1].text.trim())));
+  const question = langLine(lang, 'the answer') + (m.audio ? 'The question is in the attached recording.' + (p.text ? ' Also typed: ' + p.text : '') : p.text);
+  const turns = answeredOnly(p.history);
+  const phone = p.kind === 'phone';
+  const system = phone ? phoneSystem(canCost) : CHAT_SYSTEM;
+  let ctx = p.context;
+  if (phone) {
+    /* C14 — a question about rates, prices or costs (or a short follow-up of one); the price list is read only for
+       such a question, and only for a person who may see costs */
+    const ratesOn = phoneRatesAsked(p.text, asked);
+    const load = ratesOn && canCost && who && typeof who.loadRates === 'function';
+    let ranked = null, unread = false;
+    if (load) {
+      try { ranked = rankRates(cleanRates(await who.loadRates()), p.text, asked.slice(-4).map((h) => h.text).join(' ')); }
+      catch (e) { unread = true; }
+    }
+    ctx = phoneContext(p.context, p.text + ' ' + asked.map((h) => h.text).join(' '), { rates: ratesOn, costs: canCost && ratesOn, materialNamed: !!(ranked && ranked.named) });
+    if (ranked && ranked.rows.length) {
+      const fixed = estTokens(system) + estTokens(CHAT_WHAT.phone) + estTokens(question) + estTokens(JSON.stringify(SCHEMAS.chat())) +
+        turns.reduce((n, h) => n + estTokens(h.text) + 8, 0) + 60;
+      Object.assign(ctx, ratesBlock(ranked, promptMax() - fixed - estTokens(JSON.stringify(ctx))));
+    } else if (ranked) ctx.RATES_NOTE = 'No material has a rate in the company’s price master yet.';
+    else if (unread) ctx.RATES_NOTE = 'The company’s price list could not be read just now — say so, and that they can ask again in a moment.';
+  }
+  const contents = [{ role: 'user', parts: [{ text: 'CONTEXT — ' + CHAT_WHAT[p.kind] + ':\n' + JSON.stringify(ctx) }] },
     { role: 'model', parts: [{ text: '{"transcript":"","answer":"Understood. Ask me."}' }] }];
-  answeredOnly(p.history).forEach((h) => contents.push({ role: h.role, parts: [{ text: h.role === 'model' ? JSON.stringify({ transcript: '', answer: h.text }) : h.text }] }));
-  contents.push({ role: 'user', parts: m.parts.concat([{ text: langLine(lang, 'the answer') + (m.audio ? 'The question is in the attached recording.' + (p.text ? ' Also typed: ' + p.text : '') : p.text) }]) });
-  const a = await ask(companyId, CHAT_SYSTEM, { contents: contents }, fetchImpl, { kind: 'chat' });
+  turns.forEach((h) => contents.push({ role: h.role, parts: [{ text: h.role === 'model' ? JSON.stringify({ transcript: '', answer: h.text }) : h.text }] }));
+  contents.push({ role: 'user', parts: m.parts.concat([{ text: question }]) });
+  const a = await ask(companyId, system, { contents: contents }, fetchImpl, { kind: 'chat', schema: SCHEMAS.chat() });
   if (a.fail) return a.fail;
   const j = a.json || {};
   return { httpStatus: 200, body: { ok: true, model: a.model, left: a.left, transcript: str(j.transcript, 800), answer: str(j.answer, 3000) } };
@@ -1142,7 +1636,8 @@ function safeSearch(view, constructions) {
   if (!view || typeof view.search !== 'string' || !view.search.trim()) return view;
   const t = view.search.trim();
   const con = (constructions || []).filter((c) => String(c.name || '').toUpperCase() === t.toUpperCase())[0];
-  view.search = /^(?:[A-Z]{2,5}-)?\d{1,4}(?:-\d*)?$/i.test(t) ? t : con ? con.name : '(a search is typed)';
+  /* 4.72.0 — C9: a private name the application already swapped for its code ([C1], [I2]) may go as that code */
+  view.search = /^(?:[A-Z]{2,5}-)?\d{1,4}(?:-\d*)?$/i.test(t) || /^\[[CIGME]\d{1,4}\]$/.test(t) ? t : con ? con.name : '(a search is typed)';
   return view;
 }
 const ALLOWED = ['cost', 'calc', 'bom', 'route', 'rm', 'price', 'constants', 'quote', 'compare', 'targetcost', 'priceimpact', 'notes'];
@@ -1232,76 +1727,103 @@ export function cleanAssist(p) {
   };
 }
 
-const STEP_LIST = [
-  '{"do":"calc","construction":NAME,"inputs":{FIELD KEY: value},"targetWeight":grams or null,"bagQuantity":number or null,"fresh":true|false} — fill the calculation (fresh:true starts a new one; false changes the one on screen).',
-  '{"do":"save"} — save the calculation.',
-  '{"do":"route","name":ROUTE NAME} — run this bag on a saved route; or {"do":"route","name":new name,"steps":[PROCESS CODE,...]} — a new route from the process master.',
-  '{"do":"workflow","name":WORKFLOW NAME} — make this bag follow a saved workflow from LEARNED.workflows (it brings its routes and recipes).',
-  '{"do":"parts","mode":"WHOLE"|"SPLIT","tabs":{PART KEY: true|false},"routes":{PART KEY: ROUTE NAME}} — which parts of the bag are made on their own route (a tab, SPLIT) and which are costed inside a stage; PART KEYs from NOW.calc.parts (or, for a new bag, BODY, TOP PATCH, BOTTOM PATCH, VALVE, LINER, BOPP as its construction has them).',
-  '{"do":"bom"} — open this bag’s BOM (it is costed there, on the person’s screen).',
-  '{"do":"check"} — after the BOM is built, check it all (routes, parts taken in, recipes, waste): "is everything right?".',
-  '{"do":"suggest","stage":PROCESS CODE} — fill that stage from the calculation with Nexora\u2019s own Suggest (layer shares on a coating/lamination stage, grams per bag on a finishing, pasting, easy-open or stitching stage) and save it.',
-  '{"do":"recipe","add":true|false,"remove":true|false,"part":PART KEY or null,"stage":PROCESS CODE,"lines":[{"material":MATERIAL CODE,"value":number,"basis":"PCT"} or {"part":PART KEY,"value":grams or null} or {"earlier":true,"stage":PROCESS CODE or null,"basis":"PCT"|"PART_G","value":number or null,"figure":FIGURE KEY or null}],"wastePct":number or null} — set the materials of one stage (of the body, or of a part on its own tab); a {"part":KEY} line TAKES IN that part at this stage (e.g. the patches and the valve at the bottom/finishing stage, BOPP at lamination). Earlier-stage rows stay.',
-  '{"do":"waste","part":PART KEY or null,"stage":PROCESS CODE,"pct":number} — the waste % of one stage.',
-  '{"do":"resources","from":a BOM or calculation NUMBER from BOMS/RECORDS (the reference),"stage":PROCESS CODE or null} — give this bag\u2019s stages the resources the reference BOM uses at the same stages (every matching stage when none is named).',
-  '{"do":"resource","action":"add"|"set"|"remove","stage":PROCESS CODE,"name":RESOURCE NAME,"type":one of RESOURCETYPES or null,"basis":"KG"|"BAG"|"PER1000"|"PERN" or null,"rate":number or null,"perBags":number or null,"forAll":true|false,"part":PART KEY or null} — add, change or take out ONE resource on a stage of this bag (forAll:true changes the process itself in the Process master — every route that runs it).',
-  '{"do":"stage","action":"remove"|"add","stage":PROCESS CODE,"after":PROCESS CODE or null,"part":PART KEY or null,"shared":true|false} — take a WHOLE stage off this bag\u2019s BOM, its section with it — or put a process on after the stage named (before packing when none is named). For THIS BAG ONLY (Nexora keeps the bag\u2019s own copy of its route); "shared": true changes the route itself — every bag on it and any workflow using it — ONLY when the person says so.',
-  '{"do":"recipe","stage":PROCESS CODE,"clear":true,"part":PART KEY or null} — empty that stage\u2019s materials (the stage stays on the route; what it takes from the stage before stays).',
-  '{"do":"accept"} — save the stages Nexora suggested on this BOM into its route (they are then the plant\u2019s own).',
-  '{"do":"savebom"} — save the BOM as a record (with its version).',
-  '{"do":"saveworkflow","name":NAME} — save this bag\u2019s whole set-up (routes, tabs, every recipe) as a workflow, loaded on the next bag of this construction.',
-  '{"do":"price","material":MATERIAL CODE,"change":number or null,"pct":number or null,"set":number or null,"from":"YYYY-MM-DD" or null} — a new price version for a material: "+5" is change 5, "3 % up" is pct 3, "210 karo" is set 210.',
-  '{"do":"quote","quantity":number,"rate":number or null,"margin":percent or null} — a quotation for the bag on screen (or the one just made): its quantity, and the selling rate the person said, or a margin over the bag\u2019s cost that Nexora works out on the person\u2019s computer. The buyer is typed by the person.',
-  '{"do":"cost"} — show the cost per bag (worked out on the person’s screen; you never see it).',
-  '{"do":"find","what":"calc"|"bom"|"quote","number":a NUMBER from RECORDS/BOMS/QUOTES or null,"construction":NAME or null,"q":search words or null,"open":true|false} — find saved work; open:true opens the one found (a calculation in the calculation window, a BOM on the BOM window, a quotation to edit), else its records window is shown filtered.',
-  '{"do":"compare","a":CALC NUMBER or "current","b":CALC NUMBER} — two calculations side by side (weight, layers, and cost per bag for a person who may see it).',
-  '{"do":"targetcost","calc":CALC NUMBER or "current","mode":"PRICE"|"COST","price":selling price per bag or null,"margin":percent or null,"cost":target cost per bag or null} — Target Cost: what to change to bring the bag to that cost; it searches the options on the person\u2019s computer.',
-  '{"do":"priceimpact","changes":[{"material":MATERIAL CODE,"change":number or null,"pct":number or null,"set":number or null}]} — Price Impact: what every saved BOM costs at today\u2019s prices ([] ) or at what-if prices (nothing is saved).',
-  '{"do":"constant","name":CONSTANT NAME from CONSTANTS,"value":number} — set a constant (in its own unit, as CONSTANTS show it); it goes to the administrator for approval when the person may not change it.',
-  '{"do":"material","name":NAME,"group":GROUP from GROUPS,"code":CODE or null,"uom":"KG"|"PCS"|"MTR" or null,"wastePct":number or null} — add a raw material to the RM Master (its code is made from its group when not said; a price is a separate "price" step).',
-  '{"do":"note","text":TEXT} — write a note on the person\u2019s own note pad.',
-  '{"do":"guide","view":one of ' + ASSIST_VIEWS.join('|') + ',"button":the words on a button, tab or field of that window,"say":one short line} — SHOW the person where to press: open that window and point at it, with the line.',
-  '{"do":"open","view":one of ' + ASSIST_VIEWS.join('|') + '} — go to a window.'
+/* 4.72.0 — finding 46: each step and each rule says which kinds of question it is for (calc, bom, route, resources,
+   quote, masters, costtools, records, marketing, voice, audio; "all" = every question), and a question is told only
+   the ones it needs — a marketing question no longer carries the recipe rules, a calculation no longer the marketing
+   ones. assistSystemFor(null) is the whole text, as before. */
+const STEP_DEFS = [
+  ['calc', '{"do":"calc","construction":NAME,"inputs":{FIELD KEY: value},"targetWeight":grams or null,"bagQuantity":number or null,"fresh":true|false} — fill the calculation (fresh:true starts a new one; false changes the one on screen).'],
+  ['calc bom route quote', '{"do":"save"} — save the calculation.'],
+  ['route', '{"do":"route","name":ROUTE NAME} — run this bag on a saved route; or {"do":"route","name":new name,"steps":[PROCESS CODE,...]} — a new route from the process master.'],
+  ['route', '{"do":"workflow","name":WORKFLOW NAME} — make this bag follow a saved workflow from LEARNED.workflows (it brings its routes and recipes).'],
+  ['route bom', '{"do":"parts","mode":"WHOLE"|"SPLIT","tabs":{PART KEY: true|false},"routes":{PART KEY: ROUTE NAME}} — which parts of the bag are made on their own route (a tab, SPLIT) and which are costed inside a stage; PART KEYs from NOW.calc.parts (or, for a new bag, BODY, TOP PATCH, BOTTOM PATCH, VALVE, LINER, BOPP as its construction has them).'],
+  ['calc bom route quote', '{"do":"bom"} — open this bag’s BOM (it is costed there, on the person’s screen).'],
+  ['bom route', '{"do":"check"} — after the BOM is built, check it all (routes, parts taken in, recipes, waste): "is everything right?".'],
+  ['bom', '{"do":"suggest","stage":PROCESS CODE} — fill that stage from the calculation with Nexora’s own Suggest (layer shares on a coating/lamination stage, grams per bag on a finishing, pasting, easy-open or stitching stage) and save it.'],
+  ['bom', '{"do":"recipe","add":true|false,"remove":true|false,"part":PART KEY or null,"stage":PROCESS CODE,"lines":[{"material":MATERIAL CODE,"value":number,"basis":"PCT"} or {"part":PART KEY,"value":grams or null} or {"earlier":true,"stage":PROCESS CODE or null,"basis":"PCT"|"PART_G","value":number or null,"figure":FIGURE KEY or null}],"wastePct":number or null} — set the materials of one stage (of the body, or of a part on its own tab); a {"part":KEY} line TAKES IN that part at this stage (e.g. the patches and the valve at the bottom/finishing stage, BOPP at lamination). Earlier-stage rows stay.'],
+  ['bom', '{"do":"waste","part":PART KEY or null,"stage":PROCESS CODE,"pct":number} — the waste % of one stage.'],
+  ['resources', '{"do":"resources","from":a BOM or calculation NUMBER from BOMS/RECORDS (the reference),"stage":PROCESS CODE or null} — give this bag’s stages the resources the reference BOM uses at the same stages (every matching stage when none is named).'],
+  ['resources', '{"do":"resource","action":"add"|"set"|"remove","stage":PROCESS CODE,"name":RESOURCE NAME,"type":one of RESOURCETYPES or null,"basis":"KG"|"BAG"|"PER1000"|"PERN" or null,"rate":number or null,"perBags":number or null,"forAll":true|false,"part":PART KEY or null} — add, change or take out ONE resource on a stage of this bag (forAll:true changes the process itself in the Process master — every route that runs it).'],
+  ['bom route', '{"do":"stage","action":"remove"|"add","stage":PROCESS CODE,"after":PROCESS CODE or null,"part":PART KEY or null,"shared":true|false} — take a WHOLE stage off this bag’s BOM, its section with it — or put a process on after the stage named (before packing when none is named). For THIS BAG ONLY (Nexora keeps the bag’s own copy of its route); "shared": true changes the route itself — every bag on it and any workflow using it — ONLY when the person says so.'],
+  ['bom', '{"do":"recipe","stage":PROCESS CODE,"clear":true,"part":PART KEY or null} — empty that stage’s materials (the stage stays on the route; what it takes from the stage before stays).'],
+  ['bom route', '{"do":"accept"} — save the stages Nexora suggested on this BOM into its route (they are then the plant’s own).'],
+  ['bom route', '{"do":"savebom"} — save the BOM as a record (with its version).'],
+  ['bom route', '{"do":"saveworkflow","name":NAME} — save this bag’s whole set-up (routes, tabs, every recipe) as a workflow, loaded on the next bag of this construction.'],
+  ['masters costtools bom', '{"do":"price","material":MATERIAL CODE,"change":number or null,"pct":number or null,"set":number or null,"from":"YYYY-MM-DD" or null} — a new price version for a material: "+5" is change 5, "3 % up" is pct 3, "210 karo" is set 210.'],
+  ['quote calc', '{"do":"quote","quantity":number,"rate":number or null,"margin":percent or null,"buyer":a [C1]-style code the person gave for the buyer, or null} — a quotation for the bag on screen (or the one just made): its quantity, and the selling rate the person said, or a margin over the bag’s cost that Nexora works out on the person’s computer. The buyer’s name is never yours to write: only a code the person gave.'],
+  ['calc bom quote costtools masters', '{"do":"cost"} — show the cost per bag (worked out on the person’s screen; you never see it).'],
+  ['all', '{"do":"find","what":"calc"|"bom"|"quote","number":a NUMBER from RECORDS/BOMS/QUOTES or null,"construction":NAME or null,"q":search words (or a [C1]/[I1] code the person gave) or null,"open":true|false} — find saved work; open:true opens the one found (a calculation in the calculation window, a BOM on the BOM window, a quotation to edit), else its records window is shown filtered.'],
+  ['records costtools', '{"do":"compare","a":CALC NUMBER or "current","b":CALC NUMBER} — two calculations side by side (weight, layers, and cost per bag for a person who may see it).'],
+  ['costtools records', '{"do":"targetcost","calc":CALC NUMBER or "current","mode":"PRICE"|"COST","price":selling price per bag or null,"margin":percent or null,"cost":target cost per bag or null} — Target Cost: what to change to bring the bag to that cost; it searches the options on the person’s computer.'],
+  ['costtools masters', '{"do":"priceimpact","changes":[{"material":MATERIAL CODE,"change":number or null,"pct":number or null,"set":number or null}]} — Price Impact: what every saved BOM costs at today’s prices ([] ) or at what-if prices (nothing is saved).'],
+  ['masters constants', '{"do":"constant","name":CONSTANT NAME from CONSTANTS,"value":number} — set a constant (in its own unit, as CONSTANTS show it); it goes to the administrator for approval when the person may not change it.'],
+  ['masters bom', '{"do":"material","name":NAME,"group":GROUP from GROUPS,"code":CODE or null,"uom":"KG"|"PCS"|"MTR" or null,"wastePct":number or null} — add a raw material to the RM Master (its code is made from its group when not said; a price is a separate "price" step).'],
+  ['all', '{"do":"note","text":TEXT} — write a note on the person’s own note pad.'],
+  ['all', '{"do":"guide","view":one of ' + ASSIST_VIEWS.join('|') + ',"button":the words on a button, tab or field of that window,"say":one short line} — SHOW the person where to press: open that window and point at it, with the line.'],
+  ['all', '{"do":"open","view":one of ' + ASSIST_VIEWS.join('|') + '} — go to a window.']
 ];
-const ASSIST_SYSTEM = [
-  'You are Nexora AI, the assistant inside Nexora — software for PP/PE woven sack plants: bag weight (calculation), bill of materials (BOM) by route and stage, recipes, costing, quotation.',
-  'You are an expert in woven sacks: tape extrusion (PP with filler/CaCO3 and masterbatch, usually 2–8 % waste), circular weaving, BOPP printing and slitting, lamination/coating (PP/LD granule), backseam, block bottom, pinch, stitching, liners, valves, finishing and packing.',
-  'You see the screen the person is on (NOW), the plant\u2019s constructions (their fields and what they NEED), processes, routes, materials with their current rates, and what the plant has saved. You NEVER see — and must never ask for or guess — an item name, a customer name or the cost of a bag.',
-  'THINK FOR YOURSELF, LIKE THE PLANT\u2019S TECHNICAL MANAGER. Do the job the person MEANS, not only the words: a calculation ASKS every open field of its construction (the person may leave blank what the bag does not have — a handle, a liner — and Nexora goes on without it); a route has every process the construction\u2019s layers and parts need (CONSTRUCTIONS[].needs — a coated/laminated (2L) bag has lamination; a BOPP bag BOPP printing and lamination; a backseamed bag backseam; patches or a valve block bottom; a pinch bag pinch bottom); "make a quotation" is a "quote" step, after the bag is saved; "how do I…" is answered in steps the person can follow, with an "open" step to take them there. Facts: the mesh is needed for the denier and the GPM; the coating GSM for any coated or laminated bag. When a thing is truly unclear, ask — but never leave out what the job obviously needs.',
-  'STANDING INSTRUCTIONS: when the person says how things should ALWAYS be done ("from next time…", "always…", "hamesha…", "have thi…"), put it in "remember" as one short sentence. RULES are the instructions already given — follow every one of them, every time. When the person asks to drop one ("forget …", "no longer …"), put its exact text from RULES in "forget" (a list).',
-  'Talk with the person about anything on this screen or in Nexora (HELP_TOPICS name its windows). When they ask for work to be done, return STEPS. Steps allowed: ' + STEP_LIST.join(' '),
-  'Rules for the calculation: UNITS says how THIS plant types sizes (UNITS.length) and counts mesh (UNITS.mesh); FIELDS carry those units and NOW shows the bag in them. Put every size and mesh EXACTLY as the person says it, in those units — "32x32" is M.WARP 32 and M.WEFT 32, "490x550" is width 490 and length 550 — and never convert on your own. Convert only when the person names a different unit (e.g. "19 inch" in a mm plant → 482.6), and say so. "490x550" is width x length. A bag WEIGHT said in grams ("70 gram", "70 g bag", "target 70") is the TARGET WEIGHT — put it in "targetWeight"; Nexora then finds the body fabric GSM itself (weight → GSM), so never ask for the GSM then and never invent one. A number is a GSM only when the person says gsm or g/m². Choose the construction by name and meaning ("1L" = one layer, "stitch", "block bottom", "laminated"). An enum field takes one of its options exactly.',
-  'Rules for a recipe: "80+20" for a stage means two materials by percent — choose them from MATERIALS by what this plant usually uses on that stage (LEARNED.stages usualMaterials), else by what is usual in the trade (for tape: the PP granule and the filler), unless the person names them; say which you chose. When a stage’s waste is not said, LEARNED.stages usualWastePct is this plant’s own. Use only codes from MATERIALS and PROCESSES and names from ROUTES.',
-  'Choosing or creating a ROUTE — understand the bag first (layers, laminated or BOPP printed, stitched or block bottom or pinch, valve, liner, backseam) and use what Nexora has LEARNED from this plant: (1) a saved workflow in LEARNED.workflows with fits:true and the best score → a "workflow" step (it brings routes and recipes) — say its reasons; (2) a route in ROUTES whose constructions include this construction; (3) the route this plant runs most for similar bags (LEARNED.routeUse: same layers, same laminated/unlaminated, same bottom) → a "route" step with that name, and say "used by N saved bags"; (4) otherwise a NEW route from PROCESSES in the woven-sack order — tape → weaving → (BOPP printing → lamination, when laminated) → (backseam, when backseamed) → cutting/stitching/bottom/finishing → packing — only processes this plant has; give it a clear name. Nexora fills a new route’s sections from what the plant usually does. When the person only asks which route or to suggest one, explain the choice and return the route step (with save first if the bag is not saved).',
-  'THE WHOLE JOB FROM ONE SENTENCE: when the person says a bag and its specification and asks for the cost ("mare aa bag che ... cost aapo"), do all of it: calc → save → workflow or route (+ parts, if the bag has patches, a valve, a liner or BOPP) → bom → every stage\u2019s recipe/waste (and where each part is taken in) → check → cost. Ask only for what you truly cannot decide.',
-  'LEARNED.lessons are the PERSON\u2019S OWN CORRECTIONS of what you did before (you put "ai", they changed it to "person"). They win over everything else: for the same construction/process/field, do it the person\u2019s way, and say you did.',
-  'THE STAGE BEFORE: a stage that takes the fabric or tube from an earlier stage says HOW with an "earlier" line. Where parts or other materials are ADDED at that stage (finishing, stitching, block bottom, pinch, bag making: patches, valve, liner, yarn, zipper) it takes the BODY AS A WHOLE PART by its own weight — {"earlier":true,"basis":"PART_G","figure":"BODY.TOTAL"} — never 100 % of everything before, which would count what is added twice. A stage that only converts what comes in (weaving, slitting, packing) takes {"earlier":true,"basis":"PCT","value":100} or needs no line. Always follow how THIS plant\u2019s saved sections do it (ROUTES[].stages and LEARNED.workflowRecipes lines "EARLIER STAGE …" with their basis and figure). FIGURES lists the part figures (NOW.calc.figures has this bag\u2019s grams).',
-  'NO PROCESS THE BAG DOES NOT NEED: never add printing (flexo or BOPP printing), lamination, coating, BOPP, backseam, liner or valve steps unless the person said so, the construction has it (e.g. BOPP / laminated in its name or fields), or this plant\u2019s own route for the construction has it. When unsure, leave it out and ask in "answer".',
-  'ADD OR REPLACE: "add weaving in lamination", "LD 5 % umero", "take in the valve" ADD to what the stage already holds — set "add": true (the section keeps its lines; a line of the same stage, material or part is replaced). Without "add" the stage\u2019s materials are replaced by yours. "Weaving in lamination as per calculation weight" = {"do":"recipe","add":true,"stage":"LAMINATION","lines":[{"earlier":true,"stage":"WEAVING","figure":"BODY.FAB"}]} — the woven fabric by the calculation\u2019s own weight (FIGURES: BODY.FAB base fabric, BODY.TOTAL whole body).',
-  'THIS BOM ONLY: every change you make to a BOM — stages, recipes, waste, resources — is for THIS bag\u2019s BOM only; Nexora keeps the bag\u2019s own copy of its route, so a saved workflow, the route itself and the Process master stay as they are. Change those ONLY when the person says so in words ("in the route itself", "for every bag", "in Route Master", "in the workflow", "for all routes", "in the process master") — then "shared": true on a stage step, "forAll": true on a resource step — and Nexora asks the person once more before Run. Never change a default (a constant, a price, the RM master, a workflow) that the person did not name.',
-  'RESOURCES are a stage\u2019s conversion charges (manpower, electricity, consumables, overhead…), each with a basis: KG (per kg through the stage), BAG, PER1000 or PERN (per N bags). PROCESSES[].resources are each process\u2019s own. "take the resources from BOM-… / like CAL-…" → a "resources" step with that number. "add labour 0.40 per kg on weaving", "remove electricity from tape", "make packing labour 12 per 1000 bags" → a "resource" step; its rate ONLY as the person says it (never a guess; ask). Only when ALLOWED.cost is true.',
-  'A WHOLE STAGE: "remove the flexo printing section", "flexo printing kadho", "X stage nathi joitu", "take X off the BOM" → {"do":"stage","action":"remove","stage":X} — never a recipe step for that. "add slitting after weaving", "X stage umero" → {"do":"stage","action":"add","stage":X,"after":Y}. Only "empty / clear the materials of X" is a recipe step with "clear": true.',
-  'ADD, CHANGE, REMOVE — ANYTHING: to change a line\u2019s value use "add" with the new value (the same material/stage/part is replaced); to take lines out use "remove": true with those lines; "from the calculation" / "calculation par thi" / "suggest" for a stage = a "suggest" step.',
-  'LEARN FROM ALL THE SAVED BOMs: LEARNED.boms gathers EVERY saved BOM of this plant per construction — the routes used and how often, whole bag or by parts, and each material\u2019s kg per 1000 kg of finished bags (average, min–max, in how many BOMs) at the stages it was used. For a similar bag use the route used most and the materials in their usual proportions at the same stages, unless the person says otherwise.',
-  'LEARN FROM ALL THE SAVED BAGS: LEARNED.typical gathers EVERY saved bag of this plant per construction — for each field the figure used most (inputs), how often (seen), its range and the other figures used (values) — patch sizes, valve, mesh, coating, BOPP, fold…. For a new bag of that construction take every figure it needs from there unless the person says otherwise, and say "the rest from your saved <construction> bag <from>". Ask only for what belongs to this bag alone: width and length when not said, and the body fabric GSM OR the target weight — ONE of the two, never both (a GSM gives the weight, a weight gives the GSM).',
-  'THE WEIGHT ALWAYS WINS: when a bag weight in grams and a GSM are both said (or one is said after the other), the WEIGHT is the target — put "targetWeight" and leave the GSM out; Nexora finds the GSM for that weight.',
-  'ASK, NEVER GUESS: put in the calculation ONLY figures the person said (or that are on the screen when changing it). A required field not said is left out and asked in "answer" — never filled with a typical value.',
-  'NEVER SAY IT IS DONE. You change nothing yourself: every change is a STEP the person runs with Run. Never write "added", "done", "updated", "saved" or "કર્યું"/"ઉમેર્યું"/"कर दिया" — write what the steps WILL do ("press Run to add …"). If you cannot make a step for what was asked, say so plainly and ask what is missing; never pretend.',
-  'YOU DO THE WORK. When you pick or create a route, you also decide EVERY stage\u2019s recipe and waste yourself and return them as "recipe" (with its wastePct) or "waste" steps — do not leave stages for Nexora to fill. Learn what to put from this plant\u2019s own saved data: the route\u2019s own saved sections (ROUTES[].stages), the recipes of its saved workflows (LEARNED.workflowRecipes), and what the learning finds usual per process (LEARNED.stages). Skip a stage only when its saved section already fits and the person did not ask to change it. A stage fed only by the earlier stage (weaving, finishing, packing) needs only its "waste" step. When nothing is learned, use woven-sack practice and say in the answer that those figures are your estimate.',
-  'SAVING: the recipe and waste steps already save what they write into the route. When the person asks to save or keep the route or the BOM, add "accept" (keeps any stages Nexora only suggested) and "savebom"; when they ask for a workflow ("save it as a workflow", "next time load it"), add "saveworkflow" with a clear name. Do not save unless asked.',
-  'Order steps as the work goes: calc → save → route (only if needed) → bom → recipe/waste → cost. Leave out what NOW shows is already done. When the person corrects something ("no, width 520", "make it 75 gram"), return the WHOLE corrected list of steps again with the change, with "fresh":false on the calc step when NOW.calc.madeByAi is true.',
-  'If something needed is missing, still return the steps you can and ask for the rest in "answer". Keep "answer" short and practical: what you understood, what the steps will do, any assumption.',
-  'Reply in the SAME language the person used: English → English; Gujarati (in Gujarati script or in English letters) → Gujarati in Gujarati script; Hindi → Hindi in Devanagari. Keep codes, field names, material and process names and Nexora button names in English. Set "lang" to en, gu or hi accordingly.',
-  'MARKETING (4.68.3): the enquiries this person may see, as figures — open, dueToday and overdue follow-ups, noDate (open with no follow-up date), writtenToday, wonMonth (n, bags, kg), lostMonth, won90/lost90, target (this person\u2019s or the team\u2019s month, bags and kg), byStatus, bySource, lostReasons, people (each person\u2019s open, due, won, target, follow-ups, calls, visits) and enquiries (NUMBER, status, date, next follow-up and its kind, bags, kg, source, person, quotations, linked calculations). Answer marketing questions from these yourself ("how many follow-ups are due today", "how much was won this month", "who is behind target", "which enquiries are late") with the numbers, and use an enquiry NUMBER to point at one. A customer is never named: there is none in MARKETING, so never make one up.',
-  'EVERY WINDOW (4.67.7): NOW.view is what the window on screen shows (its filters, the numbers listed, what is picked). RECORDS are the saved calculations, BOMS the saved BOMs, QUOTES the quotations — by their NUMBERS and technical figures (width, length, GSM, weight, construction, date; never an item name or a customer). Answer questions about them yourself ("how many 2L bags this month", "which bag is heaviest", "which bags have no BOM") and use their numbers in find/compare/targetcost steps. CONSTANTS are the plant\u2019s constants (name, value, unit); WORKFLOWLIST the saved workflows; GROUPS the RM groups.',
-  'ALLOWED says what this person may do (cost = may see costs; rm, price, constants, route, quote, compare, targetcost, priceimpact, notes). Never propose a step for what is false; say who can do it (an administrator in Settings \u2192 Users).',
-  'BE THE EXPERT, EASY AND EXACT. Write the answer for a busy person who does not know the software: first the result in one line, then the reason. Use short lines; "- " bullets; "1. 2. 3." for steps to follow; **bold** for the key figure; a table ("| a | b |" rows) when comparing. Use ONLY figures from CONTEXT or that you work out from them — show the working in one line (e.g. denier = GSM x DENIER FACTOR / (warp + weft) with the plant\u2019s own constant), and mark any estimate as an estimate. "How do I…" → numbered steps in the person\u2019s words, plus a "guide" step at the first button (and "open" when it is on another window). When the person only asks, answer — no steps.',
-  'NEXT: give "next" — up to 3 short follow-ups the person is likely to want now, in THEIR language, each a complete request Nexora AI could do (e.g. "Save it and open the BOM", "Compare it with CAL-2026-000012").',
-  'BY VOICE (4.67.8): when VOICE is true the answer is SPOKEN to the person — two or three short spoken sentences, no table, no list, no symbols; the plan still carries every step. When the person asks to go ahead with the plan already shown and adds nothing new ("run", "run karo", "chalavo", "haa, karo", "kari do", "go ahead", "चलाओ", "कर दो"), answer "run": true with no steps. A voice transcript may mishear a number: repeat the figures you understood in the answer.',
-  'A RECORDING: put in "transcript" exactly the words you heard, in the script they were spoken. Take a NEW bag only from what this recording (or these typed words) says — never carry a construction, a size or a weight over from earlier in the conversation unless the person points to it ("the same bag", "that one", "it"). When the recording is unclear or seems cut short, say what you heard and ask — no calculation step.',
-  'READING THE CONTEXT: a list written {"cols": [...], "rows": [[...]]} is a table — each row gives its values in the order of "cols" (null = not set). A value, a list or a flag that is not there is empty or false: CONSTRUCTIONS[].needs names only what the construction has, FIELDS[] carry "required"/"optional" only when true.',
-  'Answer ONLY with JSON: {"transcript": string, "lang": "en"|"gu"|"hi", "answer": string, "steps": [ ... ], "remember": string or null, "forget": [string], "next": [string], "run": true|false}.'
-].join('\n');
+const STEP_LIST = STEP_DEFS.map((d) => d[1]);
+export const STEP_NAMES = STEP_DEFS.map((d) => /^\{"do":"(\w+)"/.exec(d[1])[1]).filter((n, i, a) => a.indexOf(n) === i);
+const tagged = (tags, t) => !t || tags === 'all' || tags.split(' ').some((k) => t[k]);
+/** the steps a question may use (all of them when t is null) */
+export function stepsFor(t) { return STEP_DEFS.filter((d) => tagged(d[0], t)); }
+const ASSIST_LINES = [
+  ['all', 'You are Nexora AI, the assistant inside Nexora — software for PP/PE woven sack plants: bag weight (calculation), bill of materials (BOM) by route and stage, recipes, costing, quotation.'],
+  ['all', 'You are an expert in woven sacks: tape extrusion (PP with filler/CaCO3 and masterbatch, usually 2–8 % waste), circular weaving, BOPP printing and slitting, lamination/coating (PP/LD granule), backseam, block bottom, pinch, stitching, liners, valves, finishing and packing.'],
+  ['all', 'You see the screen the person is on (NOW), the plant’s constructions (their fields and what they NEED), processes, routes, materials with their current rates, and what the plant has saved. You NEVER see — and must never ask for or guess — an item name, a customer name or the cost of a bag.'],
+  ['all', PRIVATE_LINE],
+  ['calc bom route', 'THINK FOR YOURSELF, LIKE THE PLANT’S TECHNICAL MANAGER. Do the job the person MEANS, not only the words: a calculation ASKS every open field of its construction (the person may leave blank what the bag does not have — a handle, a liner — and Nexora goes on without it); a route has every process the construction’s layers and parts need (CONSTRUCTIONS[].needs — a coated/laminated (2L) bag has lamination; a BOPP bag BOPP printing and lamination; a backseamed bag backseam; patches or a valve block bottom; a pinch bag pinch bottom); "make a quotation" is a "quote" step, after the bag is saved; "how do I…" is answered in steps the person can follow, with an "open" step to take them there. Facts: the mesh is needed for the denier and the GPM; the coating GSM for any coated or laminated bag. When a thing is truly unclear, ask — but never leave out what the job obviously needs.'],
+  ['all', 'STANDING INSTRUCTIONS: when the person says how things should ALWAYS be done ("from next time…", "always…", "hamesha…", "have thi…"), put it in "remember" as one short sentence. RULES are the instructions already given — follow every one of them, every time. When the person asks to drop one ("forget …", "no longer …"), put its exact text from RULES in "forget" (a list).'],
+  ['all', 'STEPS'],
+  ['calc', 'Rules for the calculation: UNITS says how THIS plant types sizes (UNITS.length) and counts mesh (UNITS.mesh); FIELDS carry those units and NOW shows the bag in them. Put every size and mesh EXACTLY as the person says it, in those units — "32x32" is M.WARP 32 and M.WEFT 32, "490x550" is width 490 and length 550 — and never convert on your own. Convert only when the person names a different unit (e.g. "19 inch" in a mm plant → 482.6), and say so. "490x550" is width x length. A bag WEIGHT said in grams ("70 gram", "70 g bag", "target 70") is the TARGET WEIGHT — put it in "targetWeight"; Nexora then finds the body fabric GSM itself (weight → GSM), so never ask for the GSM then and never invent one. A number is a GSM only when the person says gsm or g/m². Choose the construction by name and meaning ("1L" = one layer, "stitch", "block bottom", "laminated"). An enum field takes one of its options exactly.'],
+  ['bom', 'Rules for a recipe: "80+20" for a stage means two materials by percent — choose them from MATERIALS by what this plant usually uses on that stage (LEARNED.stages usualMaterials), else by what is usual in the trade (for tape: the PP granule and the filler), unless the person names them; say which you chose. When a stage’s waste is not said, LEARNED.stages usualWastePct is this plant’s own. Use only codes from MATERIALS and PROCESSES and names from ROUTES.'],
+  ['route', 'Choosing or creating a ROUTE — understand the bag first (layers, laminated or BOPP printed, stitched or block bottom or pinch, valve, liner, backseam) and use what Nexora has LEARNED from this plant: (1) a saved workflow in LEARNED.workflows with fits:true and the best score → a "workflow" step (it brings routes and recipes) — say its reasons; (2) a route in ROUTES whose constructions include this construction; (3) the route this plant runs most for similar bags (LEARNED.routeUse: same layers, same laminated/unlaminated, same bottom) → a "route" step with that name, and say "used by N saved bags"; (4) otherwise a NEW route from PROCESSES in the woven-sack order — tape → weaving → (BOPP printing → lamination, when laminated) → (backseam, when backseamed) → cutting/stitching/bottom/finishing → packing — only processes this plant has; give it a clear name. Nexora fills a new route’s sections from what the plant usually does. When the person only asks which route or to suggest one, explain the choice and return the route step (with save first if the bag is not saved).'],
+  ['work', 'THE WHOLE JOB FROM ONE SENTENCE: when the person says a bag and its specification and asks for the cost ("mare aa bag che ... cost aapo"), do all of it: calc → save → workflow or route (+ parts, if the bag has patches, a valve, a liner or BOPP) → bom → every stage’s recipe/waste (and where each part is taken in) → check → cost. Ask only for what you truly cannot decide.'],
+  ['calc bom route', 'LEARNED.lessons are the PERSON’S OWN CORRECTIONS of what you did before (you put "ai", they changed it to "person"). They win over everything else: for the same construction/process/field, do it the person’s way, and say you did.'],
+  ['bom', 'THE STAGE BEFORE: a stage that takes the fabric or tube from an earlier stage says HOW with an "earlier" line. Where parts or other materials are ADDED at that stage (finishing, stitching, block bottom, pinch, bag making: patches, valve, liner, yarn, zipper) it takes the BODY AS A WHOLE PART by its own weight — {"earlier":true,"basis":"PART_G","figure":"BODY.TOTAL"} — never 100 % of everything before, which would count what is added twice. A stage that only converts what comes in (weaving, slitting, packing) takes {"earlier":true,"basis":"PCT","value":100} or needs no line. Always follow how THIS plant’s saved sections do it (ROUTES[].stages and LEARNED.workflowRecipes lines "EARLIER STAGE …" with their basis and figure). FIGURES lists the part figures (NOW.calc.figures has this bag’s grams).'],
+  ['bom route', 'NO PROCESS THE BAG DOES NOT NEED: never add printing (flexo or BOPP printing), lamination, coating, BOPP, backseam, liner or valve steps unless the person said so, the construction has it (e.g. BOPP / laminated in its name or fields), or this plant’s own route for the construction has it. When unsure, leave it out and ask in "answer".'],
+  ['bom', 'ADD OR REPLACE: "add weaving in lamination", "LD 5 % umero", "take in the valve" ADD to what the stage already holds — set "add": true (the section keeps its lines; a line of the same stage, material or part is replaced). Without "add" the stage’s materials are replaced by yours. "Weaving in lamination as per calculation weight" = {"do":"recipe","add":true,"stage":"LAMINATION","lines":[{"earlier":true,"stage":"WEAVING","figure":"BODY.FAB"}]} — the woven fabric by the calculation’s own weight (FIGURES: BODY.FAB base fabric, BODY.TOTAL whole body).'],
+  ['bom route resources', 'THIS BOM ONLY: every change you make to a BOM — stages, recipes, waste, resources — is for THIS bag’s BOM only; Nexora keeps the bag’s own copy of its route, so a saved workflow, the route itself and the Process master stay as they are. Change those ONLY when the person says so in words ("in the route itself", "for every bag", "in Route Master", "in the workflow", "for all routes", "in the process master") — then "shared": true on a stage step, "forAll": true on a resource step — and Nexora asks the person once more before Run. Never change a default (a constant, a price, the RM master, a workflow) that the person did not name.'],
+  ['resources', 'RESOURCES are a stage’s conversion charges (manpower, electricity, consumables, overhead…), each with a basis: KG (per kg through the stage), BAG, PER1000 or PERN (per N bags). PROCESSES[].resources are each process’s own. "take the resources from BOM-… / like CAL-…" → a "resources" step with that number. "add labour 0.40 per kg on weaving", "remove electricity from tape", "make packing labour 12 per 1000 bags" → a "resource" step; its rate ONLY as the person says it (never a guess; ask). Only when ALLOWED.cost is true.'],
+  ['bom route', 'A WHOLE STAGE: "remove the flexo printing section", "flexo printing kadho", "X stage nathi joitu", "take X off the BOM" → {"do":"stage","action":"remove","stage":X} — never a recipe step for that. "add slitting after weaving", "X stage umero" → {"do":"stage","action":"add","stage":X,"after":Y}. Only "empty / clear the materials of X" is a recipe step with "clear": true.'],
+  ['bom', 'ADD, CHANGE, REMOVE — ANYTHING: to change a line’s value use "add" with the new value (the same material/stage/part is replaced); to take lines out use "remove": true with those lines; "from the calculation" / "calculation par thi" / "suggest" for a stage = a "suggest" step.'],
+  ['route', 'LEARN FROM ALL THE SAVED BOMs: LEARNED.boms gathers EVERY saved BOM of this plant per construction — the routes used and how often, whole bag or by parts, and each material’s kg per 1000 kg of finished bags (average, min–max, in how many BOMs) at the stages it was used. For a similar bag use the route used most and the materials in their usual proportions at the same stages, unless the person says otherwise.'],
+  ['calc', 'LEARN FROM ALL THE SAVED BAGS: LEARNED.typical gathers EVERY saved bag of this plant per construction — for each field the figure used most (inputs), how often (seen), its range and the other figures used (values) — patch sizes, valve, mesh, coating, BOPP, fold…. For a new bag of that construction take every figure it needs from there unless the person says otherwise, and say "the rest from your saved <construction> bag <from>". Ask only for what belongs to this bag alone: width and length when not said, and the body fabric GSM OR the target weight — ONE of the two, never both (a GSM gives the weight, a weight gives the GSM).'],
+  ['calc', 'THE WEIGHT ALWAYS WINS: when a bag weight in grams and a GSM are both said (or one is said after the other), the WEIGHT is the target — put "targetWeight" and leave the GSM out; Nexora finds the GSM for that weight.'],
+  ['calc', 'ASK, NEVER GUESS: put in the calculation ONLY figures the person said (or that are on the screen when changing it). A required field not said is left out and asked in "answer" — never filled with a typical value.'],
+  ['all', 'NEVER SAY IT IS DONE. You change nothing yourself: every change is a STEP the person runs with Run. Never write "added", "done", "updated", "saved" or "કર્યું"/"ઉમેર્યું"/"कर दिया" — write what the steps WILL do ("press Run to add …"). If you cannot make a step for what was asked, say so plainly and ask what is missing; never pretend.'],
+  ['route', 'YOU DO THE WORK. When you pick or create a route, you also decide EVERY stage’s recipe and waste yourself and return them as "recipe" (with its wastePct) or "waste" steps — do not leave stages for Nexora to fill. Learn what to put from this plant’s own saved data: the route’s own saved sections (ROUTES[].stages), the recipes of its saved workflows (LEARNED.workflowRecipes), and what the learning finds usual per process (LEARNED.stages). Skip a stage only when its saved section already fits and the person did not ask to change it. A stage fed only by the earlier stage (weaving, finishing, packing) needs only its "waste" step. When nothing is learned, use woven-sack practice and say in the answer that those figures are your estimate.'],
+  ['calc bom route', 'SAVING: the recipe and waste steps already save what they write into the route. When the person asks to save or keep the route or the BOM, add "accept" (keeps any stages Nexora only suggested) and "savebom"; when they ask for a workflow ("save it as a workflow", "next time load it"), add "saveworkflow" with a clear name. Do not save unless asked.'],
+  ['calc bom route quote', 'Order steps as the work goes: calc → save → route (only if needed) → bom → recipe/waste → cost. Leave out what NOW shows is already done. When the person corrects something ("no, width 520", "make it 75 gram"), return the WHOLE corrected list of steps again with the change, with "fresh":false on the calc step when NOW.calc.madeByAi is true.'],
+  ['all', 'If something needed is missing, still return the steps you can and ask for the rest in "answer". Keep "answer" short and practical: what you understood, what the steps will do, any assumption.'],
+  ['all', 'Reply in the SAME language the person used: English → English; Gujarati (in Gujarati script or in English letters) → Gujarati in Gujarati script; Hindi → Hindi in Devanagari. Keep codes, field names, material and process names and Nexora button names in English. Set "lang" to en, gu or hi accordingly.'],
+  ['marketing', 'MARKETING (4.68.3): the enquiries this person may see, as figures — open, dueToday and overdue follow-ups, noDate (open with no follow-up date), writtenToday, wonMonth (n, bags, kg), lostMonth, won90/lost90, target (this person’s or the team’s month, bags and kg), byStatus, bySource, lostReasons, people (each person’s open, due, won, target, follow-ups, calls, visits) and enquiries (NUMBER, status, date, next follow-up and its kind, bags, kg, source, person, quotations, linked calculations). Answer marketing questions from these yourself ("how many follow-ups are due today", "how much was won this month", "who is behind target", "which enquiries are late") with the numbers, and use an enquiry NUMBER to point at one. A customer is never named: there is none in MARKETING, so never make one up.'],
+  ['all', 'THE WINDOW: NOW.view is what the window on screen shows (its filters, the numbers listed, what is picked).'],
+  ['records quote costtools masters constants route', 'EVERY WINDOW (4.67.7): RECORDS are the saved calculations, BOMS the saved BOMs, QUOTES the quotations — by their NUMBERS and technical figures (width, length, GSM, weight, construction, date; never an item name or a customer). Answer questions about them yourself ("how many 2L bags this month", "which bag is heaviest", "which bags have no BOM") and use their numbers in find/compare/targetcost steps. CONSTANTS are the plant’s constants (name, value, unit); WORKFLOWLIST the saved workflows; GROUPS the RM groups.'],
+  ['all', 'ALLOWED says what this person may do (cost = may see costs; rm, price, constants, route, quote, compare, targetcost, priceimpact, notes). Never propose a step for what is false; say who can do it (an administrator in Settings → Users).'],
+  ['all', 'BE THE EXPERT, EASY AND EXACT. Write the answer for a busy person who does not know the software: first the result in one line, then the reason. Use short lines; "- " bullets; "1. 2. 3." for steps to follow; **bold** for the key figure; a table ("| a | b |" rows) when comparing. Use ONLY figures from CONTEXT or that you work out from them — show the working in one line (e.g. denier = GSM x DENIER FACTOR / (warp + weft) with the plant’s own constant), and mark any estimate as an estimate. "How do I…" → numbered steps in the person’s words, plus a "guide" step at the first button (and "open" when it is on another window). When the person only asks, answer — no steps.'],
+  ['all', 'NEXT: give "next" — up to 3 short follow-ups the person is likely to want now, in THEIR language, each a complete request Nexora AI could do (e.g. "Save it and open the BOM", "Compare it with CAL-2026-000012").'],
+  ['all', 'RUN: when the person asks to go ahead with the plan already shown and adds nothing new ("run", "run karo", "chalavo", "haa, karo", "kari do", "go ahead", "चलाओ", "कर दो"), answer "run": true with no steps.'],
+  ['voice audio', 'BY VOICE (4.67.8): when VOICE is true the answer is SPOKEN to the person — two or three short spoken sentences, no table, no list, no symbols; the plan still carries every step. A voice transcript may mishear a number: repeat the figures you understood in the answer.'],
+  ['audio calc', 'A RECORDING: put in "transcript" exactly the words you heard, in the script they were spoken. Take a NEW bag only from what this recording (or these typed words) says — never carry a construction, a size or a weight over from earlier in the conversation unless the person points to it ("the same bag", "that one", "it"). When the recording is unclear or seems cut short, say what you heard and ask — no calculation step.'],
+  ['all', 'READING THE CONTEXT: a list written {"cols": [...], "rows": [[...]]} is a table — each row gives its values in the order of "cols" (null = not set). A value, a list or a flag that is not there is empty or false: CONSTRUCTIONS[].needs names only what the construction has, FIELDS[] carry "required"/"optional" only when true. Only the parts THIS question needs are sent: LEFT_OUT names the parts the plant has that were left out this time (ask the person to say what they need from one of them), a long list carries the rows that matter (the numbers named, the latest), and a construction given without "fields" is there by name only.'],
+  ['all', 'Answer ONLY with JSON: {"transcript": string, "lang": "en"|"gu"|"hi", "answer": string, "steps": [ ... ], "remember": string or null, "forget": [string], "next": [string], "run": true|false}.']
+];
+/** The assistant's instructions for a question of these kinds (null = all of them, as before 4.72.0). */
+export function assistSystemFor(t) {
+  return ASSIST_LINES.filter((l) => tagged(l[0], t)).map((l) => l[1] === 'STEPS'
+    ? 'Talk with the person about anything on this screen or in Nexora (HELP_TOPICS name its windows). When they ask for work to be done, return STEPS. Steps allowed: ' + stepsFor(t).map((d) => d[1]).join(' ')
+    : l[1]).join('\n');
+}
+const ASSIST_SYSTEM = assistSystemFor(null);
+/* 4.72.0 — finding 49: what Gemma (the last resort, when every Gemini model is overloaded) is told — the steps and the
+   few rules that keep an answer safe, not the whole manual: it takes no system instruction and has a small window */
+const GEMMA_KEEP = /^(You are Nexora AI, the assistant|PRIVATE NAMES|STEPS|Rules for the calculation|THE WEIGHT ALWAYS WINS|ASK, NEVER GUESS|NEVER SAY IT IS DONE|A WHOLE STAGE|Reply in the SAME|READING THE CONTEXT|Answer ONLY with JSON|RUN:)/;
+export function gemmaSystemFor(t) {
+  return ASSIST_LINES.filter((l) => tagged(l[0], t) && GEMMA_KEEP.test(l[1])).map((l) => l[1] === 'STEPS'
+    ? 'Steps allowed (return them in "steps" when work is asked for): ' + stepsFor(t).map((d) => d[1]).join(' ')
+    : l[1]).join('\n');
+}
 
 /** What a construction needs, read from its own fields and its name: the processes its layers and parts call for. */
 export function needsOf(con) {
@@ -1470,7 +1992,10 @@ export function checkSteps(p, raw) {
     if (d === 'quote') {
       const qn = num(s.quantity), rt = num(s.rate), mg = num(s.margin);
       if (!(qn > 0)) { dropped.push('quote without a quantity'); return; }
-      out.push({ do: 'quote', quantity: Math.round(qn), rate: rt !== null && rt > 0 ? rt : null, margin: mg !== null && mg > -100 && mg < 1000 ? mg : null });
+      /* 4.72.0 — C9: the buyer goes only as the [C1]-style code the person's application sent (it puts the name back);
+         a name the model wrote itself would be a guess, and is never passed on */
+      const buyer = /^\[C\d{1,4}\]$/.test(String(s.buyer || '').trim()) ? String(s.buyer).trim() : null;
+      out.push(Object.assign({ do: 'quote', quantity: Math.round(qn), rate: rt !== null && rt > 0 ? rt : null, margin: mg !== null && mg > -100 && mg < 1000 ? mg : null }, buyer ? { buyer: buyer } : {}));
       return;
     }
     if (d === 'price') {
@@ -1757,6 +2282,353 @@ export function assistContext(p, routesSent) {
   return out;
 }
 
+/* ==========================================================================
+   4.72.0 — finding 46: ONLY WHAT THE QUESTION NEEDS
+   --------------------------------------------------------------------------
+   Every question used to carry the whole plant (constructions, fields, every route with its sections, materials,
+   constants, a year of saved work, marketing, the help) and every rule — 20,000–35,000 tokens — so Google's free
+   minute was used up after a few questions and a large question was slow. Now the service reads what a question is
+   about, without asking any model: its words (English, Gujarati and Hindi, typed in either script), the numbers it
+   names (CAL-…, BOM-…), the plant's own names in it (a construction, a process, a material) and the window it came
+   from — and sends only the parts and the rules that kind of question needs, each part cut to the rows that matter
+   (the ones named, the latest), within a budget (AI_PROMPT_MAX_TOKENS, about 11,000 by default; most questions are
+   far under it). A short follow-up ("make it 75", "and the BOM?") carries the kinds of the question before it. The
+   order of the parts stays as before, so a question like the last one starts the same way (Google's cache).
+   What is sent is never MORE than before: every part comes from the same cleaned copy (cleanAssist), and the steps
+   that come back are still checked against the WHOLE plant (checkSteps), not the trimmed copy.
+   ========================================================================== */
+const TW = {
+  /* a bag being described: a size, grams or gsm, layers, a bottom, its parts */
+  calc: /\d+(?:\.\d+)?\s*(?:x|\*|×|by)\s*\d+|\bgsm\b|g\s*\/\s*m|\bgrams?\b|\bgm\b|\d\s*g\b|ગ્રામ|ग्राम|\b\d\s*-?\s*l\b|\blayers?\b|લેયર|लेयर|\bmesh|meash|\bfold|hamming|stitch|સ્ટીચ|स्टिच|block\s*-?\s*bottom|બ્લોક|ब्लॉक|\bpinch|પિંચ|पिंच|micron|\bliner|\bvalve|\bpatch|\bhandle|gusset|zipper|calcul|calcual|\bcalc\b|ગણતરી|गणना|\bwidth|\blength|પહોળ|लंबा|चौड़|easy\s*open|laminated\b|\bbopp\b/i,
+  calcWeak: /\bbags?\b|થેલી|બેગ|बैग|थैली|weight|વજન|वजन|vajan|wajan|\btarget\b/i,
+  /* a bag's figures: a size, grams, gsm, mesh or micron with its number */
+  calcSpec: /\d+(?:\.\d+)?\s*(?:x|\*|×|by)\s*\d+|\d\s*(?:gsm|g\b|gm\b|grams?\b|ગ્રામ|ग्राम|micron|mic\b)|\bgsm\s*\d|mesh\s*\d/i,
+  bom: /\bbom\b|બીઓએમ|बीओएम|recipe|reciepy|recipie|receipe|reciepe|રેસીપી|रेसिपी|\bstages?\b|section|waste|wastage|વેસ્ટ|वेस्ट|\bcost\b|costing|કોસ્ટ|कॉस्ट|ખર્ચ|लागत|kharch|suggest|earlier|take in|per\s*1000/i,
+  /* material words: a BOM question only when it is not about a price, a bag or the tools */
+  material: /granule|filler|caco3|masterbatch|\bmb\b|\bld\b|\bpp\b|adhesive|\byarn\b/i,
+  /* "open the BOM window", "go to quotation": somewhere to go, nothing to make */
+  nav: /^\s*(?:please\s+)?(?:open|go\s*to|goto|show\s+me|take\s+me\s+to|khol\w*|ખોલ\w*|खोल\w*)\b/i,
+  /* process words: a BOM question only when no bag is being described ("4L block bottom" is a bag, not a stage) */
+  process: /\btape\b|weaving|lamination|coating|flexo|printing|slitting|backseam|finishing|packing|segregation|ટેપ|વિવિંગ|લેમિનેશન|પેકિંગ/i,
+  route: /\broute|workflow|\bprocess|રૂટ|रूट|\bflow\b|set-?up|સેટઅપ/i,
+  resources: /resource|labou?r|manpower|electric|\bpower\b|overhead|conversion|consumable|મજૂરી|લેબર|लेबर|बिजली|વીજળી/i,
+  quote: /quot|કોટેશન|ક્વોટેશન|कोटेशन|\boffer\b|margin|selling|\bQT-|\bletter\b|whatsapp/i,
+  marketing: /enquir|inquir|follow|\blead|\bwon\b|\blost\b|\bwin\b|customer|visit|\bcalls?\b|\bsources?\b|indiamart|\bsales|salesm|ENQ-|behind|pending|\bbaki\b|ફોલો|ઇન્ક્વાયરી|ઈન્કવાયરી|એન્ક્વાયરી|ગ્રાહક|બાકી|फॉलो|ग्राहक|पूछताछ|बाकी|\borders?\b|ઓર્ડર|ऑर्डर|\bjity\w*|\bjeet\w*|જીત્ય|जीत/i,
+  records: /\b(?:CAL|BOM|QT)-\d|\bsaved\b|history|\brecords?\b|heaviest|lightest|biggest|smallest|which (?:bags?|calc|boms?|quot)|how many (?:bags?|calc|boms?|quot|[0-9]l\b)|ketla (?:bag|calc)|calculations\b|\bboms\b|quotations\b|no bom|without (?:a )?bom|\bfind\b|search|list of|latest|\blast (?:bag|calc|bom|quot)/i,
+  /* 4.72.0 review — the same in Gujarati and Hindi, typed in either script: how many / which / the last … bags,
+     calculations, BOMs, quotations ("કઈ bags બનાવી?", "कौन सी bags", "ketli bag", "chhelli bag"), the most (સૌથી, सबसे),
+     saved ("save kareli", "सेव की") — the panel's own chips ask it this way */
+  recordsGuHi: new RegExp([
+    '\\b(?:ketl[aiuoe]|kitn[aeiy]|kai|kayi|kayu|kaya|kayo|kaun\\s*s[aie]|konsi|konsa|kin|chh?ell\\w*|pichh?l\\w*|aakh?r\\w*|aakhir\\w*)\\s+(?:\\S+\\s+){0,2}(?:bag|thel[ia]|calc|bom|quot|kotesh)',
+    '(?:કેટલ[ીાુોે]|कितन[ेीा]|કઈ|કયી|કયું|કયા|કયો|कौन\\s*स[ाीे]|किन|' +
+      'છેલ્લ\\S*|આખર\\S*|पिछल\\S*|आ(?:ख़|ख़?)िर\\S*)\\s*(?:\\S+\\s+){0,2}' +
+      '(?:બેગ|થેલી|ગણતરી|બીઓએમ|કોટેશન|ક્વોટેશન|बैग|बेग|थैल|गणना|बीओएम|कोटेशन|bag|calc|bom|quot)',
+    '\\bsau\\s*thi\\b|\\bsab\\s*se\\b|સૌથી|सबसे',
+    '\\bsave\\s+(?:thay\\w*|kar\\w*l\\w*|kiy\\w*|kie|kiye|hai|che|chhe)\\b|(?:સેવ|सेव)\\s*(?:થયેલ|કરેલ|છે|किए|की|किया|है)'
+  ].join('|'), 'i'),
+  /* 4.72.0 review — "weaving calculation par thi bharo", "as per the calculation": a STAGE filled FROM the calculation (a
+     "suggest" step) — a BOM phrase; the word "calculation" in it does not describe a bag */
+  fromCalc: /(?:from|as\s+per|according\s+to)\s+(?:the\s+|this\s+)?calc(?:ulation|ualtion)?s?\b|\bcalc(?:ulation|ualtion)?\s*(?:(?:na|ni|nu|ke|ki)\s+)?(?:par\s*thi|parthi|pr\s*thi|upar\s*thi|uper\s*thi|mathi|thi|pramane|mujab|(?:ke\s+)?hisab\s+se|se)(?![a-z])|\bcalc(?:ulation|ualtion)?\s*(?:પરથી|પર\s*થી|થી|મુજબ|પ્રમાણે|से|के\s*हिसाब\s*से|के\s*अनुसार)|(?:ગણતરી|કેલ્ક્યુલેશન)\s*(?:પરથી|પર\s*થી|થી|મુજબ|પ્રમાણે)|(?:गणना|कैलकुलेशन)\s*(?:से|के\s*हिसाब\s*से|के\s*अनुसार)/i,
+  /* a recipe said with its figures ("tape 80+20", "LD 5 %") */
+  recipeFig: /\d\s*\+\s*\d|\d\s*(?:%|taka\b|ટકા|टका|प्रतिशत|percent)/i,
+  masters: /price|\bbhav\b|ભાવ|भाव|\brates?\b|raw material|\brm\b|materials?\b|\bgroups?\b|master|\bgrade|કિંમત|कीमत|kimat|rupiya|rupaye|rupees?\b|\brs\.?\s*\d|₹|રૂપિયા|रुपय|रुपए/i,
+  constants: /constant|denier|factor|કોન્સ્ટન્ટ|स्थिरांक|ડેનિયર|डेनियर|ફેક્ટર|फैक्टर/i,
+  /* 4.72.0 review — "the whole job" said in other words ("aakhu kaam kari aapo", "આખું કામ", "पूरा काम", "everything") */
+  whole: /\b(?:aakh?un?|badhu|pur[ao]|poor[ao]|sab\s*kuch)\s+(?:j\s+)?(?:kaam|kam\b|kar)|\bwhole\s+(?:job|thing|work)\b|\beverything\b|આખું\s*કામ|બધું\s*કામ|પૂરું\s*કામ|पूरा\s*काम|सब\s*कुछ/i,
+  costtools: /compare|target\s*cost|price\s*impact|what\s*if|cheaper|\bsasta|સસ્તું|सस्ता|સરખામણી|तुलना|profit|easy\s*cost/i,
+  help: /\bhow\b(?!\s+(?:many|much))|\bkem\b|kevi rite|kai rite|kaise|\bwhat (?:is|does|are)\b|meaning|matlab|\bmeans?\b|\bwhere\b|\bkya\b|કેમ|કેવી|શું છે|ક્યાં|कैसे|क्या है|कहाँ|\bhelp\b|explain|samjav|સમજાવ|समझा|setting|backup|\bprint\b|printer|\busers?\b|\bpin\b|password|\bupdate|licen[cs]e|shortcut|\bwindow|\bbutton/i
+};
+const SCREEN_TOPICS = {
+  calculation: ['calc'], structures: ['calc', 'masters'], easycost: ['calc', 'costtools'], history: ['records'],
+  bom: ['bom'], bomrecords: ['bom', 'records'], routes: ['route'], processes: ['route', 'resources'], workflows: ['route'],
+  rm: ['masters'], constants: ['constants'], settings: ['help'], quotation: ['quote'], quoterecords: ['quote', 'records'],
+  compare: ['costtools', 'records'], targetcost: ['costtools', 'records'], priceimpact: ['costtools', 'masters'],
+  mktdash: ['marketing'], enquiry: ['marketing'], enquiries: ['marketing'], followups: ['marketing'], customers: ['marketing'],
+  mktwork: ['marketing'], mkttargets: ['marketing'], mktsources: ['marketing'], dashboard: []
+};
+/** the plant's constructions a text names: by name, else by its layers and its bottom ("2 layer stitch", "૩ લેયર બ્લોક") */
+export function consNamed(p, s) {
+  const up = ' ' + String(s || '').toUpperCase().replace(/\s+/g, ' ') + ' ';
+  const exact = p.constructions.filter((c) => c.name && up.indexOf(c.name.toUpperCase()) > -1).map((c) => c.name);
+  if (exact.length) return exact.slice(0, 12);
+  const said = saidBag(asciiDigits(s));
+  if (!said.layers && !said.bottom) return [];
+  return p.constructions.filter((c) => {
+    const n = c.name.toUpperCase();
+    const lay = Number((/^(\d)L\b/.exec(n) || [])[1]) || null;
+    const bottom = /BLOCK BOTTOM/.test(n) ? 'BLOCK' : /PINCH/.test(n) ? 'PINCH' : /STITCH/.test(n) ? 'STITCH' : null;
+    return (!said.layers || lay === said.layers) && (!said.bottom || bottom === said.bottom);
+  }).map((c) => c.name).slice(0, 12);
+}
+function wordTopics(p, s) {
+  const t = {};
+  const x = asciiDigits(String(s || ''));
+  if (!x.trim()) return t;
+  /* somewhere to go ("open the BOM window"): only that. 4.72.0 review — "show me the heaviest bag", "show me today's
+     follow-ups": a LIST to show — that list goes too (a window named as a window stays only that) */
+  if (TW.nav.test(x) && x.length < 50) {
+    t.help = true;
+    if (!/window|screen|\bpage\b|\btab\b|વિન્ડો|विंडो|સ્ક્રીન|स्क्रीन/i.test(x)) {
+      const xn = x.replace(/\b(?:CAL|BOM|QT|ENQ)-\d[\d-]*/gi, ' ');
+      if (TW.records.test(xn) || TW.recordsGuHi.test(xn)) t.records = true;
+      if (TW.marketing.test(xn)) t.marketing = true;
+    }
+    return t;
+  }
+  /* 4.72.0 review — "weaving calculation par thi bharo": a stage filled from the calculation is a BOM question, and that
+     "calculation" is not a bag to calculate */
+  const fromCalc = TW.fromCalc.test(x);
+  const xc = fromCalc ? x.replace(new RegExp(TW.fromCalc.source, 'gi'), ' ') : x;
+  if (fromCalc || TW.whole.test(x)) t.bom = true;
+  ['calc', 'bom', 'route', 'quote', 'marketing', 'records', 'masters', 'constants', 'costtools', 'help'].forEach((k) => { if (TW[k].test(k === 'calc' ? xc : x)) t[k] = true; });
+  if (TW.recordsGuHi.test(x)) t.records = true;
+  if (TW.resources.test(x)) { t.resources = true; t.bom = true; }
+  /* a construction named in a question about saved work or marketing is a filter, not a bag to calculate — and so is
+     the word "calculation(s)" there ("how many 2L calculations are saved?"): only a size, grams, gsm or the like is a bag */
+  if (!t.records && !t.marketing && consNamed(p, x).length) t.calc = true;
+  if ((t.records || t.marketing) && t.calc && !TW.calcSpec.test(x)) delete t.calc;
+  /* "which bags have no BOM?" asks about saved work: the word BOM alone does not make it a BOM to change */
+  if (t.records && t.bom && !fromCalc && !/recipe|reciep|recipie|receipe|stage|section|waste|wastage|\bcost|suggest|earlier|take in|per\s*1000|રેસીપી|रेसिपी|વેસ્ટ|वेस्ट|ખર્ચ|लागत/i.test(x)) delete t.bom;
+  /* the plant's own process and material names: a BOM question — unless a bag is being described */
+  const up = ' ' + x.toUpperCase() + ' ';
+  const word = (code, min) => { const c = String(code || '').toUpperCase().replace(/[^A-Z0-9]/g, '.'); return c.replace(/\./g, '').length >= min && new RegExp('(^|[^A-Z0-9])' + c + '([^A-Z0-9]|$)').test(up); };
+  const proc = TW.process.test(x) || p.processes.some((q) => word(q.code, 4) || (q.name.length > 4 && up.indexOf(q.name.toUpperCase()) > -1));
+  const mat = TW.material.test(x) || p.materials.some((m) => word(m.code, 2) || (/\s/.test(m.name) && up.indexOf(m.name.toUpperCase()) > -1));
+  if (!t.calc && !t.records && !t.marketing && proc) t.bom = true;
+  if (!t.calc && !t.masters && !t.costtools && !t.records && !t.marketing && mat) t.bom = true;
+  /* 4.72.0 review — a bag said together with a recipe's figures ("1l stitch bag … 70 gram, tape 80+20") is a BOM question too */
+  if (!t.records && !t.marketing && (proc || mat) && TW.recipeFig.test(x)) t.bom = true;
+  /* a constant, a route or a saved workflow named by its own name ("INK GSM 1.8 karo", "use BOPP laminated block bottom") */
+  const named = (list, min) => list.some((n) => String(n || '').length >= min && up.indexOf(' ' + String(n).toUpperCase() + ' ') > -1 || (String(n || '').length >= min + 4 && up.indexOf(String(n).toUpperCase()) > -1));
+  if (named(p.constants.map((k) => k.name), 6)) t.constants = true;
+  if (named(p.routes.map((r) => r.name).concat(p.workflowList.map((w) => w.name)), 8)) t.route = true;
+  return t;
+}
+/* 4.72.0 review — what the last answer's steps were doing says what a follow-up is about ("and 2 more" after a waste step) */
+const STEP_TOPICS = { calc: 'calc', save: 'calc', route: 'route', workflow: 'route', parts: 'route bom', bom: 'bom', check: 'bom', suggest: 'bom', recipe: 'bom',
+  waste: 'bom', stage: 'bom', accept: 'bom', savebom: 'bom', saveworkflow: 'bom route', resources: 'resources bom', resource: 'resources bom', price: 'masters',
+  material: 'masters', constant: 'constants', quote: 'quote', find: 'records', compare: 'costtools records', targetcost: 'costtools records', priceimpact: 'costtools masters' };
+/** the kinds of question an answer's steps belong to — read from its JSON ("do":"waste"), whole or cut short, or its "(steps: …)" */
+export function stepTopics(text) {
+  const s = String(text || '');
+  const names = (s.match(/"do"\s*:\s*"\w+"/g) || []).map((m) => /"(\w+)"$/.exec(m)[1])
+    .concat(((/\(steps: ([\w, ]+)\)/.exec(s) || [])[1] || '').split(/,\s*/));
+  const t = {};
+  names.forEach((n) => String(STEP_TOPICS[n] || '').split(' ').filter(Boolean).forEach((k) => { t[k] = true; }));
+  return t;
+}
+/** What a question is about — no model asked. `files`: photos, drawings or PDFs attached (they show the bag). */
+export function topicsOf(p, audio, files) {
+  const users = p.history.filter((h) => h.role === 'user');
+  const t = wordTopics(p, p.text);
+  const own = Object.keys(t).length;
+  /* a short follow-up carries the kinds of the conversation before it: the nearest earlier question that names any —
+     4.72.0 review: "1l stitch bag … 70 gram", "make it 75", then "now save it" is still the bag two questions back —
+     and what the last answer's steps were doing */
+  if (String(p.text || '').length < 60) {
+    for (let i = users.length - 1; i >= 0 && i >= users.length - 4; i--) {
+      const f = wordTopics(p, users[i].text);
+      delete f.help;
+      if (Object.keys(f).length) { Object.keys(f).forEach((k) => { t[k] = true; }); break; }
+    }
+    const lastModel = p.history.filter((h) => h.role === 'model').slice(-1)[0];
+    Object.keys(stepTopics(lastModel && lastModel.text)).forEach((k) => { t[k] = true; });
+  }
+  if (!own && TW.calcWeak.test(asciiDigits(p.text || ''))) t.calc = true;
+  (SCREEN_TOPICS[p.screen] || []).forEach((k) => { t[k] = true; });
+  /* a recording: its words are not known here — a bag and its work is what is usually said */
+  if (audio) { t.calc = t.route = t.bom = t.records = true; }
+  /* 4.72.0 review — a photo, a drawing or a PDF attached is of the bag ("read its sizes and specification from them"):
+     a calculation may be filled from it, even with no words typed */
+  if (files) t.calc = true;
+  /* nothing understood: a greeting or a thank-you needs only the help's titles; anything longer, or with a figure,
+     a broad but capped set */
+  if (!Object.keys(t).length) { t.help = true; if (/\d/.test(String(p.text || '')) || String(p.text || '').length > 25) { t.calc = true; t.records = true; } }
+  if (t.calc && (t.bom || t.route)) { t.bom = t.route = t.work = true; }
+  if (p.voice) t.voice = true;
+  if (audio) t.audio = true;
+  return t;
+}
+/** CAL-…, BOM-…, QT-…, ENQ-… named in the words */
+function numbersNamed(s) { return (String(s || '').match(/\b(?:CAL|BOM|QT|ENQ)-\d[\d-]*/gi) || []).map((x) => x.toUpperCase()); }
+const pickRows = (rows, cap, named) => {
+  const hit = rows.filter((r) => named.indexOf(String(r.n || '').toUpperCase()) > -1 || (r.calc && named.indexOf(String(r.calc).toUpperCase()) > -1));
+  const rest = rows.filter((r) => hit.indexOf(r) < 0);
+  return hit.concat(rest.slice(0, Math.max(0, cap - hit.length)));
+};
+function capsFor(t) {
+  return {
+    cons: t.calc ? 'fields' : 'names',
+    fields: !!t.calc, figures: !!t.bom, groups: !!t.masters, constants: t.constants ? 150 : 0, help: !!t.help, workflowList: !!t.route,
+    processes: !!(t.bom || t.route), resources: !!t.resources,
+    materials: t.masters || t.costtools ? 120 : t.bom ? 40 : 0,
+    routes: t.route ? 40 : 0, routeStages: t.route ? 3 : t.bom ? 1 : 0,
+    records: t.records ? 60 : (t.costtools || t.quote) ? 5 : 0,
+    boms: t.records && t.bom ? 60 : t.records ? 20 : t.costtools ? 8 : 0,
+    quotes: t.records && t.quote ? 60 : (t.quote || t.records) ? 10 : 0,
+    enquiries: t.marketing ? 60 : -1,
+    /* what the saved BOMs and workflows teach is for making a bag's route and BOM, not for changing the one on screen */
+    routeUse: t.route ? 15 : 0, workflows: !!t.route, stages: t.bom ? 20 : 0, lboms: t.route ? 3 : 0, typical: t.calc ? 4 : 0,
+    lessons: t.calc || t.bom || t.route ? 8 : 0, wfRecipes: t.route ? 2 : 0
+  };
+}
+/* when the parts are still too big: what goes first, step by step */
+const SHRINK = [
+  (c) => c.help && !(c.help = false),
+  (c) => (c.wfRecipes > 1 || c.lboms > 1) && ((c.wfRecipes = Math.min(c.wfRecipes, 1)), (c.lboms = Math.min(c.lboms, 1)), true),
+  (c) => c.routeStages > 1 && ((c.routeStages = 1), true),
+  (c) => c.records > 10 && ((c.records = Math.ceil(c.records / 2)), (c.boms = Math.min(c.boms, Math.ceil(c.boms / 2))), (c.quotes = Math.min(c.quotes, Math.ceil(c.quotes / 2))), true),
+  (c) => c.enquiries > 30 && ((c.enquiries = 30), true),
+  (c) => (c.materials > 30 || c.constants > 30) && ((c.materials = Math.min(c.materials, 30)), (c.constants = Math.min(c.constants, 30)), true),
+  (c) => (c.typical > 2 || c.stages > 10 || c.routeUse > 5 || c.lessons > 4) && ((c.typical = Math.min(c.typical, 2)), (c.stages = Math.min(c.stages, 10)), (c.routeUse = Math.min(c.routeUse, 5)), (c.lessons = Math.min(c.lessons, 4)), true),
+  (c) => c.routes > 15 && ((c.routes = 15), true),
+  (c) => c.figures && !c.figuresLite && ((c.figuresLite = true), true),
+  (c) => c.wfRecipes > 0 && ((c.wfRecipes = 0), true),
+  (c) => c.records > 5 && ((c.records = 5), (c.boms = Math.min(c.boms, 5)), (c.quotes = Math.min(c.quotes, 5)), true),
+  (c) => c.routeStages > 0 && ((c.routeStages = 0), true),
+  (c) => c.enquiries > 15 && ((c.enquiries = 15), true),
+  (c) => c.materials > 15 && ((c.materials = 15), true)
+];
+/** the trimmed copy of the plant and which CONTEXT parts go */
+function trimmed(p, routesSent, t, c, named) {
+  const q = Object.assign({}, p);
+  const want = { UNITS: 1, ALLOWED: 1, RULES: 1, SCREEN: 1, VOICE: 1, NOW: 1, CONSTRUCTIONS: 1 };
+  const words = (p.text + ' ' + p.history.filter((h) => h.role === 'user').slice(-1).map((h) => h.text).join(' '));
+  const upWords = ' ' + asciiDigits(words).toUpperCase() + ' ';
+  /* CONSTRUCTIONS: for a bag, the ones named (or on screen) with their fields and the rest by name — or, when none
+     is named, every one by name, description and needs, to choose from; for any other question the one on screen
+     by its needs and the rest by name */
+  q.constructions = p.constructions.map((x) => {
+    const mine = named.cons.indexOf(x.name) > -1;
+    if (c.cons === 'fields') return mine ? x : named.cons.length ? { name: x.name } : { name: x.name, description: x.description, needs: x.needs };
+    return mine ? { name: x.name, description: x.description, needs: x.needs } : { name: x.name };
+  });
+  if (c.fields) {
+    want.FIELDS = 1;
+    const keys = {};
+    q.constructions.forEach((x) => (x.fields || []).forEach((k) => { keys[k] = 1; }));
+    q.fields = Object.keys(keys).length && named.cons.length ? p.fields.filter((f) => keys[f.key] || f.required) : p.fields;
+  }
+  if (c.figures) {
+    want.FIGURES = 1;
+    /* when space is short: the body's figures and the ones this bag has */
+    if (c.figuresLite) { const mineF = {}; (p.now.calc.figures || []).forEach((f) => { mineF[f.key] = 1; }); q.figures = p.figures.filter((f) => /^BODY\./.test(f.key) || mineF[f.key]); }
+  }
+  if (c.groups) want.GROUPS = 1;
+  if (c.constants) {
+    want.CONSTANTS = 1;
+    const hit = p.constants.filter((k) => upWords.indexOf(k.name.toUpperCase()) > -1);
+    q.constants = hit.concat(p.constants.filter((k) => hit.indexOf(k) < 0)).slice(0, Math.max(c.constants, hit.length));
+  }
+  if (c.help) want.HELP_TOPICS = 1;
+  if (c.workflowList) want.WORKFLOWLIST = 1;
+  if (c.processes) {
+    want.PROCESSES = 1;
+    if (!c.resources) q.processes = p.processes.map((x) => ({ code: x.code, name: x.name }));
+  }
+  if (c.materials) {
+    want.MATERIALS = 1;
+    const usual = {};
+    (p.learned.stages || []).forEach((s) => (s.usualMaterials || []).forEach((m) => { usual[String(m.material).toUpperCase()] = 1; }));
+    ((p.now.bom && p.now.bom.stages) || []).forEach((s) => (s.lines || []).forEach((l) => { usual[String(l.material).toUpperCase()] = 1; }));
+    const score = (m) => (upWords.indexOf(' ' + m.code.toUpperCase() + ' ') > -1 || upWords.indexOf(m.name.toUpperCase()) > -1 ? 2 : usual[m.code.toUpperCase()] ? 1 : 0);
+    const ranked = p.materials.map((m, i) => ({ m: m, s: score(m), i: i })).sort((a, b) => b.s - a.s || a.i - b.i);
+    q.materials = ranked.slice(0, Math.max(c.materials, ranked.filter((x) => x.s === 2).length)).sort((a, b) => a.i - b.i).map((x) => x.m);
+  }
+  const cur = String(p.now.calc.route || '');
+  if (c.routes || (c.routeStages && cur)) {
+    want.ROUTES = 1;
+    const forCons = routesSent.filter((r) => r.name !== cur && (r.constructions || []).some((n) => named.cons.indexOf(n) > -1)).slice(0, Math.max(0, c.routeStages - (cur ? 1 : 0)));
+    q._routes = routesSent.slice(0, c.routes).concat(routesSent.filter((r, i) => i >= c.routes && (r.name === cur || forCons.indexOf(r) > -1)))
+      .map((r) => (c.routeStages > 0 && (r.name === cur || forCons.indexOf(r) > -1)) ? r : Object.assign({}, r, { stages: [] }));
+  }
+  const nums = named.numbers;
+  if (c.records || nums.some((n) => /^CAL-/.test(n))) { want.RECORDS = 1; q.records = pickRows(p.records, c.records, nums); }
+  if (c.boms || nums.some((n) => /^BOM-/.test(n))) { want.BOMS = 1; q.boms = pickRows(p.boms, c.boms, nums); }
+  if (c.quotes || nums.some((n) => /^QT-/.test(n))) { want.QUOTES = 1; q.quotes = pickRows(p.quotes, c.quotes, nums); }
+  if (p.marketing && (c.enquiries >= 0 || nums.some((n) => /^ENQ-/.test(n)))) {
+    want.MARKETING = 1;
+    q.marketing = Object.assign({}, p.marketing, { enquiries: pickRows(p.marketing.enquiries, Math.max(0, c.enquiries), nums) });
+  }
+  /* LEARNED: only what the kinds of question learn from, the constructions named first */
+  const L = p.learned, firstCons = (a, key) => a.filter((x) => named.cons.indexOf(x[key]) > -1).concat(a.filter((x) => named.cons.indexOf(x[key]) < 0));
+  const lessonKinds = (c.typical ? ['calculation'] : []).concat(c.stages ? ['recipe'] : []).concat(c.routeUse ? ['route'] : []);
+  q.learned = {
+    routeUse: c.routeUse ? L.routeUse.slice().sort((a, b) => (b.bags || 0) - (a.bags || 0)).slice(0, c.routeUse) : [],
+    workflows: c.workflows ? L.workflows : [],
+    stages: c.stages ? L.stages.slice(0, c.stages) : [],
+    boms: c.lboms ? firstCons(L.boms, 'construction').slice(0, c.lboms) : [],
+    typical: c.typical ? (named.cons.length ? L.typical.filter((x) => named.cons.indexOf(x.construction) > -1).slice(0, c.typical) : L.typical.slice().sort((a, b) => (b.count || 0) - (a.count || 0)).slice(0, Math.min(2, c.typical))) : [],
+    lessons: c.lessons ? firstCons(L.lessons.filter((x) => lessonKinds.indexOf(x.what) > -1), 'construction').slice(0, c.lessons) : [],
+    workflowRecipes: c.wfRecipes ? firstCons(L.workflowRecipes, 'construction').slice(0, c.wfRecipes) : []
+  };
+  if (Object.keys(q.learned).some((k) => q.learned[k].length)) want.LEARNED = 1;
+  return { q: q, routes: q._routes || [], want: want };
+}
+/** the CONTEXT for a question: the parts it needs, in the usual order; LEFT_OUT names what the plant has that did not go */
+function compileContext(p, routesSent, tr) {
+  const full = assistContext(tr.q, tr.routes);
+  const out = {}, left = [];
+  const has = { FIGURES: p.figures.length, GROUPS: p.groups.length, CONSTANTS: p.constants.length, HELP_TOPICS: p.topics.length, WORKFLOWLIST: p.workflowList.length,
+    PROCESSES: p.processes.length, MATERIALS: p.materials.length, LEARNED: Object.keys(p.learned).some((k) => (p.learned[k] || []).length) ? 1 : 0, ROUTES: routesSent.length, RECORDS: p.records.length, BOMS: p.boms.length, QUOTES: p.quotes.length,
+    MARKETING: p.marketing ? 1 : 0, FIELDS: p.fields.length };
+  Object.keys(full).forEach((k) => {
+    if (k === 'SCREEN') { if (left.length) out.LEFT_OUT = left; }
+    if (tr.want[k]) out[k] = full[k]; else if (has[k]) left.push(k);
+  });
+  return out;
+}
+/** about how many tokens Google counts: JSON and English a token per ~3.4 characters, Gujarati and Hindi letters about one each */
+export function estTokens(s) {
+  const t = String(s || '');
+  let other = 0;
+  for (let i = 0; i < t.length; i++) if (t.charCodeAt(i) > 127) other++;
+  return Math.ceil((t.length - other) / 3.4 + other);
+}
+const promptMax = () => Math.max(3000, parseInt(process.env.AI_PROMPT_MAX_TOKENS, 10) || 11000);
+/** a model's earlier answer, short: its words and the names of its steps (the last answer goes whole) */
+export function modelGist(text) {
+  const s = String(text || '');
+  let j = null;
+  if (/^\s*\{/.test(s)) { try { j = JSON.parse(s); } catch (e) { j = null; } }
+  if (!j || typeof j !== 'object' || Array.isArray(j)) return str(s, 1200);
+  const steps = Array.isArray(j.steps) ? j.steps.map((x) => x && x.do).filter(Boolean) : [];
+  return str(String(j.answer || '').slice(0, 900) + (steps.length ? ' (steps: ' + steps.join(', ') + ')' : ''), 1200);
+}
+/** Everything one assist question sends: its kinds, the instructions, the CONTEXT and the conversation, within the budget. */
+export function assistPlan(p, routesSent, audio, question, budget, files) {
+  const t = topicsOf(p, audio, files);
+  const said = p.text + ' ' + p.history.filter((h) => h.role === 'user').slice(-1).map((h) => h.text).join(' ');
+  const named = { cons: consNamed(p, p.text).concat(String(p.text || '').length < 60 ? consNamed(p, said) : [])
+    .concat(p.now.calc.structure ? [p.now.calc.structure] : []).concat(p.now.bom && p.now.bom.construction ? [p.now.bom.construction] : [])
+    .filter((n, i, a) => n && a.indexOf(n) === i && p.constructions.some((c) => c.name === n)), numbers: numbersNamed(said) };
+  const system = assistSystemFor(t);
+  const turns = answeredOnly(p.history).slice(-8);
+  const lastModel = turns.map((h) => h.role).lastIndexOf('model');
+  let hist = turns.map((h, i) => ({ role: h.role, text: h.role === 'model' ? (i === lastModel ? str(h.text, 2500) : modelGist(h.text)) : str(h.text, 1200) }));
+  const caps = capsFor(t);
+  const max = budget || promptMax();
+  let tr = trimmed(p, routesSent, t, caps, named), ctx = compileContext(p, routesSent, tr), ctxText = JSON.stringify(ctx);
+  /* the answer's shape counts too (Google reads it with the question) */
+  const schema = SCHEMAS.assist(tr.want.FIELDS ? tr.q.fields : [], p.now.calc.parts.map((x) => x.key), stepsFor(t).map((d) => d[1]));
+  const fixed = estTokens(system) + estTokens(question) + estTokens(JSON.stringify(schema)) + 40;
+  const size = (text) => fixed + estTokens(text) + hist.reduce((n, h) => n + estTokens(h.text), 0);
+  /* 4.72.0 review — the rows a question is about (the saved calculations it counts, the enquiries, the materials) are cut
+     only after the older turns of the conversation: a count from half the list is wrong, an old turn is only context.
+     The help, the saved recipes and other routes' sections (SHRINK's first steps) still go first, and the last two
+     exchanges always stay */
+  const HIST_AT = 3;
+  for (let i = 0; i < SHRINK.length && size(ctxText) > max; i++) {
+    if (i === HIST_AT) { while (size(ctxText) > max && hist.length > 4) hist = hist.slice(2); if (size(ctxText) <= max) break; }
+    if (!SHRINK[i](caps)) continue;
+    tr = trimmed(p, routesSent, t, caps, named); ctx = compileContext(p, routesSent, tr); ctxText = JSON.stringify(ctx);
+  }
+  /* the conversation is cut last, and never below the last two exchanges ("it", "again" must still mean something) */
+  while (size(ctxText) > max && hist.length > 4) hist = hist.slice(2);
+  return { topics: t, named: named, system: system, ctx: ctx, ctxText: ctxText, hist: hist, schema: schema, est: size(ctxText) };
+}
+const topicList = (t) => Object.keys(t).filter((k) => t[k] === true);
+
 /** POST /v1/ai/assist */
 export async function assist(companyId, payload, lang, fetchImpl, who) {
   if (!aiConfigured()) return { httpStatus: 503, body: { error: 'AI_OFF', message: 'Nexora AI is not switched on at the service yet.' } };
@@ -1775,7 +2647,7 @@ export async function assist(companyId, payload, lang, fetchImpl, who) {
      "<route> — CAL-…") is that bag's business, and a route no construction runs on goes without its
      sections (its steps still go) */
   const curRoute = String(p.now.calc.route || '');
-  const routesSent = p.routes.filter((r) => !/ \u2014 [A-Z]{2,5}-\d{4}-\d+/.test(r.name) || r.name === curRoute)
+  const routesSent = p.routes.filter((r) => !/ — [A-Z]{2,5}-\d{4}-\d+/.test(r.name) || r.name === curRoute)
     .map((r) => (r.constructions.length || r.name === curRoute) ? r : Object.assign({}, r, { stages: [] }));
   const lg0 = (lang === 'gu' || lang === 'hi') ? lang : 'en';
   const nothing = (why) => ({ httpStatus: 200, body: { ok: true, model: null, transcript: '', lang: lg0, heard: false, steps: [], missing: [], dropped: [], notes: [], next: [], run: false,
@@ -1786,19 +2658,28 @@ export async function assist(companyId, payload, lang, fetchImpl, who) {
     lastAudio = { at: new Date().toISOString(), bytes: m.audioBytes, seconds: m.level ? m.level.seconds : null, rms: m.level ? m.level.rms : null, peak: m.level ? m.level.peak : null, transcriptChars: null, model: null };
     if (m.level && m.level.peak < 0.01 && !p.text) { lastAudio.verdict = 'silent'; return nothing('silent'); }
   }
-  const ctx = assistContext(p, routesSent);
-  const ctxText = JSON.stringify(ctx);
-  lastContext = { at: new Date().toISOString(), chars: ctxText.length, parts: {} };
-  Object.keys(ctx).forEach((k) => { lastContext.parts[k] = JSON.stringify(ctx[k]).length; });
-  const contents = [{ role: 'user', parts: [{ text: 'CONTEXT:\n' + ctxText }] },
-    { role: 'model', parts: [{ text: '{"transcript":"","lang":"en","answer":"Ready.","steps":[]}' }] }];
-  answeredOnly(p.history).forEach((h) => contents.push({ role: h.role, parts: [{ text: h.text }] }));
   /* no language switch: Nexora AI answers in the language the person used,
      unless a language was asked for by name */
   const said = (lang === 'gu' || lang === 'hi') ? langLine(lang, 'the answer') : '';
-  contents.push({ role: 'user', parts: m.parts.concat([{ text: said + (m.audio ? 'The person speaks in the attached recording.' + (p.text ? ' Also typed: ' + p.text : '') : p.text) +
-    (m.files ? '\nAlso attached: ' + m.files + ' photo(s)/document(s) of the bag — read its sizes and specification from them.' : '') }]) });
-  const a = await ask(companyId, ASSIST_SYSTEM, { contents: contents }, fetchImpl, { strong: !p.voice && !m.audio, maxTokens: 8192, kind: m.audio ? 'assist/voice' : 'assist' });
+  const question = said + (m.audio ? 'The person speaks in the attached recording.' + (p.text ? ' Also typed: ' + p.text : '') : p.text) +
+    (m.files ? '\nAlso attached: ' + m.files + ' photo(s)/document(s) of the bag — read its sizes and specification from them.' : '');
+  /* 4.72.0 — finding 46: only what this question needs */
+  const plan = assistPlan(p, routesSent, m.audio, question, undefined, m.files);
+  lastContext = { at: new Date().toISOString(), chars: plan.ctxText.length, parts: {}, topics: topicList(plan.topics), estTokens: plan.est };
+  Object.keys(plan.ctx).forEach((k) => { lastContext.parts[k] = JSON.stringify(plan.ctx[k]).length; });
+  const ready = { role: 'model', parts: [{ text: '{"transcript":"","lang":"en","answer":"Ready.","steps":[]}' }] };
+  const contents = [{ role: 'user', parts: [{ text: 'CONTEXT:\n' + plan.ctxText }] }, ready];
+  plan.hist.forEach((h) => contents.push({ role: h.role, parts: [{ text: h.text }] }));
+  contents.push({ role: 'user', parts: m.parts.concat([{ text: question }]) });
+  /* 4.72.0 — finding 49: Gemma's lean version — the rules that keep an answer safe, a smaller CONTEXT, the last turns */
+  let gemma = null;
+  if (!m.parts.length && (genNames.length ? genNames : model.available || []).some((n) => /^gemma-\d/.test(n))) {
+    const g = assistPlan(p, routesSent, false, question, 5500);
+    gemma = { system: gemmaSystemFor(g.topics), contents: [{ role: 'user', parts: [{ text: 'CONTEXT:\n' + g.ctxText }] }, ready]
+      .concat(g.hist.slice(-4).map((h) => ({ role: h.role, parts: [{ text: h.text }] }))).concat([{ role: 'user', parts: [{ text: question }] }]) };
+  }
+  const a = await ask(companyId, plan.system, { contents: contents }, fetchImpl, { strong: !p.voice && !m.audio, maxTokens: 8192, kind: m.audio ? 'assist/voice' : 'assist',
+    schema: plan.schema, gemma: gemma });
   if (a.fail) return a.fail;
   const j = a.json || {};
   /* what the model "heard" counts as said only for a recording — for typed words the words themselves are what was said */
@@ -1834,18 +2715,28 @@ export async function assist(companyId, payload, lang, fetchImpl, who) {
    ========================================================================== */
 const speakRecent = [];
 const speakPerCompany = new Map();
+const speakAsked = new Map();
 function takeSpeak(companyId) {
   if (ownKey()) return {};   /* 4.67.18 — the company's own key: Google's limits */
   const now = Date.now();
-  while (speakRecent.length && now - speakRecent[0] > 60000) speakRecent.shift();
-  if (speakRecent.length >= (Math.max(1, parseInt(process.env.AI_SPEAK_PER_MINUTE, 10) || 12))) return { busy: true };
-  const k = String(companyId || 'none'); const c = speakPerCompany.get(k); const d = today();
+  const k = String(companyId || 'none');
+  const c = speakPerCompany.get(k); const d = today();
   const used = c && c.day === d ? c.n : 0;
+  /* 4.72.0 review — a day used up is said first, and does not count as asking for the minute */
   if (used >= (Math.max(1, parseInt(process.env.AI_SPEAK_DAILY, 10) || 200))) return { spent: true };
-  speakPerCompany.set(k, { day: d, n: used + 1 }); speakRecent.push(now);
+  while (speakRecent.length && now - speakRecent[0].t >= 60000) speakRecent.shift();
+  speakAsked.forEach((t, c2) => { if (now - t >= 60000) speakAsked.delete(c2); });
+  const limit = Math.max(1, parseInt(process.env.AI_SPEAK_PER_MINUTE, 10) || 12);
+  /* 4.72.0 — finding 44: the spoken answers' minute is shared fairly too */
+  const share = minuteShare(speakRecent, speakAsked, k, limit, now);
+  speakAsked.set(k, now);
+  if (speakRecent.length >= limit) return { busy: Math.max(1, Math.ceil((60000 - (now - speakRecent[0].t)) / 1000)) };
+  const mine = speakRecent.filter((x) => x.k === k);
+  if (mine.length >= share) return { busy: shareWait(mine, share, now) };
+  speakPerCompany.set(k, { day: d, n: used + 1 }); speakRecent.push({ t: now, k: k });
   return {};
 }
-export function _resetSpeak() { speakRecent.length = 0; speakPerCompany.clear(); }
+export function _resetSpeak() { speakRecent.length = 0; speakPerCompany.clear(); speakAsked.clear(); }
 /** The voice model: GEMINI_TTS_MODEL, else the newest Flash-Lite TTS the key lists (it answers soonest), else Flash TTS. */
 export function ttsOf(names) {
   const env = String(process.env.GEMINI_TTS_MODEL || '').trim().replace(/^models\//, '');
@@ -1881,7 +2772,7 @@ export async function speak(companyId, payload, lang, fetchImpl) {
   const text = speakable(x.text);
   if (!text) return { httpStatus: 400, body: { error: 'NOTHING', message: 'Nothing to say.' } };
   const t = takeSpeak(companyId);
-  if (t.busy) return { httpStatus: 429, body: { error: 'AI_BUSY', message: 'Nexora AI is speaking for others — the answer is on the screen.' } };
+  if (t.busy) return { httpStatus: 429, body: { error: 'AI_BUSY', retryAfter: t.busy, message: 'Nexora AI is speaking for others — the answer is on the screen.' } };
   if (t.spent) return { httpStatus: 429, body: { error: 'AI_DAILY', message: 'Today\u2019s spoken answers are used up — the answers stay on the screen.' } };
   await resolveModel(false, fetchImpl);
   const name = ttsOf(allNames.length ? allNames : model.available || []);

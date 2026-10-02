@@ -51,6 +51,9 @@
 
   function num(v) { const x = Number(v); return isFinite(x) ? x : 0; }
   function fmtN(v, d) { return Number(v).toFixed(d === undefined ? 2 : d); }
+  /* 4.72.0 — a line's cost is worked on its EXACT kilograms; l.kg is the
+     issued (rounded) quantity. A result from before 4.72.0 has no exactKg. */
+  function exactOf(l) { return l.exactKg === undefined || l.exactKg === null ? num(l.kg) : num(l.exactKg); }
 
   /* A bag component the weight calculation knows about, and the material
      group that would supply it. Used only to ASK whether some stage adds
@@ -161,8 +164,9 @@
       if (s.sourcing === 'BUY') {
         if (!s.buyRm) return;
         var bk = s.buyRm;
-        if (!byCode[bk]) { byCode[bk] = { code: bk, name: nameOf(bk), kg: 0, cost: 0, stages: [], bought: true }; order.push(bk); }
+        if (!byCode[bk]) { byCode[bk] = { code: bk, name: nameOf(bk), kg: 0, exactKg: 0, cost: 0, stages: [], bought: true }; order.push(bk); }
         byCode[bk].kg += num(s.purchasedKg);
+        byCode[bk].exactKg += num(s.purchasedKg);
         byCode[bk].cost += num(s.materialCost);
         byCode[bk].stages.push(s.processName);
         return;
@@ -170,15 +174,24 @@
       (s.lines || []).forEach(function (l) {
         if (l.invalid || l.src === 'SFG' || !l.rm) return;   // SFG is not bought — it is made upstream
         var k = l.rm;
-        if (!byCode[k]) { byCode[k] = { code: k, name: nameOf(k), kg: 0, cost: 0, stages: [] }; order.push(k); }
+        if (!byCode[k]) { byCode[k] = { code: k, name: nameOf(k), kg: 0, exactKg: 0, cost: 0, stages: [] }; order.push(k); }
         byCode[k].kg += num(l.kg);
+        byCode[k].exactKg += exactOf(l);
         byCode[k].cost += num(l.cost);
+        /* 4.72.0 (audit #79) — kilograms priced at a rate TYPED on the line, not the price master's: a master
+           price change does not move them, so Price Impact must know which they are (and what they cost).
+           Written only when there are some, so a list with no typed rate reads exactly as before. */
+        if (l.rateSource === 'override') {
+          byCode[k].overrideKg = num(byCode[k].overrideKg) + exactOf(l);
+          byCode[k].overrideCost = num(byCode[k].overrideCost) + num(l.cost);
+        }
         if (byCode[k].stages.indexOf(s.processName) < 0) byCode[k].stages.push(s.processName);
       });
     });
     var materials = order.map(function (k) {
       var m = byCode[k];
-      m.rate = m.kg > 0 ? m.cost / m.kg : 0;      // its OWN rate, never a stage's cumulative cost
+      // its OWN rate, never a stage's cumulative cost — over the kilograms the cost was worked on
+      m.rate = m.exactKg > 0 ? m.cost / m.exactKg : 0;
       m.group = groupOf(k);
       return m;
     });
@@ -434,10 +447,10 @@
           var j = l.sfgStep;
           if (!(j >= 0 && j < stages.length)) return;
           claimCost[j] += num(l.cost);
-          claimKg[j] += num(l.kg);
-          claimants[j].push({ by: s.processName, kg: num(l.kg), cost: num(l.cost), explicit: true });
+          claimKg[j] += exactOf(l);
+          claimants[j].push({ by: s.processName, kg: exactOf(l), cost: num(l.cost), explicit: true });
           if (l.rateSource === 'override') {
-            byOverride[j] = { by: s.processName, typed: num(l.rate), kg: num(l.kg) };
+            byOverride[j] = { by: s.processName, typed: num(l.rate), kg: exactOf(l) };
           }
         });
       } else if (prevIdx > -1 && num(s.inputCost) !== 0) {

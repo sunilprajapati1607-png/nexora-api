@@ -192,7 +192,8 @@ export async function broadcastAction(body) {
   const text = String((body && body.body) || '').trim().slice(0, MAX_BODY);
   if (!text) return { error: 'EMPTY', message: 'There is nothing to send.' };
   const tags = cleanTags(body && body.tags);
-  const companies = await q(`SELECT id FROM companies ORDER BY id`);
+  /* 4.72.0 (audit 40) — not into a company the console deleted (it is archived, and erased after 30 days) */
+  const companies = await q(`SELECT id FROM companies WHERE deleted_at IS NULL ORDER BY id`);
   let rooms = 0;
   for (const c of companies) {
     await q(

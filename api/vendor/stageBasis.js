@@ -113,7 +113,9 @@
         if (view.mode === MODES.EACH && factor !== 1 && l.basis === 'ABS' && !l.invalid) {
           prorated.push({ stage: s.index, processName: s.processName, name: l.name });
         }
-        return Object.assign({}, l, { kg: num(l.kg) * factor, cost: num(l.cost) * factor });
+        var scaled = { kg: num(l.kg) * factor, cost: num(l.cost) * factor };
+        if (l.exactKg !== undefined && l.exactKg !== null) scaled.exactKg = num(l.exactKg) * factor;   // 4.72.0 — what the cost is worked on
+        return Object.assign({}, l, scaled);
       });
       var resourceCosts = s.resourceCosts
         ? s.resourceCosts.map(function (r) { return Object.assign({}, r, { cost: num(r.cost) * factor }); })

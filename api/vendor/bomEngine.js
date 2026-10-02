@@ -132,7 +132,9 @@
    *                every version before 1.0.0 hard-coded. It comes from
    *                the Constants Master now ("BOM ISSUE QUANTITY
    *                ROUNDING") so a plant that issues in whole kilograms,
-   *                or to 0.001, can say so.
+   *                or to 0.001, can say so. Since 4.72.0 it rounds only
+   *                the ISSUED quantity (line.kg); cost and the quantities
+   *                carried between stages use line.exactKg.
    */
   function build(opts) {
     const steps = (opts.steps || []).slice();
@@ -301,15 +303,22 @@
       s.grossKg = s.outputKg / (1 - s.wastePct / 100);
       s.wasteKg = s.grossKg - s.outputKg;
 
+      /* 4.72.0 — COST ON THE EXACT KILOGRAMS (owner, 2 Oct 2026: "ચોક્કસ
+         kg થી cost"). The 0.1 kg step is how the store ISSUES material, so
+         it is what a line shows and prints (l.kg). Everything costed, and
+         everything carried to another stage, uses the exact kilograms
+         (l.exactKg): a 0.04 kg line rounded to 0.0 cost nothing, and the
+         cost per bag moved with the order size. */
       let addedKg = 0, sfgKg = 0, hasSfg = false;
       s.lines.forEach((l) => {
-        if (l.invalid) { l.kg = 0; return; }
-        l.kg = mround(qtyOf(l, s.grossKg, s.wastePct, i), qtyStep);
+        if (l.invalid) { l.kg = 0; l.exactKg = 0; return; }
+        l.exactKg = qtyOf(l, s.grossKg, s.wastePct, i);
+        l.kg = mround(l.exactKg, qtyStep);
         if (l.src === 'SFG') {
-          hasSfg = true; sfgKg += l.kg;
-          demand[l.sfgStep] += l.kg;        // pull it from that stage
+          hasSfg = true; sfgKg += l.exactKg;
+          demand[l.sfgStep] += l.exactKg;   // pull it from that stage
         } else {
-          addedKg += l.kg;
+          addedKg += l.exactKg;
         }
       });
       s.addedKg = addedKg;
@@ -433,7 +442,7 @@
             const ref = stages[l.sfgStep];
             l.rate = l.rateOverride !== null ? l.rateOverride : (ref ? ref.costPerKg : 0);
             l.rateSource = l.rateOverride !== null ? 'override' : 'stage';
-            l.cost = l.kg * num(l.rate);
+            l.cost = l.exactKg * num(l.rate);
             sfgCost += l.cost;
           } else {
             const master = rateOf(l.rm);
@@ -441,7 +450,7 @@
             l.rateSource = l.rateOverride !== null ? 'override' : 'master';
             l.masterRate = master;
             if (l.rate === null) unpriced.push(l.rm);
-            l.cost = l.kg * num(l.rate);
+            l.cost = l.exactKg * num(l.rate);
             material += l.cost;
           }
         });
@@ -610,7 +619,7 @@
   function n(v, dp) {
     const d = dp === undefined ? 2 : dp;
     const r = Math.round(num(v) * Math.pow(10, d)) / Math.pow(10, d);
-    return r.toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: d });
+    return r.toLocaleString('en-IN', { minimumFractionDigits: 0, maximumFractionDigits: d });   // 4.72.0 — one style app-wide
   }
 
   function fmtKg(v) { return (Math.round(v * 100) / 100).toFixed(2); }

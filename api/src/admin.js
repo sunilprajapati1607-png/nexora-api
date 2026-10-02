@@ -12,16 +12,22 @@
  * real accounts the day there is more than one operator.
  */
 import { createHash, timingSafeEqual } from 'node:crypto';
-import { endSessionOn } from './waiters.js';
+import { endSessionOn, wakeCompany } from './waiters.js';
 import { q, getSettings, forgetSettings, logEvent } from './db.js';
 import { cleanPlan, cleanPlanFeatures, PLAN_FEATURES } from './plans.js';
 import { hashPasscode, validPasscode, PASSCODE_MIN } from './passcode.js';
-import { newLicenceKey } from './licence.js';
+import { newLicenceKey, maskKey, keylessRefused, forgetCompanies, DELETED_KEEP_DAYS, istDate, purgeDayOf } from './licence.js';
 import { aiUsedTodayAll, aiDefaultDaily } from './ai.js';
 import { forget as aiForget } from './aikey.js';
-import { ensureAdmin, usersSummary, userCap, listUsers, hashPin, validPin, nameKey, cleanEmail, defaultPermissions, resendPrices } from './sync.js';
+import { ensureAdmin, usersSummary, userCap, listUsers, hashPin, validPin, nameKey, cleanEmail, defaultPermissions, resendPrices,
+  signOutEverywhere, masterHistory, restoreMaster } from './sync.js';
+import { ensureInkSchema } from './inkstore.js';
 
 const ADMIN_KEY = process.env.NEXORA_ADMIN_KEY || '';
+/* 4.72.0 (audit 9, 35) — a console key shorter than this is easy to guess; the service says so in its log
+   (once, never the key) and the console shows a warning on Service settings */
+export const ADMIN_KEY_MIN = 32;
+export function adminKeyShort() { return !!ADMIN_KEY && ADMIN_KEY.length < ADMIN_KEY_MIN; }
 
 /* 4.71.0 (audit) — compared in constant time. `===` stops at the first
    character that differs, so how long a wrong key took to refuse said how
@@ -44,30 +50,109 @@ export function adminAuthorised(request) {
 const ADMIN_TRIES = 5;
 const ADMIN_LOCK_MS = 15 * 60 * 1000;
 const ADMIN_MISSES = new Map();
+/* 4.72.0 (audit 9, 35) — AND FIFTY WRONG KEYS FROM EVERY ADDRESS TOGETHER, within
+   fifteen minutes, shut the console for everybody for fifteen minutes (the right
+   key too), logged once. Five per address stops one machine guessing; it does not
+   stop a thousand machines guessing five each. In memory, like the per-address count.
+   4.72.0 review — BUT ONLY WHILE THE KEY IS SHORT (adminKeyShort). A lock for
+   everybody is also a lever for anybody: fifty wrong keys from a handful of
+   addresses (one home connection's IPv6 range has more than enough) would keep the
+   owner out of his own console, again every quarter of an hour, for as long as
+   somebody cared to. Against a key of ADMIN_KEY_MIN random characters or more,
+   guessing is hopeless however many machines guess, so there the lock would buy
+   nothing and only that lever is left: with a long key there is no lock for
+   everybody — the per-address lock stays — and the log says once a quarter-hour
+   that many were tried (ADMIN_KEY_MANY_WRONG). With a short key the lock stays as
+   it was, and the service keeps saying the key should be longer. */
+const ADMIN_ALL_TRIES = 50;
+const ADMIN_ALL = { n: 0, since: 0, until: 0, logged: 0, said: false };
+/* 4.72.0 review — HOW MUCH A FLOOD OF WRONG KEYS MAY WRITE OR HOLD. Without the lock for everybody, many
+   addresses could each write their five wrong keys into the event log (the free database is 500 MB): the log
+   takes ADMIN_LOG_MAX of them (and the per-address locks) in a quarter-hour, from every address together, and
+   counts the rest. The per-address counts are at most ADMIN_MISSES_MAX: past that the oldest are forgotten. */
+export const ADMIN_LOG_MAX = 50;
+export const ADMIN_MISSES_MAX = 10000;
+let keyLengthSaid = false;
+/** For the suites: how many addresses' wrong-key counts are held. */
+export function adminMissesSize() { return ADMIN_MISSES.size; }
+
+/** 4.72.0 (audit 39) — where a console call comes from, for the event log (db.js consoleCall): the address
+ *  Cloudflare saw (register.js remoteIp, passed in), which console ('android' when the phone console says so in
+ *  x-console or its HTTP client names itself; otherwise 'web'), and the first 120 characters of its user-agent.
+ *  Never the key. */
+export function consoleCaller(request, ip) {
+  const ua = String(request.headers.get('user-agent') || '').replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, 120);
+  const said = String(request.headers.get('x-console') || '').trim().toLowerCase();
+  const app = said === 'android' || said === 'web' ? said : (/okhttp|dalvik|android/i.test(ua) ? 'android' : 'web');
+  return { ip: ip || '-', app, ua };
+}
+
 export async function adminGate(request, ip) {
+  if (!keyLengthSaid) {
+    keyLengthSaid = true;
+    if (adminKeyShort()) console.warn('[nexora] the console key NEXORA_ADMIN_KEY is shorter than ' + ADMIN_KEY_MIN + ' characters - set a longer random one on Render');
+  }
   const who = ip || '-';
   const now = Date.now();
   const s = ADMIN_MISSES.get(who);
-  const shut = (until) => {
+  const shut = (until, all) => {
     const sec = Math.max(1, Math.ceil((until - now) / 1000));
     const m = Math.max(1, Math.ceil(sec / 60));
     return { ok: false, httpStatus: 429, body: { error: 'TOO_MANY', retryAfter: sec,
-      message: 'Too many wrong admin keys from this address — try again in ' + m + ' minute' + (m === 1 ? '' : 's') + '.' } };
+      message: (all ? 'Too many wrong admin keys from many addresses — the console is shut for everybody; try again in '
+                    : 'Too many wrong admin keys from this address — try again in ') + m + ' minute' + (m === 1 ? '' : 's') + '.' } };
   };
+  if (ADMIN_ALL.until > now) return shut(ADMIN_ALL.until, true);
   if (s && s.until > now) return shut(s.until);
   if (adminAuthorised(request)) { if (s) ADMIN_MISSES.delete(who); return { ok: true }; }
+  /* 4.72.0 (audit 39) — every wrong key is in the event log, with where it came from (never what was typed) —
+     4.72.0 review: up to ADMIN_LOG_MAX of them (with the per-address locks) a quarter-hour from every address
+     together, so a flood from many addresses cannot fill the database */
+  if (now - ADMIN_ALL.since > ADMIN_LOCK_MS) { ADMIN_ALL.since = now; ADMIN_ALL.n = 0; ADMIN_ALL.logged = 0; ADMIN_ALL.said = false; }
+  ADMIN_ALL.n++;
+  const mayLog = () => ADMIN_ALL.logged < ADMIN_LOG_MAX && ++ADMIN_ALL.logged > 0;
+  const from = consoleCaller(request, who);
+  if (mayLog()) await logEvent(null, 'ADMIN_KEY_WRONG', { ip: who, app: from.app, ua: from.ua });
+  if (ADMIN_ALL.n >= ADMIN_ALL_TRIES) {
+    if (adminKeyShort()) {
+      ADMIN_ALL.until = now + ADMIN_LOCK_MS;
+      await logEvent(null, 'ADMIN_KEY_LOCKED_ALL', { tries: ADMIN_ALL.n, last: who });
+      ADMIN_ALL.n = 0; ADMIN_ALL.since = now; ADMIN_ALL.logged = 0; ADMIN_ALL.said = false;
+      return shut(ADMIN_ALL.until, true);
+    }
+    /* 4.72.0 review — a long key: nobody is shut out; the log says it once this quarter-hour */
+    if (!ADMIN_ALL.said) {
+      ADMIN_ALL.said = true;
+      await logEvent(null, 'ADMIN_KEY_MANY_WRONG', { tries: ADMIN_ALL.n, last: who, locked: false });
+    }
+  }
   const n = (s && !s.until ? s.n : 0) + 1;
   if (n >= ADMIN_TRIES) {
     const until = now + ADMIN_LOCK_MS;
+    ADMIN_MISSES.delete(who);
     ADMIN_MISSES.set(who, { n: 0, until });
-    await logEvent(null, 'ADMIN_KEY_LOCKED', { ip: who, tries: n });
+    if (mayLog()) await logEvent(null, 'ADMIN_KEY_LOCKED', { ip: who, tries: n });
+    trimMisses(now);
     return shut(until);
   }
   ADMIN_MISSES.set(who, { n, until: 0 });
-  if (ADMIN_MISSES.size > 5000) {
-    for (const [k, v] of ADMIN_MISSES) if (!(v.until > now)) ADMIN_MISSES.delete(k);
-  }
+  trimMisses(now);
   return { ok: false, httpStatus: 401, body: { error: 'UNAUTHORISED' } };
+}
+/** 4.72.0 review — the per-address counts kept within ADMIN_MISSES_MAX: those no longer locked go first (as
+ *  before, from 5000), then the oldest (a Map keeps the order they were set in; a lock is set anew). */
+function trimMisses(now) {
+  if (ADMIN_MISSES.size <= 5000) return;
+  for (const [k, v] of ADMIN_MISSES) if (!(v.until > now)) ADMIN_MISSES.delete(k);
+  if (ADMIN_MISSES.size <= ADMIN_MISSES_MAX) return;
+  for (const k of ADMIN_MISSES.keys()) {
+    if (ADMIN_MISSES.size <= ADMIN_MISSES_MAX) break;
+    ADMIN_MISSES.delete(k);
+  }
+}
+/** For the suites only: forget every wrong-key count (per address and in all). */
+export function forgetAdminMisses() {
+  ADMIN_MISSES.clear(); ADMIN_ALL.n = 0; ADMIN_ALL.since = 0; ADMIN_ALL.until = 0; ADMIN_ALL.logged = 0; ADMIN_ALL.said = false;
 }
 
 export async function listLicences() {
@@ -95,14 +180,45 @@ export async function listLicences() {
               a machine with nobody on it can do nothing but show its
               sign-in screen — which is worth seeing from here when a plant
               rings to say "it is not working". */
-           u.name AS on_user, u.session_at AS on_since
+           u.name AS on_user, u.session_at AS on_since,
+           /* 4.72.0 (audit 97) — whether the row holds its device key yet: a yes or a no, never the hash */
+           (l.device_key_hash IS NOT NULL) AS key_held
       FROM licences l
       LEFT JOIN companies c ON c.id = l.company_id
       LEFT JOIN company_users u ON (u.session_device = l.device_id OR u.session_mobile = l.device_id)
+     /* 4.72.0 (audit 40) — a deleted company's machines go with it, as they did when a deletion erased them */
+     WHERE c.deleted_at IS NULL
      ORDER BY l.created_at DESC
      LIMIT 500`);
   const settings = await getSettings();
-  return { licences: rows, companies: await listCompanies(), settings, aiDefaultDaily: aiDefaultDaily() };
+  /* 4.72.0 (audit 97) — computers and phones in use whose row holds no device key yet. While there are any,
+     a device id alone still re-joins as that device (licence.js activate); once this is 0, NEXORA_DEVICE_KEY_REQUIRED=1
+     on Render closes that for good. `required` — whether it is already set. */
+  const kl = (await q(`SELECT COUNT(*)::int AS n FROM licences l LEFT JOIN companies c ON c.id = l.company_id
+                        WHERE l.state <> 'REVOKED' AND l.device_key_hash IS NULL AND c.deleted_at IS NULL`))[0];
+  return { licences: rows, companies: await listCompanies(), settings, aiDefaultDaily: aiDefaultDaily(),
+    /* 4.72.0 — additive: what Delete has archived (restorable), the keyless count, and whether the console key is short */
+    archived: await listArchived(),
+    keyless: { devices: Number(kl && kl.n) || 0, required: keylessRefused() },
+    adminKeyShort: adminKeyShort() };
+}
+
+/** 4.72.0 (audit 40) — the companies Delete has archived: kept DELETED_KEEP_DAYS, restorable until then
+ *  (companyAction 'undelete'), erased after (purgeArchived). Newest first. */
+export async function listArchived() {
+  const rows = await q(`
+    SELECT c.id, c.name, c.email, c.phone, c.gstin, c.login_id, c.is_demo, c.plan, c.seats,
+           c.deleted_at, c.deleted_state,
+           c.deleted_at + make_interval(days => $1::int) AS purge_at,
+           GREATEST(0, CEIL(EXTRACT(EPOCH FROM (c.deleted_at + make_interval(days => $1::int) - now())) / 86400))::int AS days_to_purge,
+           (SELECT COUNT(*)::int FROM licences l WHERE l.company_id = c.id) AS machines,
+           (SELECT COUNT(*)::int FROM company_users u WHERE u.company_id = c.id) AS people,
+           (SELECT COUNT(*)::int FROM sync_records s WHERE s.company_id = c.id) AS records
+      FROM companies c
+     WHERE c.deleted_at IS NOT NULL
+     ORDER BY c.deleted_at DESC
+     LIMIT 200`, [DELETED_KEEP_DAYS]);
+  return rows;
 }
 
 /* ---- companies (4.0.0) -----------------------------------------------
@@ -142,8 +258,14 @@ export async function listCompanies() {
            (SELECT COALESCE(SUM(GREATEST(0, l.txn_count - l.txn_base)), 0)::int FROM licences l
              WHERE l.company_id = c.id) AS txn_used,
            (SELECT COALESCE(SUM(GREATEST(0, l.usage_minutes - l.usage_base)), 0)::int FROM licences l
-             WHERE l.company_id = c.id) AS usage_minutes
+             WHERE l.company_id = c.id) AS usage_minutes,
+           /* 4.72.0 (audit 90) — a paying licence that ends within 30 days (IST calendar days, like days_left)
+              and has not ended yet: the plants to ring about renewing. Demos run out by design and are not in it. */
+           (NOT c.is_demo AND c.state = 'LICENSED' AND c.expires_at >= now()
+            AND ((c.expires_at AT TIME ZONE INTERVAL '+05:30')::date - (now() AT TIME ZONE INTERVAL '+05:30')::date) <= 30) AS ending_soon
       FROM companies c
+     /* 4.72.0 (audit 40) — a deleted (archived) company is listed apart (listArchived), as if it were gone */
+     WHERE c.deleted_at IS NULL
      ORDER BY c.is_demo ASC, c.created_at DESC
      LIMIT 500`);
   /* 4.8.0 — who can sign in on this company's seats. */
@@ -204,6 +326,16 @@ export async function companyAction(body) {
 
   const id = parseInt(body.id, 10);
   if (!id) return { error: 'A company is required.' };
+
+  /* 4.72.0 (audit 40) — a deleted company (archived for DELETED_KEEP_DAYS) takes nothing but being put back:
+     no extending, licensing, new people or PINs for a company that is on its way out. 'delete' says so itself. */
+  if (action !== 'undelete' && action !== 'delete') {
+    const gone = (await q(`SELECT name, deleted_at FROM companies WHERE id = $1 AND deleted_at IS NOT NULL`, [id]))[0];
+    if (gone) {
+      return { error: gone.name + ' is deleted. Restore it first (Companies → Deleted) — it can be restored until ' +
+        istDate(purgeDayOf(gone.deleted_at)) + '.' };
+    }
+  }
 
   if (action === 'extend') {
     /* From whichever is later, so extending a live licence adds time
@@ -270,7 +402,11 @@ export async function companyAction(body) {
     await logEvent(null, 'ADMIN_COMPANY_RESTORE', { id });
 
   } else if (action === 'rename') {
-    await q(`UPDATE companies SET name = $2 WHERE id = $1`, [id, String(body.name || '').trim() || 'Unnamed']);
+    /* 4.72.0 (audit 39) — and the log says what it was called before */
+    const was = (await q(`SELECT name FROM companies WHERE id = $1`, [id]))[0];
+    const to = String(body.name || '').trim() || 'Unnamed';
+    await q(`UPDATE companies SET name = $2 WHERE id = $1`, [id, to]);
+    await logEvent(null, 'ADMIN_COMPANY_RENAME', { id, from: was ? was.name : null, to });
 
   } else if (action === 'gstin') {
     /* Stored exactly as given, upper-cased only. The shape is checked in
@@ -443,16 +579,33 @@ export async function companyAction(body) {
     await logEvent(null, 'ADMIN_USER_ROLE', { companyId: id, userId: u.id, name: u.name, role: want });
     /* 4.71.0 (C2) — an administrator sees costs: the prices they were sent empty come again */
     if (want === 'ADMIN') await resendPrices(id);
-    return { ok: true, warning: u.name + ' is now ' + (want === 'ADMIN' ? 'an administrator.' : 'an ordinary user.') };
+    else {
+      /* 4.72.0 (audit 38, 95) — stepping down ends their sessions everywhere: whatever they hold from being an
+         administrator (prices, every request) must not go on working on a machine they are signed in on. What
+         is sent to them depends on who they are, so it is sent again (sync.js resendPrices). */
+      await signOutEverywhere(id, u.id, { why: 'CONSOLE_DEMOTED',
+        where: 'no other computer — Nexora made this account an ordinary user; sign in again' });
+      await resendPrices(id);
+    }
+    return { ok: true, warning: u.name + ' is now ' + (want === 'ADMIN' ? 'an administrator.'
+      : 'an ordinary user, and is signed out everywhere so the change holds at once.') };
 
   } else if (action === 'userpin') {
     if (!validPin(body.pin)) return { error: 'A PIN of at least 4 characters is required.' };
     const u = (await q(`SELECT id, name FROM company_users WHERE company_id = $1 AND id = $2`, [id, +body.userId]))[0];
     if (!u) return { error: 'No such user on this company.' };
-    await q(`UPDATE company_users SET pin_hash = $3 WHERE company_id = $1 AND id = $2`,
+    /* 4.72.0 \u2014 and the wrong-PIN lock is lifted: the tries counted against the OLD PIN say nothing about the new
+       one, and a person locked out is the commonest reason for this reset */
+    await q(`UPDATE company_users SET pin_hash = $3, pin_fails = 0, pin_locked_until = NULL WHERE company_id = $1 AND id = $2`,
       [id, u.id, hashPin(body.pin)]);
-    await logEvent(null, 'ADMIN_USER_PIN', { companyId: id, userId: u.id, name: u.name });
-    return { ok: true, warning: 'The PIN for ' + u.name + ' has been set. Tell them directly \u2014 it is not shown again.' };
+    /* 4.72.0 (audit 38) \u2014 A NEW PIN ENDS THE SESSIONS THE OLD ONE OPENED. The usual reason for this reset is a
+       leaver, or a PIN somebody else learned; the computer or phone already signed in as them used to go on
+       working with full access. Now every place they are signed in is signed out at once (sync.js). */
+    const out = await signOutEverywhere(id, u.id, { why: 'CONSOLE_PIN_RESET',
+      where: 'no other computer \u2014 Nexora set a new PIN for this account; sign in with the new PIN' });
+    await logEvent(null, 'ADMIN_USER_PIN', { companyId: id, userId: u.id, name: u.name, signedOut: out.ended.length });
+    return { ok: true, signedOut: out.ended.length, warning: 'The PIN for ' + u.name + ' has been set, and they are signed out everywhere' +
+      (out.ended.length ? '' : ' (they were not signed in anywhere)') + '. Tell them the new PIN directly \u2014 it is not shown again.' };
 
   } else if (action === 'userdel') {
     const u = (await q(`SELECT id, name, role FROM company_users WHERE company_id = $1 AND id = $2`, [id, +body.userId]))[0];
@@ -467,11 +620,14 @@ export async function companyAction(body) {
         return { error: u.name + ' is the only administrator. Set another one first \u2014 a company with none cannot add anybody.' };
       }
     }
+    /* 4.72.0 (audit 38, 95) — signed out everywhere first, so a machine they are on hears it now rather than
+       finding a person who no longer exists at its next call */
+    await signOutEverywhere(id, u.id, { why: 'CONSOLE_REMOVED', where: 'no other computer — Nexora removed this account' });
     /* What they saved stays with the company: it is the company's work,
        and a leaver must not take the plant's costings with them. */
     await q(`DELETE FROM company_users WHERE company_id = $1 AND id = $2`, [id, u.id]);
     await logEvent(null, 'ADMIN_USER_DELETE', { companyId: id, userId: u.id, name: u.name });
-    return { ok: true, warning: u.name + ' has been removed and their seat is free. Everything they saved stays with the company.' };
+    return { ok: true, warning: u.name + ' has been removed and signed out everywhere, and their seat is free. Everything they saved stays with the company.' };
 
   } else if (action === 'passcode') {
     /* 4.39.0 — SET A NEW COMPANY PASSCODE.
@@ -527,34 +683,108 @@ export async function companyAction(body) {
       : out.user.name + ' can now sign in as the administrator on any of this company\'s seats.' };
 
   } else if (action === 'delete') {
-    /* The one action that cannot be undone from here. It takes the
-       company and everything that hangs off it — its machines, its
-       people, the records its seats synced, its ink models — so nothing
-       is left pointing at a company that no longer exists. The owner
-       types the company's name to confirm; an id in a button is not a
-       decision, a name typed out is. */
-    const co = (await q(`SELECT id, name FROM companies WHERE id = $1`, [id]))[0];
+    /* 4.72.0 (audit 40) — DELETE NOW ARCHIVES FOR 30 DAYS (DELETED_KEEP_DAYS).
+       It used to take the company and everything that hangs off it at once,
+       with no way back but last night's whole-database backup. Now the company
+       is suspended and marked deleted: every computer and phone of it stops at
+       its next check (licence.js describe/authorise refuse it everywhere), it
+       leaves the console's lists, and nothing is erased. 'undelete' puts it
+       back exactly as it was until DELETED_KEEP_DAYS have passed; after that
+       purgeArchived erases it with its machines, people, synced records, master
+       history, ink models, chat and problem reports (audit 89). The owner still
+       types the company's name to confirm; an id in a button is not a decision,
+       a name typed out is. The answer keeps every field it had (removed, name —
+       `removed` now counts what will be erased) and says what happened. */
+    const co = (await q(`SELECT id, name, state, deleted_at FROM companies WHERE id = $1`, [id]))[0];
     if (!co) return { error: 'No such company.' };
+    if (co.deleted_at) {
+      return { error: co.name + ' is already deleted. It can be restored until ' + istDate(purgeDayOf(co.deleted_at)) + ' (Companies → Deleted).' };
+    }
     if (String(body.confirmName || '').trim() !== String(co.name).trim()) {
       return { error: 'Type the company name exactly — ' + co.name + ' — to delete it.' };
     }
-    const count = async (sql) => Number((await q(sql, [id]))[0].n);
-    const removed = {
-      installations: await count(`SELECT COUNT(*)::int AS n FROM licences WHERE company_id = $1`),
-      users: await count(`SELECT COUNT(*)::int AS n FROM company_users WHERE company_id = $1`),
-      records: await count(`SELECT COUNT(*)::int AS n FROM sync_records WHERE company_id = $1`),
-      inkModels: await count(`SELECT COUNT(*)::int AS n FROM ink_models WHERE company_id = $1`)
-    };
-    await q(`DELETE FROM licences WHERE company_id = $1`, [id]);
-    await q(`DELETE FROM company_users WHERE company_id = $1`, [id]);
-    await q(`DELETE FROM sync_records WHERE company_id = $1`, [id]);
-    await q(`DELETE FROM ink_models WHERE company_id = $1`, [id]);
-    await q(`DELETE FROM companies WHERE id = $1`, [id]);
-    await logEvent(null, 'ADMIN_COMPANY_DELETE', { id, name: co.name, removed });
-    return { ok: true, removed, name: co.name };
+    await ensureInkSchema();
+    const counted = (await q(`SELECT
+        (SELECT COUNT(*)::int FROM licences WHERE company_id = $1) AS installations,
+        (SELECT COUNT(*)::int FROM company_users WHERE company_id = $1) AS users,
+        (SELECT COUNT(*)::int FROM sync_records WHERE company_id = $1) AS records,
+        (SELECT COUNT(*)::int FROM ink_models WHERE company_id = $1) AS ink_models,
+        (SELECT COUNT(*)::int FROM chat_messages WHERE company_id = $1) AS chats,
+        (SELECT COUNT(*)::int FROM feedback WHERE company_id = $1) AS reports`, [id]))[0];
+    const removed = { installations: counted.installations, users: counted.users, records: counted.records,
+      inkModels: counted.ink_models, chats: counted.chats, reports: counted.reports };
+    const done = (await q(`UPDATE companies SET deleted_at = now(), deleted_state = state, state = 'SUSPENDED'
+                            WHERE id = $1 AND deleted_at IS NULL RETURNING deleted_at`, [id]))[0];
+    if (!done) return { error: co.name + ' is already deleted.' };
+    const purgeAt = purgeDayOf(done.deleted_at);
+    /* every machine of it hears at once: the waits answer now, and their next call is refused */
+    forgetCompanies(id);
+    try { wakeCompany(id, null); } catch (e) { /* they find out at their next call */ }
+    await logEvent(null, 'ADMIN_COMPANY_DELETE', { id, name: co.name, removed, archived: true, was: co.state, purgeAt: purgeAt.toISOString() });
+    return { ok: true, removed, name: co.name, archived: true, deletedAt: done.deleted_at, purgeAt: purgeAt.toISOString(),
+      restoreDays: DELETED_KEEP_DAYS,
+      warning: co.name + ' is deleted: its computers and phones stop at their next check and nobody can sign in. It is kept for ' +
+        DELETED_KEEP_DAYS + ' days — Restore (Companies → Deleted) puts it back exactly as it was until ' + istDate(purgeAt) +
+        '. After that the company and everything it synced are erased for good.' };
+
+  } else if (action === 'undelete') {
+    /* 4.72.0 (audit 40) — PUT A DELETED COMPANY BACK, within DELETED_KEEP_DAYS: the state it had when it was
+       deleted (licensed, demo or suspended), its machines, people and records exactly as they were. The
+       machines find out at their next check and carry on; nobody has to join or sign in again. */
+    const co = (await q(`SELECT id, name, is_demo, deleted_at, deleted_state FROM companies WHERE id = $1`, [id]))[0];
+    if (!co) return { error: 'No such company — a deleted company is erased ' + DELETED_KEEP_DAYS + ' days after it was deleted.' };
+    if (!co.deleted_at) return { ok: true, name: co.name, warning: co.name + ' is not deleted.' };
+    const back = (await q(`UPDATE companies
+                              SET state = COALESCE(NULLIF(deleted_state, ''), CASE WHEN is_demo THEN 'DEMO' ELSE 'LICENSED' END),
+                                  deleted_at = NULL, deleted_state = NULL
+                            WHERE id = $1 AND deleted_at IS NOT NULL RETURNING state`, [id]))[0];
+    if (!back) return { error: 'No such company — a deleted company is erased ' + DELETED_KEEP_DAYS + ' days after it was deleted.' };
+    forgetCompanies(id);
+    try { wakeCompany(id, null); } catch (e) { /* they find out at their next call */ }
+    await logEvent(null, 'ADMIN_COMPANY_UNDELETE', { id, name: co.name, state: back.state });
+    return { ok: true, name: co.name, state: back.state,
+      warning: co.name + ' is back as it was (' + String(back.state).toLowerCase() + '). Its computers and phones work again at their next check.' };
+
+  } else if (action === 'rekey') {
+    /* 4.72.0 (audit 96) — A NEW LICENCE KEY. A key that a leaver knows used to add a computer to the plant for
+       ever: nothing could change it. Now the owner issues a new one. The old key stops adding computers and phones
+       at once (licence.js activate: an unknown key); every computer and phone already on the company keeps
+       working, because none of them sends the key again (they re-join with their device id and device key). A
+       company that registered itself also joins with its id and passcode: 'passcode' sets a new one. The key is
+       answered here, once, for the owner to pass on; the event log keeps only its first part. */
+    const co = (await q(`SELECT id, name, licence_key FROM companies WHERE id = $1`, [id]))[0];
+    if (!co) return { error: 'No such company.' };
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const key = newLicenceKey();
+      try {
+        const rows = await q(`UPDATE companies SET licence_key = $2 WHERE id = $1 RETURNING id`, [id, key]);
+        if (!rows.length) return { error: 'No such company.' };
+        await logEvent(null, 'ADMIN_COMPANY_REKEY', { id, name: co.name, was: maskKey(co.licence_key), now: maskKey(key) });
+        return { ok: true, name: co.name, key,
+          warning: 'The new licence key for ' + co.name + ' is ' + key + '. The old key no longer adds a computer or a phone; ' +
+            'every computer and phone already on the company keeps working, with nothing to type. Give the new key only to whoever adds the next one.' };
+      } catch (e) {
+        if (!/unique|duplicate/i.test(String(e && e.message))) throw e;
+      }
+    }
+    return { error: 'Could not allocate a new licence key. Try again.' };
+
+  } else if (action === 'masterHistory') {
+    /* 4.72.0 (audit 3, C12) — the earlier copies kept of this company's masters (sync.js keepHistory), newest
+       first, without their bodies; masterId narrows it to one master */
+    const masterId = body.masterId == null ? '' : String(body.masterId).trim();
+    return { ok: true, history: await masterHistory(id, masterId || null) };
+
+  } else if (action === 'restoreMaster') {
+    /* 4.72.0 (C12) — {id, historyId}: one kept copy written back with a fresh seq; every computer and phone of
+       the company takes it at its next sync, and the copy it replaces is kept in turn (sync.js restoreMaster) */
+    if (!(parseInt(body.historyId, 10) > 0)) return { error: 'Which earlier copy? (historyId)' };
+    return restoreMaster(id, body.historyId);
 
   } else if (action === 'note') {
     await q(`UPDATE companies SET notes = $2 WHERE id = $1`, [id, String(body.notes || '')]);
+    /* 4.72.0 (audit 39) — logged: its length, never its words (a note may name a person) */
+    await logEvent(null, 'ADMIN_COMPANY_NOTE', { id, chars: String(body.notes || '').length });
 
   } else {
     return { error: 'Unknown action: ' + action };
@@ -567,6 +797,18 @@ export async function licenceAction(body) {
   const action = String(body.action || '');
   const days = Math.max(1, Math.min(3650, parseInt(body.days, 10) || 7));
   if (!deviceId) return { error: 'deviceId is required' };
+
+  /* 4.72.0 review (audit 40) — A MACHINE OF A DELETED COMPANY IS LEFT AS IT IS, exactly as companyAction leaves
+     the company: 'licence' or 'extend' would have changed the deleted company's state and expiry (its machines
+     then heard a working licence at their heartbeat while every other call was refused, and Restore put back
+     the old state but kept the new expiry), and 'delete' would have erased a machine Restore promises to give
+     back. The console no longer lists these machines; a stale list (the phone console's) is refused here. */
+  const gone = (await q(`SELECT c.name, c.deleted_at FROM licences l JOIN companies c ON c.id = l.company_id
+                          WHERE l.device_id = $1 AND c.deleted_at IS NOT NULL`, [deviceId]))[0];
+  if (gone) {
+    return { error: 'This machine belongs to ' + gone.name + ', which is deleted. Restore the company first (Companies → Deleted) — it can be restored until ' +
+      istDate(purgeDayOf(gone.deleted_at)) + '.' };
+  }
 
   /* 4.0.0 — THE CLOCK MOVED TO THE COMPANY. These two actions used to
      write the device's own expires_at, which describe() no longer reads
@@ -648,6 +890,8 @@ export async function licenceAction(body) {
 
   } else if (action === 'note') {
     await q(`UPDATE licences SET notes = $2 WHERE device_id = $1`, [deviceId, String(body.notes || '')]);
+    /* 4.72.0 (audit 39) — logged: its length, never its words */
+    await logEvent(deviceId, 'ADMIN_LICENCE_NOTE', { chars: String(body.notes || '').length });
   } else {
     return { error: 'Unknown action: ' + action };
   }
@@ -664,18 +908,138 @@ export async function saveSettings(body) {
   if (body.sessionMinutes !== undefined) pairs.push(['session_minutes', String(Math.min(720, Math.max(5, parseInt(body.sessionMinutes, 10) || 30)))]);
   /* 4.48.0 — which features each plan carries. */
   if (body.planFeatures !== undefined) pairs.push(['plan_features', JSON.stringify(cleanPlanFeatures(body.planFeatures))]);
+  /* 4.72.0 (audit 39) — what the settings were, so the log can say what changed */
+  const before = await getSettings();
   for (const [k, v] of pairs) {
     await q(`INSERT INTO settings (key, value) VALUES ($1,$2)
              ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`, [k, v]);
   }
   forgetSettings();
-  return { ok: true, settings: await getSettings() };
+  const after = await getSettings();
+  /* 4.72.0 (audit 39) — EVERY CHANGE TO THE SERVICE'S SETTINGS IS LOGGED, before and after: the demo length,
+     what happens when a licence ends (READONLY / HARDSTOP), sign-ups, anonymous demos, the working window, and
+     each plan feature switched on or off. Nothing is logged when nothing changed. */
+  const was = {}, now = {};
+  ['trialDays', 'expiredMode', 'signupsOpen', 'demoSignup', 'demoGraceDays', 'sessionMinutes'].forEach((k) => {
+    if (before[k] !== after[k]) { was[k] = before[k]; now[k] = after[k]; }
+  });
+  const features = [];
+  const pb = before.planFeatures || {}, pa = after.planFeatures || {};
+  Object.keys(Object.assign({}, pb, pa)).forEach((plan) => {
+    const fb = pb[plan] || {}, fa = pa[plan] || {};
+    Object.keys(Object.assign({}, fb, fa)).forEach((f) => {
+      if (!!fb[f] !== !!fa[f]) features.push(plan + '.' + f + ': ' + (fb[f] ? 'on' : 'off') + ' → ' + (fa[f] ? 'on' : 'off'));
+    });
+  });
+  if (Object.keys(now).length || features.length) {
+    await logEvent(null, 'ADMIN_SETTINGS', Object.assign({ before: was, after: now }, features.length ? { features } : {}));
+  }
+  return { ok: true, settings: after };
 }
 
-export async function recentEvents(deviceId) {
-  return q(`SELECT at, event, detail FROM activation_log
+/** The event log, newest first. `deviceId` — one installation's; opts.admin — 4.72.0 (audit 39): only what was
+ *  done FROM THE CONSOLE (every ADMIN_ event, and anything else logged during a console call, which carries
+ *  detail.via) — the console's Activity list; opts.limit — up to 500 (100 when not given). */
+export async function recentEvents(deviceId, opts) {
+  const o = opts || {};
+  const limit = Math.max(1, Math.min(500, parseInt(o.limit, 10) || 100));
+  return q(`SELECT at, event, device_id, detail FROM activation_log
              WHERE ($1::text IS NULL OR device_id = $1)
-             ORDER BY at DESC LIMIT 100`, [deviceId || null]);
+               AND ($2::bool IS NOT TRUE OR left(event, 6) = 'ADMIN_' OR (detail -> 'via') IS NOT NULL)
+             ORDER BY at DESC, id DESC LIMIT ${limit}`, [deviceId || null, o.admin === true]);
+}
+
+/* ---- 4.72.0 (audit 87) — HOW FULL THE DATABASE IS -------------------------
+   Supabase's free plan stops writing at 500 MB, and every save in every plant
+   would then fail at once. Nothing watched it. This is the console's view: the
+   database's size against that limit (a warning from 80 %), and each table's
+   size with its exact row count, largest first. Asked for only when the
+   Service settings tab is opened, never by the background checks. */
+export const DB_LIMIT_BYTES = 500 * 1024 * 1024;
+export const DB_WARN_SHARE = 0.8;
+export async function dbStatus() {
+  const top = (await q(`SELECT pg_database_size(current_database())::bigint AS bytes, now() AS at`))[0];
+  const tables = await q(`SELECT c.relname AS name, pg_total_relation_size(c.oid)::bigint AS bytes
+                            FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                           WHERE n.nspname = current_schema() AND c.relkind IN ('r', 'p')
+                           ORDER BY pg_total_relation_size(c.oid) DESC, c.relname
+                           LIMIT 25`);
+  /* exact counts, in one statement; a table name is only ever one the catalogue gave, and only plain ones */
+  const plain = tables.filter((t) => /^[a-z_][a-z0-9_]*$/.test(t.name));
+  const counts = plain.length
+    ? (await q('SELECT ' + plain.map((t, i) => '(SELECT COUNT(*) FROM "' + t.name + '")::bigint AS c' + i).join(', ')))[0]
+    : {};
+  const bytes = Number(top && top.bytes) || 0;
+  const share = bytes / DB_LIMIT_BYTES;
+  return {
+    at: top && top.at, bytes, limitBytes: DB_LIMIT_BYTES,
+    usedPct: Math.round(share * 1000) / 10, warnPct: DB_WARN_SHARE * 100, warn: share >= DB_WARN_SHARE,
+    tables: tables.map((t) => {
+      const i = plain.indexOf(t);
+      return { name: t.name, bytes: Number(t.bytes) || 0, rows: i >= 0 ? Number(counts['c' + i]) || 0 : null };
+    })
+  };
+}
+
+/* ---- 4.72.0 (audit 40, 89) — A DELETED COMPANY IS ERASED AFTER 30 DAYS -------
+   Everything that belongs to it goes, in one statement, so it is all or
+   nothing: its machines, people, synced records and the earlier copies of its
+   masters, its ink models and their history, its company chat, its problem
+   reports and its Nexora AI day counts; an enquiry that led to it is kept (it
+   is Nexora's own lead) but no longer points at it. The company row is locked
+   first and must still be due — one put back a moment ago is left alone. Run
+   at most every six hours, from /health and the console (index.js); never on a
+   company the console can still restore. */
+const PURGE_SQL = `
+  WITH due AS (SELECT id FROM companies
+                WHERE id = $1 AND deleted_at IS NOT NULL AND deleted_at < now() - make_interval(days => $2::int)
+                FOR UPDATE),
+       l  AS (DELETE FROM licences          WHERE company_id IN (SELECT id FROM due) RETURNING 1),
+       u  AS (DELETE FROM company_users     WHERE company_id IN (SELECT id FROM due) RETURNING 1),
+       s  AS (DELETE FROM sync_records      WHERE company_id IN (SELECT id FROM due) RETURNING 1),
+       h  AS (DELETE FROM sync_history      WHERE company_id IN (SELECT id FROM due) RETURNING 1),
+       i  AS (DELETE FROM ink_models        WHERE company_id IN (SELECT id FROM due) RETURNING 1),
+       ih AS (DELETE FROM ink_model_history WHERE company_id IN (SELECT id FROM due) RETURNING 1),
+       ch AS (DELETE FROM chat_messages     WHERE company_id IN (SELECT id FROM due) RETURNING 1),
+       fb AS (DELETE FROM feedback          WHERE company_id IN (SELECT id FROM due) RETURNING 1),
+       ai AS (DELETE FROM ai_usage          WHERE company_id IN (SELECT id::text FROM due) RETURNING 1),
+       iq AS (UPDATE inquiries SET company_id = NULL WHERE company_id IN (SELECT id FROM due) RETURNING 1),
+       co AS (DELETE FROM companies         WHERE id IN (SELECT id FROM due) RETURNING 1)
+  SELECT (SELECT COUNT(*) FROM co)::int AS companies, (SELECT COUNT(*) FROM l)::int AS installations,
+         (SELECT COUNT(*) FROM u)::int AS users, (SELECT COUNT(*) FROM s)::int AS records,
+         (SELECT COUNT(*) FROM h)::int AS "masterHistory", (SELECT COUNT(*) FROM i)::int AS "inkModels",
+         (SELECT COUNT(*) FROM ih)::int AS "inkHistory", (SELECT COUNT(*) FROM ch)::int AS chats,
+         (SELECT COUNT(*) FROM fb)::int AS reports, (SELECT COUNT(*) FROM ai)::int AS "aiDays",
+         (SELECT COUNT(*) FROM iq)::int AS "enquiriesUnlinked"`;
+export async function purgeArchived() {
+  const due = await q(`SELECT id, name FROM companies
+                        WHERE deleted_at IS NOT NULL AND deleted_at < now() - make_interval(days => $1::int)
+                        ORDER BY deleted_at LIMIT 20`, [DELETED_KEEP_DAYS]);
+  const purged = [];
+  if (!due.length) return { purged };
+  await ensureInkSchema();   /* ink_models / ink_model_history exist before they are named */
+  for (const c of due) {
+    const r = (await q(PURGE_SQL, [c.id, DELETED_KEEP_DAYS]))[0];
+    if (r && r.companies) {
+      const erased = Object.assign({}, r); delete erased.companies;
+      await logEvent(null, 'ADMIN_COMPANY_PURGE', { id: Number(c.id), name: c.name, erased });
+      purged.push({ id: Number(c.id), name: c.name, erased });
+    }
+  }
+  return { purged };
+}
+const PURGE_EVERY_MS = 6 * 60 * 60 * 1000;
+let purgeLast = 0, purgeRunning = null;
+/** Starts purgeArchived when it has not run for six hours; never waits for it and never fails the caller. */
+export function purgeArchivedSoon() {
+  if (purgeRunning || Date.now() - purgeLast < PURGE_EVERY_MS) return;
+  purgeLast = Date.now();
+  purgeRunning = purgeArchived()
+    .catch((e) => {
+      purgeLast = Date.now() - PURGE_EVERY_MS + 10 * 60 * 1000;   /* tried again in ten minutes, not on every call */
+      console.error('[nexora] erasing deleted companies did not finish: ' + String((e && e.message) || e).replace(/"[^"]*"|'[^']*'/g, '"…"').slice(0, 200));
+    })
+    .finally(() => { purgeRunning = null; });
 }
 
 /* ------------------------------------------------------------------ */
@@ -938,21 +1302,23 @@ button.primary{background:linear-gradient(120deg,#0A66E0,#1EA0FF);border-color:t
         <span class="mode-mark mode-sun">\u2600</span><span class="mode-mark mode-moon">\u263e</span>
         <span class="mode-knob">\u2600</span></button>
       <button id="refreshBtn" onclick="refreshNow()">Refresh</button><span class="sub" id="refreshed" style="align-self:center"></span>
-      <button onclick="showSec('settings')">Service settings</button>
+      <button data-sec="settings" onclick="showSec(this.dataset.sec)">Service settings</button>
       <button onclick="signOut()" title="Forget the key in this browser tab">Sign out</button>
     </div>
     <!-- 4.48.1 — TABS. "make tab in console its look still tricky": one
          section on screen at a time, the counts on the tabs, the last tab
          remembered in this browser. -->
     <nav class="jump tabs" id="jump">
-      <button class="tab" data-sec="sec-companies" onclick="showSec('sec-companies')">Companies <b id="jump-co">–</b></button>
-      <button class="tab" data-sec="sec-plans" onclick="showSec('sec-plans')">Plans</button>
-      <button class="tab" data-sec="sec-inquiries" onclick="showSec('sec-inquiries')">Enquiries <b id="jump-q">–</b></button>
-      <button class="tab" data-sec="sec-feedback" onclick="showSec('sec-feedback')">Feedback &amp; problems <b id="jump-fb">–</b></button>
-      <button class="tab" data-sec="sec-broadcast" onclick="showSec('sec-broadcast')">Message plants</button>
-      <button class="tab" data-sec="sec-installations" onclick="showSec('sec-installations')">Installations <b id="jump-inst">–</b></button>
-      <button class="tab" data-sec="appcard" onclick="showSec('appcard')">Phone app</button>
-      <button class="tab" data-sec="settings" onclick="showSec('settings')">Service settings</button>
+      <!-- 4.72.0 — each tab hands its section over in data-sec (no onclick carries a quoted string) -->
+      <button class="tab" data-sec="sec-companies" onclick="showSec(this.dataset.sec)">Companies <b id="jump-co">–</b></button>
+      <button class="tab" data-sec="sec-plans" onclick="showSec(this.dataset.sec)">Plans</button>
+      <button class="tab" data-sec="sec-inquiries" onclick="showSec(this.dataset.sec)">Enquiries <b id="jump-q">–</b></button>
+      <button class="tab" data-sec="sec-feedback" onclick="showSec(this.dataset.sec)">Feedback &amp; problems <b id="jump-fb">–</b></button>
+      <button class="tab" data-sec="sec-broadcast" onclick="showSec(this.dataset.sec)">Message plants</button>
+      <button class="tab" data-sec="sec-installations" onclick="showSec(this.dataset.sec)">Installations <b id="jump-inst">–</b></button>
+      <button class="tab" data-sec="appcard" onclick="showSec(this.dataset.sec)">Phone app</button>
+      <button class="tab" data-sec="sec-activity" onclick="showSec(this.dataset.sec)">Activity</button>
+      <button class="tab" data-sec="settings" onclick="showSec(this.dataset.sec)">Service settings</button>
     </nav>
 
     <div class="card" id="settings" style="display:none">
@@ -967,6 +1333,24 @@ button.primary{background:linear-gradient(120deg,#0A66E0,#1EA0FF);border-color:t
         <button class="primary" onclick="saveSettings()">Save settings</button>
       </div>
       <p class="help"><b>Accept new registrations</b> is how a plant that downloads Nexora starts: company, GSTIN, email, mobile, a company id and passcode. <b>Anonymous demos</b> is the old way &mdash; a licence key left blank creates a company from whatever name is typed, with nothing to tell a real plant from a made-up one; leave it off unless you are demonstrating on a prospect&rsquo;s machine yourself. A demo with 0 offline days stops the moment it cannot reach this service. The working window is only how long a good answer is reused before the application asks again. Offline days for a paying customer are set on the company.</p>
+      <!-- 4.72.0 (audit 9, 97) — the console key's length, and the computers and phones still without a device key -->
+      <div id="keycard" style="margin-top:12px"></div>
+      <!-- 4.72.0 (audit 87) — how full the free database is -->
+      <h2 style="margin-top:16px">Database <span class="sub" style="font-weight:400">— Supabase free plan: 500 MB, then every save in every plant fails</span></h2>
+      <div id="dbcard"><p class="help">Reading…</p></div>
+    </div>
+
+    <!-- 4.72.0 (audit 39) — WHAT WAS DONE FROM THE CONSOLES, read-only: every
+         console action, with when and from which console and address, and every
+         wrong key. -->
+    <div class="card" id="sec-activity">
+      <div class="top" style="margin-bottom:6px">
+        <h2 class="grow">Activity <span class="sub" style="font-weight:400">— what was done from this console and the phone console, newest first</span></h2>
+        <button onclick="loadActivity()">Refresh</button>
+      </div>
+      <div style="overflow-x:auto"><table id="acttbl">
+        <thead><tr><th>When</th><th>What</th><th>Details</th><th>From</th></tr></thead><tbody></tbody></table></div>
+      <p class="help">Read-only: nothing here can be changed or removed. <b>From</b> is the console (web or phone) and the address it called from; a wrong key is listed with the address it came from, never with what was typed. PINs, passcodes and licence keys are never written here — a new licence key appears only as its first part.</p>
     </div>
 
     <!-- 4.48.0 — "give this plan wise access things in console so i can
@@ -1001,15 +1385,17 @@ button.primary{background:linear-gradient(120deg,#0A66E0,#1EA0FF);border-color:t
           <button class="primary" onclick="createCo()">Create licensed company</button>
           <button data-target="newco" onclick="toggle(this)">Cancel</button>
         </div>
-        <p class="help">For a customer you set up yourself. A licence key is generated; every machine they install types the same key and takes one seat. A plant that registers itself from the application appears here on its own, as a demo.</p>
+        <p class="help">For a customer you set up yourself. A licence key is generated; every computer they install types the same key (the first is let in at once, each one after it waits for the company&rsquo;s administrator). Seats are the people who sign in. A plant that registers itself from the application appears here on its own, as a demo.</p>
       </div>
+      <!-- 4.72.0 (audit 90, 40) — all, the paying licences that end within 30 days, and the deleted ones (restorable for 30 days) -->
+      <div id="cofilters" class="acts" style="margin:8px 0"></div>
       <div id="coMsg"></div>
       <div id="colist"></div>
       <div class="legend">
         <div><b>Plan</b>is Standard (calculation and costing) or Pro (everything ticked under Plans); seats are set separately. A demo has everything until it is made licensed.</div>
         <div><b>Suspend</b>stops every machine of the company at its next check. Nothing is deleted; Restore puts it all back. Use it when a customer has not paid.</div>
         <div><b>Revoke</b>(on one installation) stops that one machine. It frees no seat — seats are people, and a machine never held one. The company keeps running.</div>
-        <div><b>Delete</b>removes the company, its machines, its people and everything they synced. It cannot be undone from here — the name must be typed to confirm.</div>
+        <div><b>Delete</b>stops the company at once and keeps it for 30 days with everything it had — <b>Restore</b> under <i>Deleted</i> puts it back exactly as it was. After 30 days it is erased for good: its machines, its people, everything they synced, its chat and its problem reports. The name must be typed to confirm.</div>
         <div><b>Transactions and hours</b>are what the company has used — saved records, and time in the application — summed over its machines. A limit of 0 means none.</div>
       </div>
     </div>
@@ -1034,7 +1420,7 @@ button.primary{background:linear-gradient(120deg,#0A66E0,#1EA0FF);border-color:t
           <label style="flex:1">What changed<input id="rNotes" placeholder="Shown on the phone before it installs" style="width:100%"></label>
         </div>
         <div class="row" style="margin-top:10px">
-          <label>SHA-256 <span class="hint">optional</span><input id="rSha" placeholder="checked before installing" style="min-width:260px"></label>
+          <label>SHA-256 <span class="hint">required &mdash; the phone checks the download against it</span><input id="rSha" placeholder="64 characters: certutil -hashfile the.apk SHA256" style="min-width:260px"></label>
           <label style="flex-direction:row;align-items:center;gap:8px;color:var(--text)"><input id="rMust" type="checkbox">Must install</label>
           <button class="primary" onclick="publishRelease()">Publish</button>
         </div>
@@ -1141,7 +1527,7 @@ button.primary{background:linear-gradient(120deg,#0A66E0,#1EA0FF);border-color:t
       </div>
       <div style="overflow-x:auto"><table id="tbl">
         <thead><tr><th>Company · machine</th><th>State</th><th>Email</th><th>Days left</th><th>Started</th><th>Last seen</th><th>Version</th><th>Transactions</th><th>Hours</th><th></th></tr></thead><tbody></tbody></table></div>
-      <p class="help">The clock belongs to the company, not the machine. Machines take no seat — revoke one to stop that computer, suspend the company to stop all of them. Seats are the people, under Manage &rarr; People.</p>
+      <p class="help">The clock belongs to the company, not the machine. Machines take no seat — revoke one to stop that computer, suspend the company to stop all of them. Seats are the people, under Manage &rarr; People. <b>no device key yet</b> marks a computer or phone that has not handed its own key over (it does at its next heartbeat on 4.71.0 / Nexora Mobile 1.0.0 or later); the count is under Service settings.</p>
     </div>
   </div>
 </div>
@@ -1170,6 +1556,11 @@ function flipMode(){setMode(document.documentElement.getAttribute('data-theme')=
   document.documentElement.setAttribute('data-theme',m);
 })();
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+/* 4.72.0 (audit 41) — a mail link is built from the address with every character
+   that means something in a link (? & # = , and spaces) encoded, so an address
+   typed as "x@y.com?bcc=someone" cannot add a hidden copy to the owner's reply.
+   The @ is left as it is. The address SHOWN is still esc() of what was stored. */
+function mailHref(e){return 'mailto:'+encodeURIComponent(String(e==null?'':e).trim()).replace(/%40/g,'@');}
 function fmt(d){return d?new Date(d).toLocaleDateString(undefined,{day:'2-digit',month:'short',year:'2-digit'}):'—'}
 /* 4.58.1 — a DATE is not enough for "when did they last sign in": a
    sign-in at nine and one at four read the same all day. The time, and
@@ -1225,6 +1616,7 @@ async function load(){
     document.getElementById('sOpen').checked=!!s.signupsOpen;
     document.getElementById('sDemo').checked=!!s.demoSignup;
     renderPlans();
+    renderKeyNote();
     showSec(currentSec());
     renderCompanies();
     /* and the open company's people are read again with everything else */
@@ -1288,9 +1680,23 @@ function renderCompanies(){
   renderCompanyList();
   if(keptPeople&&!/Reading/.test(keptPeople)){const h=document.getElementById('users-'+OPEN);if(h)h.innerHTML=keptPeople;}
 }
+/* 4.72.0 (audit 90, 40) — WHICH COMPANIES: all of them, the paying licences
+   that end within 30 days (the plants to ring about renewing), or the ones
+   Delete has archived, which can be restored for 30 days. */
+let COVIEW='all';
+function coView(v){COVIEW=(v==='ending'||v==='deleted')?v:'all';renderCompanies();}
 function renderCompanyList(){
   const term=(document.getElementById('cq').value||'').toLowerCase();
-  const cos=(DATA.companies||[]).filter(c=>!term||[c.name,c.licence_key,c.email,c.gstin,c.login_id,c.phone].some(v=>String(v||'').toLowerCase().includes(term)));
+  const allCos=DATA.companies||[], arch=DATA.archived||[];
+  const nEnd=allCos.filter(c=>c.ending_soon).length;
+  const fl=document.getElementById('cofilters');
+  if(fl)fl.innerHTML=
+    '<button class="small'+(COVIEW==='all'?' primary':'')+'" data-view="all" onclick="coView(this.dataset.view)">All '+allCos.length+'</button>'+
+    '<button class="small'+(COVIEW==='ending'?' primary':'')+'" data-view="ending" onclick="coView(this.dataset.view)" title="Paying licences that end within 30 days — ring them to renew">Ending in 30 days '+nEnd+'</button>'+
+    '<button class="small'+(COVIEW==='deleted'?' primary':'')+'" data-view="deleted" onclick="coView(this.dataset.view)" title="Deleted companies are kept for 30 days and can be restored until then">Deleted '+arch.length+'</button>';
+  if(COVIEW==='deleted'){document.getElementById('colist').innerHTML=archivedHtml(arch,term);return;}
+  const cos=allCos.filter(c=>(COVIEW!=='ending'||c.ending_soon)&&(!term||[c.name,c.licence_key,c.email,c.gstin,c.login_id,c.phone].some(v=>String(v||'').toLowerCase().includes(term))));
+  if(COVIEW==='ending'&&!cos.length){document.getElementById('colist').innerHTML='<p class="help">No paying licence ends within the next 30 days.</p>';return;}
   document.getElementById('colist').innerHTML=cos.map(c=>{
     const state=(c.expired&&c.state!=='SUSPENDED')?'EXPIRED':c.state;
     const used=c.seats_used, seats=c.seats, pct=Math.min(100,Math.round(used/Math.max(1,seats)*100));
@@ -1332,7 +1738,8 @@ function renderCompanyList(){
            lapse, three of 365 is next year's conversation. */
         '<div class="fact"><span>'+(c.is_demo?'Demo started':'Licence started')+'</span><b>'+fmt(c.period_started_at)+'</b>'+
           '<small>'+(c.period_days?c.period_days+'-day '+(c.is_demo?'demo':'licence'):'\u2014')+'</small></div>'+
-        '<div class="fact"><span>'+(state==='EXPIRED'?'Ended':state==='SUSPENDED'?'Suspended · ends':'Days left')+'</span><b>'+(state==='EXPIRED'||state==='SUSPENDED'?fmt(c.expires_at):(c.days_left===0?'today':c.days_left))+'</b>'+(state==='EXPIRED'||state==='SUSPENDED'?'':'<small>'+fmt(c.expires_at)+'</small>')+'</div>'+
+        /* 4.72.0 (audit 90) — a paying licence ending within 30 days says so, in the warning colour */
+        '<div class="fact"'+(c.ending_soon?' style="border-color:var(--warn)" title="Ends within 30 days — ring them to renew"':'')+'><span>'+(state==='EXPIRED'?'Ended':state==='SUSPENDED'?'Suspended · ends':'Days left')+'</span><b'+(c.ending_soon?' style="color:var(--warn)"':'')+'>'+(state==='EXPIRED'||state==='SUSPENDED'?fmt(c.expires_at):(c.days_left===0?'today':c.days_left))+'</b>'+(state==='EXPIRED'||state==='SUSPENDED'?'':'<small>'+fmt(c.expires_at)+(c.ending_soon?' · <b style="color:var(--warn);display:inline;font-size:inherit">renew soon</b>':'')+'</small>')+'</div>'+
         '<div class="fact"><span>Offline allowed</span><b>'+(c.grace_days>0?c.grace_days+' days':'none')+'</b>'+(c.grace_days>0?'':'<small>stops when it cannot reach the service</small>')+'</div>'+
         '<div class="fact"><span>Transactions</span>'+txnCell(c.txn_used,c.txn_limit)+'</div>'+
         '<div class="fact"><span>Nexora AI today</span><b>'+(c.ai_used_today||0)+(c.ai_daily_limit?' of '+c.ai_daily_limit:(DATA.aiDefaultDaily&&DATA.aiDefaultDaily<100000?' of '+DATA.aiDefaultDaily:''))+'</b><small>'+(c.ai_daily_limit?'a day, set for this company':(DATA.aiDefaultDaily&&DATA.aiDefaultDaily<100000?'a day, the service\u2019s own number':'no daily limit'))+'</small></div>'+
@@ -1345,11 +1752,20 @@ function renderCompanyList(){
           '<button data-id="'+c.id+'" data-plan="'+esc(c.plan||'PRO')+'" onclick="coPlan(this)">Plan: '+(c.plan==='STANDARD'?'Standard':'Pro')+'…</button><span class="why">Standard = calculation and costing; Pro = everything ticked under Plans. Seats are set separately.</span>'+
           '<button data-id="'+c.id+'" onclick="coDays(this)">Add days…</button>'+
           '<button data-id="'+c.id+'" data-action="extend" data-days="365" onclick="coAct(this)">+1 year</button>'+
+          /* 4.72.0 (audit 96) — a key somebody who left still knows */
+          '<button data-id="'+c.id+'" data-name="'+esc(c.name)+'" onclick="coRekey(this)">New licence key…</button><span class="why">the old key stops adding computers and phones; those already on keep working</span>'+
         '</div></div>'+
         '<div class="group"><h4>Machines</h4><div class="acts">'+
-          '<button data-id="'+c.id+'" data-now="'+seats+'" onclick="coSeats(this)">Seats…</button><span class="why">how many computers may run on this licence &mdash; and how many people may sign in, one per seat</span>'+
+          '<button data-id="'+c.id+'" data-now="'+seats+'" onclick="coSeats(this)">Seats…</button><span class="why">how many people may sign in, one per seat &mdash; computers and phones are not counted</span>'+
           '<button data-id="'+c.id+'" data-now="'+c.grace_days+'" onclick="coGrace(this)">Offline days…</button>'+
           '<button data-id="'+c.id+'" onclick="showInstallations(this)">Show its installations</button>'+
+          /* 4.72.0 (audit 96) — the company's computers and phones, right here */
+          '<div class="users-panel">'+machinesHtml(c)+'</div>'+
+        '</div></div>'+
+        /* 4.72.0 (audit 3, C12) — the copies its masters had before they were changed or deleted */
+        '<div class="group"><h4>Masters</h4><div class="acts">'+
+          '<button data-id="'+c.id+'" onclick="coHistory(this)">Earlier copies…</button><span class="why">materials, routes, processes, recipes and the rest as they were before a change or a delete — any one can be put back</span>'+
+          '<div id="hist-'+c.id+'" class="users-panel" style="display:none"></div>'+
         '</div></div>'+
         '<div class="group"><h4>People</h4><div class="acts">'+
           '<button data-id="'+c.id+'" data-name="'+esc(c.name)+'" onclick="coAdmin(this)">Set administrator…</button><span class="why">the person who adds everyone else from inside the application</span>'+
@@ -1373,7 +1789,7 @@ function renderCompanyList(){
           (c.state==='SUSPENDED'
             ?'<button data-id="'+c.id+'" data-action="restore" data-days="0" onclick="coAct(this)">Restore</button><span class="why">every machine runs again</span>'
             :'<button class="danger" data-id="'+c.id+'" data-action="suspend" data-days="0" onclick="coAct(this)">Suspend</button><span class="why">every machine stops at its next check; nothing is deleted</span>')+
-          '<button class="danger" data-id="'+c.id+'" data-name="'+esc(c.name)+'" onclick="coDelete(this)">Delete…</button><span class="why">removes the company and everything that belongs to it</span>'+
+          '<button class="danger" data-id="'+c.id+'" data-name="'+esc(c.name)+'" onclick="coDelete(this)">Delete…</button><span class="why">stops it now and keeps it 30 days (Restore under Deleted); then it and everything that belongs to it are erased</span>'+
         '</div></div>'+
       '</div>'+
     '</div>';
@@ -1390,6 +1806,92 @@ function manage(btn){
   }
 }
 function copyKey(btn){const k=btn.dataset.key;try{navigator.clipboard.writeText(k);say('<div class="msg ok">Copied '+esc(k)+'</div>');}catch(e){prompt('Licence key',k);}}
+/* 4.72.0 (audit 40) — the companies Delete has archived, each with Restore
+   until it is erased 30 days after it was deleted. */
+function archivedHtml(arch,term){
+  const rows=arch.filter(c=>!term||[c.name,c.email,c.gstin,c.login_id,c.phone].some(v=>String(v||'').toLowerCase().includes(term)));
+  if(!rows.length)return '<p class="help">No deleted companies. A company you delete is kept here for 30 days and can be restored until then; after that it is erased for good.</p>';
+  return '<p class="help">A deleted company is kept for 30 days with everything it had, but its computers and phones are stopped and nobody can sign in. <b>Restore</b> puts it back exactly as it was. After 30 days it is erased for good — its machines, people, synced records, chat and problem reports.</p>'+
+    rows.map(c=>'<div class="co suspended"><div class="co-head"><div class="grow" style="flex:1">'+
+      '<span class="co-name">'+esc(c.name)+'</span> <span class="pill s-SUSPENDED">deleted</span>'+
+      '<div class="co-meta"><span>Deleted '+esc(fmtTime(c.deleted_at))+'</span>'+
+        '<span>Erased on <b>'+esc(fmt(c.purge_at))+'</b> ('+(+c.days_to_purge||0)+' day(s) left to restore)</span>'+
+        '<span>'+(+c.machines||0)+' computer(s) and phone(s) · '+(+c.people||0)+' people · '+(+c.records||0)+' synced record(s)</span>'+
+        (c.gstin?'<span>GSTIN <code>'+esc(c.gstin)+'</code></span>':'')+(c.email?'<span><code>'+esc(c.email)+'</code></span>':'')+'</div></div>'+
+      '<div><button class="primary" data-id="'+c.id+'" data-name="'+esc(c.name)+'" onclick="coUndelete(this)">Restore</button></div>'+
+    '</div></div>').join('');
+}
+async function coUndelete(btn){
+  if(!confirm('Restore '+btn.dataset.name+'?\\n\\nIt comes back exactly as it was when it was deleted: its computers and phones work again at their next check, and nobody has to join or sign in again.'))return;
+  const r=await api('/admin/api/company',{method:'POST',body:JSON.stringify({id:+btn.dataset.id,action:'undelete'})});
+  if(r.error){say('<div class="msg err">'+esc(r.error)+'</div>');return;}
+  COVIEW='all';
+  await load();
+  say('<div class="msg ok">'+esc(r.warning||'Restored.')+'</div>');
+}
+/* 4.72.0 (audit 96) — a new licence key, when somebody who knew the old one has left */
+async function coRekey(btn){
+  if(!confirm('Issue a NEW licence key for '+btn.dataset.name+'?\\n\\nThe old key stops adding computers and phones at once. Every computer and phone already on the company keeps working — nothing to type there. Use it when somebody who knew the key has left.'))return;
+  const r=await api('/admin/api/company',{method:'POST',body:JSON.stringify({id:+btn.dataset.id,action:'rekey'})});
+  if(r.error){say('<div class="msg err">'+esc(r.error)+'</div>');return;}
+  await load();
+  say('<div class="msg ok">New licence key for <b>'+esc(r.name)+'</b>: <span class="key">'+esc(r.key)+'</span> — give it only to whoever adds the next computer or phone. It is also on the company&rsquo;s card.</div>');
+}
+/* 4.72.0 (audit 96) — the company's computers and phones, inside Manage: which
+   are waiting for approval, which hold no device key yet, who is signed in. */
+function machinesHtml(c){
+  const ms=(DATA.licences||[]).filter(l=>+l.company_id===+c.id);
+  if(!ms.length)return '<p class="help">No computer or phone has joined this company yet.</p>';
+  return '<table class="users"><thead><tr><th>Computer / phone</th><th>State</th><th>Signed in</th><th>Last seen</th><th></th></tr></thead><tbody>'+
+    ms.map(l=>{
+      const phone=l.platform==='mobile', gone=l.state==='REVOKED', waiting=!l.approved_at&&!gone;
+      return '<tr'+(gone?' class="off"':'')+'><td><b>'+esc(l.device_name||(phone?'phone':'computer'))+'</b> <code>'+(phone?'phone':(l.seat_no?'computer '+l.seat_no:'computer'))+'</code><br><code>'+esc(String(l.device_id).slice(0,12))+'…</code></td>'+
+        '<td>'+(gone?'<span class="pill s-REVOKED">withdrawn</span>':waiting?'<span class="pill s-EXPIRED">waiting for approval</span>':'<span class="pill s-LICENSED">approved</span>')+
+          (!gone&&l.key_held===false?'<br><span class="why">no device key yet</span>':'')+'</td>'+
+        '<td>'+(l.on_user?esc(l.on_user):'<span class="why">nobody</span>')+'</td>'+
+        '<td class="why">'+esc(fmtTime(l.last_seen_at))+(l.app_version?'<br>'+esc(l.app_version):'')+'</td>'+
+        '<td><div class="acts">'+
+          (waiting?'<button class="small primary" data-device="'+esc(l.device_id)+'" data-action="approve" onclick="act(this)">Approve</button>':'')+
+          (gone?'<button class="small" data-device="'+esc(l.device_id)+'" data-action="restore" onclick="act(this)">Restore</button>'
+               :'<button class="small danger" data-device="'+esc(l.device_id)+'" data-action="revoke" onclick="act(this)">Revoke</button>')+
+        '</div></td></tr>';
+    }).join('')+'</tbody></table>';
+}
+/* 4.72.0 (audit 3, C12) — the copies a company's masters had before somebody
+   changed or deleted them (the last 20 of each), and putting one back. */
+const MASTER_NAMES={'nexora.rm.master.v1':'Materials (RM master)','nexora.rm.price.v1':'RM prices','nexora.rm.group.v1':'RM groups','nexora.rm.seeded.v1':'RM starter list',
+  'nexora.route.master.v1':'Routes','nexora.routes.seeded.v1':'Route starter list','nexora.process.master.v1':'Processes','nexora.process.recipe.v1':'Process recipes',
+  'nexora.resource.master.v1':'Resources','nexora.material.state.v1':'Material states','nexora.bom.recipe.v1':'BOM recipes','nexora.bom.basis.v1':'BOM basis',
+  'nexora.bom.linemap.v1':'BOM line map','nexora.bom.workflow.v1':'BOM workflows','nexora.constants.v1':'Constants','nexora.constants.custom.v1':'Own constants',
+  'nexora.constants.links.v1':'Constant links','nexora.structures.v1':'Structures','nexora.org.v1':'Company details','nexora.table.columns.v1':'Table columns',
+  'nexora.resource.types.v1':'Resource types','nexora.master.owner.v1':'Who made what','nexora.docseries.v1':'Document number series','nexora.units.v1':'Units',
+  'nexora.meshunit.v1':'Mesh unit','nexora.quote.terms.v1':'Quotation terms','nexora.mkt.sources.v1':'Marketing sources','nexora.mkt.targets.v1':'Marketing targets',
+  'nexora.ai.wrote.v1':'Nexora AI lessons','nexora.ai.rules.v1':'Nexora AI rules'};
+function howWord(h){return h==='delete'?'deleted':h==='restore'?'put back from the console':'changed';}
+function kbText(n){n=+n||0;return n<1024?n+' bytes':(n<1048576?(n/1024).toFixed(1)+' KB':(n/1048576).toFixed(1)+' MB');}
+async function coHistory(btn){
+  const cid=+btn.dataset.id;const host=document.getElementById('hist-'+cid);if(!host)return;
+  host.style.display='';host.innerHTML='<p class="help">Reading…</p>';
+  const r=await api('/admin/api/company',{method:'POST',body:JSON.stringify({id:cid,action:'masterHistory'})});
+  if(r.error){host.innerHTML='<div class="msg err">'+esc(r.error)+'</div>';return;}
+  const h=r.history||[];
+  host.innerHTML='<p class="help">The copy each master had before somebody changed or deleted it — the last 20 of each, newest first. <b>Put back</b> makes that copy the company&rsquo;s again: every computer and phone takes it at its next sync, and the copy it replaces is kept here in turn, so a put-back can itself be undone.</p>'+
+    (h.length?'<table class="users"><thead><tr><th>Master</th><th>This copy was saved</th><th>Then</th><th>Size</th><th></th></tr></thead><tbody>'+
+      h.map(x=>'<tr><td><b>'+esc(MASTER_NAMES[x.id]||x.id)+'</b><br><code>'+esc(x.id)+'</code></td>'+
+        '<td>'+esc(fmtTime(x.savedAt))+(x.savedBy?'<br><span class="why">by '+esc(x.savedBy)+'</span>':'')+'</td>'+
+        '<td>'+esc(howWord(x.how))+' '+esc(fmtTime(x.replacedAt))+(x.replacedBy?'<br><span class="why">by '+esc(x.replacedBy)+'</span>':'')+'</td>'+
+        '<td>'+(x.items!=null?esc(String(x.items))+' item(s)<br>':'')+'<span class="why">'+esc(kbText(x.size))+'</span></td>'+
+        '<td><button class="small" data-id="'+cid+'" data-hid="'+(+x.historyId)+'" data-name="'+esc(MASTER_NAMES[x.id]||x.id)+'" data-when="'+esc(fmtTime(x.savedAt))+'" onclick="coRestoreMaster(this)">Put back…</button></td></tr>').join('')+
+      '</tbody></table>'
+     :'<p class="help">Nothing is kept yet: a copy is kept the first time a master is changed or deleted (from 4.72.0 on).</p>');
+}
+async function coRestoreMaster(btn){
+  if(!confirm('Put back '+btn.dataset.name+' as it was saved on '+btn.dataset.when+'?\\n\\nEvery computer and phone of the company takes this copy at its next sync. The copy it replaces is kept, so this can be undone the same way.'))return;
+  const r=await api('/admin/api/company',{method:'POST',body:JSON.stringify({id:+btn.dataset.id,action:'restoreMaster',historyId:+btn.dataset.hid})});
+  if(r.error){say('<div class="msg err">'+esc(r.error)+'</div>');return;}
+  say('<div class="msg ok">'+esc(r.warning||'Put back.')+'</div>');
+  await coHistory({dataset:{id:btn.dataset.id}});
+}
 async function coAct(btn){
   const id=+btn.dataset.id,action=btn.dataset.action,days=+btn.dataset.days||0;
   if(action==='suspend'&&!confirm('Suspend this company?\\n\\nEVERY machine on this licence stops calculating at its next check. Nothing is deleted; Restore puts it back.'))return;
@@ -1406,13 +1908,79 @@ async function coDays(btn){
   btn.dataset.action='extend';btn.dataset.days=String(days);await coAct(btn);
 }
 /* ---------- the tabs (4.48.1) ---------- */
-const SECS=['sec-companies','sec-plans','sec-inquiries','sec-feedback','sec-broadcast','sec-installations','appcard','settings'];
+const SECS=['sec-companies','sec-plans','sec-inquiries','sec-feedback','sec-broadcast','sec-installations','appcard','sec-activity','settings'];
 function showSec(id){
   if(SECS.indexOf(id)<0)id='sec-companies';
   SECS.forEach(s=>{const n=document.getElementById(s);if(!n)return;n.classList.add('sec');n.classList.toggle('on',s===id);if(s===id)n.style.display='';});
   document.querySelectorAll('#jump .tab').forEach(t=>t.classList.toggle('active',t.dataset.sec===id));
   try{sessionStorage.setItem('nexora_admin_tab',id);}catch(e){}
   window.scrollTo({top:0});
+  /* 4.72.0 — these two are read when they are opened, never in the background */
+  if(id==='settings')loadDb();
+  if(id==='sec-activity')loadActivity();
+}
+/* 4.72.0 (audit 9, 97) — the console key's length, and the computers and
+   phones that have not handed their device key over yet. */
+function renderKeyNote(){
+  const n=document.getElementById('keycard');if(!n)return;
+  const k=DATA.keyless||{devices:0,required:false};
+  const n0=+k.devices||0;
+  n.innerHTML=(DATA.adminKeyShort?'<div class="msg warn">The console key (NEXORA_ADMIN_KEY on Render) is shorter than 32 characters. Set a long random one there; this page then asks for the new key.</div>':'')+
+    '<p class="help"><b>Device keys.</b> '+(n0
+      ? '<b style="color:var(--warn)">'+n0+'</b> computer(s) and phone(s) in use hold no device key yet. Each hands its own key over at its next heartbeat once it runs Nexora 4.71.0 / Nexora Mobile 1.0.0 or later. '+
+        (k.required?'NEXORA_DEVICE_KEY_REQUIRED is set: one of these that has also lost its token must be removed and join again.'
+                   :'When this reaches 0, set <code>NEXORA_DEVICE_KEY_REQUIRED=1</code> on Render — a device id alone can then no longer re-join as that device.')
+      : 'Every computer and phone in use holds its device key. '+(k.required?'NEXORA_DEVICE_KEY_REQUIRED is set.'
+                   :'Set <code>NEXORA_DEVICE_KEY_REQUIRED=1</code> on Render now — a device id alone can then no longer re-join as that device.'))+'</p>';
+}
+/* 4.72.0 (audit 87) — how full the database is, against the free plan's 500 MB */
+async function loadDb(){
+  const host=document.getElementById('dbcard');if(!host)return;
+  let r;
+  try{r=await api('/admin/api/db');}catch(e){host.innerHTML='<div class="msg err">'+esc(e.message)+'</div>';return;}
+  if(r.error){host.innerHTML='<div class="msg err">'+esc(r.message||r.error)+'</div>';return;}
+  const mb=b=>((+b||0)/1048576).toFixed((+b||0)<10485760?1:0)+' MB';
+  const pct=Math.min(100,+r.usedPct||0);
+  const col=r.warn?'var(--bad)':(pct>=60?'var(--warn)':'var(--ok)');
+  host.innerHTML='<p style="margin:6px 0"><b>'+esc(mb(r.bytes))+'</b> of '+esc(mb(r.limitBytes))+' used ('+esc(String(r.usedPct))+' %)</p>'+
+    '<span class="bar'+(r.warn?' full':'')+'"><i style="width:'+pct+'%;background:'+col+'"></i></span>'+
+    (r.warn?'<div class="msg err">The database is over '+esc(String(r.warnPct))+' % of the free 500 MB. At 500 MB Supabase stops every save in every plant — move to the paid plan, or clear what is not needed, before then.</div>'
+           :'<p class="help">A warning shows here from '+esc(String(r.warnPct))+' %.</p>')+
+    '<div style="overflow-x:auto;margin-top:8px"><table><thead><tr><th>Table</th><th>Size</th><th>Rows</th></tr></thead><tbody>'+
+    (r.tables||[]).map(t=>'<tr><td><code>'+esc(t.name)+'</code></td><td>'+esc(mb(t.bytes))+'</td><td>'+(t.rows==null?'—':esc(String(t.rows)))+'</td></tr>').join('')+
+    '</tbody></table></div>';
+}
+/* 4.72.0 (audit 39) — what was done from the consoles, read-only */
+const ACT_WORDS={ADMIN_COMPANY_CREATE:'Company created',ADMIN_COMPANY_EXTEND:'Licence extended',ADMIN_COMPANY_LICENCE:'Made licensed',ADMIN_COMPANY_SEATS:'Seats changed',
+  ADMIN_COMPANY_PLAN:'Plan changed',ADMIN_COMPANY_GRACE:'Offline days changed',ADMIN_COMPANY_SUSPEND:'Suspended',ADMIN_COMPANY_RESTORE:'Suspension lifted',
+  ADMIN_COMPANY_RENAME:'Renamed',ADMIN_COMPANY_GSTIN:'GSTIN changed',ADMIN_COMPANY_AILIMIT:'Nexora AI limit changed',ADMIN_COMPANY_TXNLIMIT:'Transaction limit changed',
+  ADMIN_COMPANY_RESETUSAGE:'Usage reset',ADMIN_COMPANY_PASSCODE:'Company passcode set',ADMIN_COMPANY_ADMINUSER:'Administrator set',
+  ADMIN_COMPANY_DELETE:'Company deleted (kept 30 days)',ADMIN_COMPANY_UNDELETE:'Deleted company restored',ADMIN_COMPANY_PURGE:'Deleted company erased',
+  ADMIN_COMPANY_REKEY:'New licence key',ADMIN_COMPANY_NOTE:'Company note',ADMIN_USER_CREATE:'Person added',ADMIN_USER_EMAIL:'Email changed',
+  ADMIN_USER_ROLE:'Role changed',ADMIN_USER_PIN:'PIN set',ADMIN_USER_DELETE:'Person removed',ADMIN_USER_SIGNOUT:'Signed out',
+  ADMIN_LICENCE:'Licensed (from a machine)',ADMIN_EXTEND:'Extended (from a machine)',ADMIN_RESETUSAGE:'Machine usage reset',ADMIN_PHONE_APPROVE:'Phone approved',
+  ADMIN_PC_APPROVE:'Computer approved',ADMIN_REVOKE:'Machine revoked',ADMIN_RESTORE:'Machine restored',ADMIN_INSTALL_DELETE:'Installation deleted',
+  ADMIN_LICENCE_NOTE:'Machine note',ADMIN_SETTINGS:'Service settings changed',ADMIN_KEY_WRONG:'Wrong console key',ADMIN_KEY_LOCKED:'Address shut out (5 wrong keys)',
+  ADMIN_KEY_LOCKED_ALL:'Console shut for everybody (50 wrong keys)',ADMIN_APP_PUBLISH:'Phone app published',ADMIN_APP_SOURCE:'Phone app source set',
+  ADMIN_APP_WITHDRAW:'Phone app withdrawn',MASTER_RESTORED:'Master put back',USER_SIGNED_OUT_EVERYWHERE:'Signed out everywhere',
+  BROADCAST:'Message to every plant',BROADCAST_WITHDRAW:'Message withdrawn'};
+async function loadActivity(){
+  const tb=document.querySelector('#acttbl tbody');if(!tb)return;
+  let r;
+  try{r=await api('/admin/api/events?admin=1&limit=300');}catch(e){tb.innerHTML='<tr><td colspan="4"><div class="msg err">'+esc(e.message)+'</div></td></tr>';return;}
+  const names={};(DATA.companies||[]).concat(DATA.archived||[]).forEach(c=>{names[c.id]=c.name;});
+  tb.innerHTML=(r.events||[]).map(x=>{
+    const d=(x.detail&&typeof x.detail==='object')?x.detail:{};
+    const via=d.via&&typeof d.via==='object'?d.via:null;
+    const co=d.companyId||(String(x.event).indexOf('ADMIN_COMPANY_')===0?d.id:null);
+    const rest=Object.keys(d).filter(k=>k!=='via').map(k=>k+': '+(d[k]!==null&&typeof d[k]==='object'?JSON.stringify(d[k]):String(d[k]))).join(' · ');
+    return '<tr><td class="why">'+esc(fmtTime(x.at))+'</td>'+
+      '<td><b>'+esc(ACT_WORDS[x.event]||x.event)+'</b><br><code>'+esc(x.event)+'</code></td>'+
+      '<td>'+(co&&names[co]?'<b>'+esc(names[co])+'</b><br>':'')+(x.device_id?'<code>'+esc(String(x.device_id).slice(0,12))+'…</code> ':'')+'<span class="why">'+esc(rest.slice(0,400))+'</span></td>'+
+      '<td'+(via&&via.ua?' title="'+esc(via.ua)+'"':(d.ua?' title="'+esc(d.ua)+'"':''))+'>'+
+        (via?esc(via.app==='android'?'phone console':'web console')+'<br><code>'+esc(via.ip||'')+'</code>'
+            :(d.ip?'<code>'+esc(d.ip)+'</code>':'<span class="why">the service</span>'))+'</td></tr>';
+  }).join('')||'<tr><td colspan="4" class="help">Nothing yet.</td></tr>';
 }
 function currentSec(){try{return sessionStorage.getItem('nexora_admin_tab')||'sec-companies';}catch(e){return 'sec-companies';}}
 /* ---------- plans (4.48.0) ---------- */
@@ -1450,7 +2018,7 @@ async function coPlan(btn){
   await load();
 }
 async function coSeats(btn){
-  const v=prompt('How many machines may run on this licence?',btn.dataset.now);
+  const v=prompt('How many people (seats) may this company have?\\n\\nOne seat is one person who signs in. Computers and phones are not counted.',btn.dataset.now);
   if(v===null)return;
   const r=await api('/admin/api/company',{method:'POST',body:JSON.stringify({id:+btn.dataset.id,action:'seats',seats:+v})});
   if(r.error){say('<div class="msg err">'+esc(r.error)+'</div>');return;}
@@ -1585,7 +2153,7 @@ async function uRole(btn){
   const word=to==='ADMIN'?'an ADMINISTRATOR':'an ordinary user';
   if(!confirm('Make '+btn.dataset.name+' '+word+'?\\n\\n'+(to==='ADMIN'
     ?'They will be able to add and remove people from inside the application, and see everyone\u2019s work.'
-    :'They will no longer be able to add or remove anybody.')))return;
+    :'They will no longer be able to add or remove anybody, and they are signed out everywhere so the change holds at once.')))return;
   const cid=+btn.dataset.cid;
   const r=await api('/admin/api/company',{method:'POST',body:JSON.stringify({id:cid,action:'userrole',userId:+btn.dataset.uid,role:to})});
   if(r.error){say('<div class="msg err">'+esc(r.error)+'</div>');return;}
@@ -1610,11 +2178,14 @@ async function uEmail(btn){
 }
 async function uPin(btn){
   const cid=+btn.dataset.cid;
-  const pin=prompt('New PIN for '+btn.dataset.name+' (at least 4 characters).\\n\\nThe old one cannot be read back. Tell them this one directly.');
+  const pin=prompt('New PIN for '+btn.dataset.name+' (at least 4 characters).\\n\\nSetting it signs them out everywhere they are signed in. The old one cannot be read back. Tell them this one directly.');
   if(pin===null)return;
   const r=await api('/admin/api/company',{method:'POST',body:JSON.stringify({id:cid,action:'userpin',userId:+btn.dataset.uid,pin})});
   if(r.error){say('<div class="msg err">'+esc(r.error)+'</div>');return;}
   say('<div class="msg ok">'+esc(r.warning||'Done.')+'</div>');
+  /* 4.72.0 (audit 38) — they are signed out: the list shows it */
+  document.getElementById('users-'+cid).innerHTML='';
+  await coUsers({dataset:{id:cid}});
 }
 /* 4.43.0 — the button beside somebody who is signed in. Only needed
    when the machine they are on will never close tidily — stolen, wiped,
@@ -1632,7 +2203,7 @@ async function uSignOut(btn){
 }
 async function uDel(btn){
   const cid=+btn.dataset.cid;
-  if(!confirm('Remove '+btn.dataset.name+' from this company?\\n\\nTheir seat is freed. Everything they saved stays with the company.'))return;
+  if(!confirm('Remove '+btn.dataset.name+' from this company?\\n\\nThey are signed out everywhere and their seat is freed. Everything they saved stays with the company.'))return;
   const r=await api('/admin/api/company',{method:'POST',body:JSON.stringify({id:cid,action:'userdel',userId:+btn.dataset.uid})});
   if(r.error){say('<div class="msg err">'+esc(r.error)+'</div>');return;}
   say('<div class="msg ok">'+esc(r.warning||'Removed.')+'</div>');
@@ -1666,13 +2237,14 @@ async function coAdmin(btn){
 }
 async function coDelete(btn){
   const name=btn.dataset.name;
-  const typed=prompt('Delete '+name+'?\\n\\nThis removes the company, its machines, its people and everything they synced. It cannot be undone from here.\\n\\nType the company name exactly to confirm:');
+  /* 4.72.0 (audit 40) — Delete archives for 30 days; the prompt and the answer say so */
+  const typed=prompt('Delete '+name+'?\\n\\nIts computers and phones stop at their next check and nobody can sign in. It is kept for 30 days: Restore (Companies → Deleted) puts it back exactly as it was. After 30 days the company, its machines, its people, everything they synced, its chat and its problem reports are erased for good.\\n\\nType the company name exactly to confirm:');
   if(typed===null)return;
   const r=await api('/admin/api/company',{method:'POST',body:JSON.stringify({id:+btn.dataset.id,action:'delete',confirmName:typed})});
   if(r.error){say('<div class="msg err">'+esc(r.error)+'</div>');return;}
   const x=r.removed||{};
-  say('<div class="msg ok">Deleted <b>'+esc(r.name)+'</b> — '+(x.installations||0)+' installation(s), '+(x.users||0)+' user(s), '+(x.records||0)+' synced record(s), '+(x.inkModels||0)+' ink model(s).</div>');
   OPEN=null;await load();
+  say('<div class="msg ok">'+(r.warning?esc(r.warning):'Deleted <b>'+esc(r.name)+'</b>.')+' <span class="why">('+(x.installations||0)+' installation(s), '+(x.users||0)+' user(s), '+(x.records||0)+' synced record(s), '+(x.inkModels||0)+' ink model(s) are kept until then.)</span></div>');
 }
 async function gstVerify(btn){
   const r=await api('/admin/api/gst',{method:'POST',body:JSON.stringify({action:'gstverify',id:+btn.dataset.id})});
@@ -1861,7 +2433,7 @@ function renderInquiries(){
     const due=q.followUp&&String(q.followUp).slice(0,10)<=today&&q.state!=='WON'&&q.state!=='LOST';
     const reach=[];
     if(q.phone)reach.push('<a href="tel:'+esc(q.phone)+'"><code>'+esc(q.phone)+'</code></a>');
-    if(q.email)reach.push('<a href="mailto:'+esc(q.email)+'"><code>'+esc(q.email)+'</code></a>');
+    if(q.email)reach.push('<a href="'+esc(mailHref(q.email))+'"><code>'+esc(q.email)+'</code></a>');
     return '<tr>'+
       '<td><b>'+esc(q.name)+'</b>'+(q.company?'<br><span class="why">'+esc(q.company)+'</span>':'')+'</td>'+
       '<td>'+esc(q.product||'—')+'</td>'+
@@ -2038,7 +2610,7 @@ function renderFeedback(){
   document.querySelector('#fbtbl tbody').innerHTML=rows.map(f=>{
     const reach=[];
     if(f.phone)reach.push('<a href="tel:'+esc(f.phone)+'"><code>'+esc(f.phone)+'</code></a>');
-    if(f.email)reach.push('<a href="mailto:'+esc(f.email)+'"><code>'+esc(f.email)+'</code></a>');
+    if(f.email)reach.push('<a href="'+esc(mailHref(f.email))+'"><code>'+esc(f.email)+'</code></a>');
     return '<tr>'+
       '<td><span class="pill s-'+(f.kind==='BUG'?'REVOKED':'LICENSED')+'">'+(f.kind==='BUG'?'problem':'feedback')+'</span><br><span class="why">'+fmt(f.createdAt)+'</span></td>'+
       '<td><b>'+esc(f.coName||f.company||'\u2014')+'</b>'+((f.name||f.userName)?'<br>'+esc(f.name||f.userName):'')+(reach.length?'<br>'+reach.join('<br>'):'')+'</td>'+
@@ -2080,11 +2652,25 @@ async function fbShot(btn){
   btn.disabled=true;btn.textContent='Loading\u2026';
   try{
     const r=await api('/admin/api/feedback/shot?id='+(+btn.dataset.id));
-    if(r.error||!r.shot){fbsay('<div class="msg err">'+esc(r.error||'No picture on that report.')+'</div>');return;}
+    const shot=(r&&typeof r.shot==='string')?r.shot:'';
+    if(r.error||!shot){fbsay('<div class="msg err">'+esc(r.error||'No picture on that report.')+'</div>');return;}
+    /* 4.72.0 (audit 42) \u2014 only a picture is ever shown: the window is built
+       piece by piece (never written as text, so nothing in the value can become
+       markup), it cannot reach back to this page (opener cut), and the picture
+       is set only when the value is a data: image. */
+    if(shot.indexOf('data:image/')!==0){fbsay('<div class="msg err">That report&rsquo;s picture is not one this console can show.</div>');return;}
     const w=window.open('','_blank');
     if(!w){fbsay('<div class="msg warn">The browser blocked the window \u2014 allow pop-ups for this page.</div>');return;}
-    w.document.write('<!doctype html><title>Report #'+(+btn.dataset.id)+'</title><body style="margin:0;background:#12141c;display:flex;align-items:flex-start;justify-content:center"><img src="'+r.shot+'" style="max-width:100%;height:auto"></body>');
-    w.document.close();
+    try{w.opener=null;}catch(e){}
+    const d=w.document;
+    d.title='Report #'+(+btn.dataset.id);
+    const body=d.body||(d.documentElement||d.appendChild(d.createElement('html'))).appendChild(d.createElement('body'));
+    body.style.cssText='margin:0;background:#12141c;display:flex;align-items:flex-start;justify-content:center';
+    const img=d.createElement('img');
+    img.alt='Report #'+(+btn.dataset.id);
+    img.style.cssText='max-width:100%;height:auto';
+    img.src=shot;
+    body.appendChild(img);
   }catch(e){
     fbsay('<div class="msg err">'+esc(e.message||'Could not fetch the picture.')+'</div>');
   }finally{btn.disabled=false;btn.textContent='View';}
@@ -2118,7 +2704,9 @@ function render(){
         (l.on_user
           ? '<br><span class="pill s-LICENSED">'+esc(l.on_user)+' is signed in</span>'
           : '<br><span class="why">nobody signed in — this machine shows its sign-in screen</span>')+
-        '<br><code>'+esc(String(l.device_id).slice(0,12))+'…</code>'+(l.device_name?' <code>'+esc(l.device_name)+'</code>':'')+'</td>'+
+        '<br><code>'+esc(String(l.device_id).slice(0,12))+'…</code>'+(l.device_name?' <code>'+esc(l.device_name)+'</code>':'')+
+        /* 4.72.0 (audit 97) — not handed its own device key over yet */
+        (l.key_held===false&&l.state!=='REVOKED'?' <code title="Hands its key over at its next heartbeat on Nexora 4.71.0 / Nexora Mobile 1.0.0 or later">no device key yet</code>':'')+'</td>'+
       '<td><span class="pill s-'+state+'">'+state.toLowerCase()+'</span></td>'+
       '<td>'+esc(l.email||'—')+'</td>'+
       '<td>'+(state==='EXPIRED'||state==='REVOKED'?'—':(l.days_left===0?'today':l.days_left))+'</td>'+
@@ -2138,7 +2726,7 @@ function render(){
   }).join('')||'<tr><td colspan="10" class="help">Nothing here yet.</td></tr>';
 }
 async function delInstall(btn){
-  if(!confirm('Delete the installation "'+btn.dataset.name+'"?\\n\\nThe row is removed altogether. If the machine is still in use it frees its seat and can activate again — use Revoke to stop a machine, and this to tidy away one that is finished with.'))return;
+  if(!confirm('Delete the installation "'+btn.dataset.name+'"?\\n\\nThe row is removed altogether. If the machine is still in use it can join again (and waits for its company’s approval) — use Revoke to stop a machine, and this to tidy away one that is finished with.'))return;
   const r=await api('/admin/api/licence',{method:'POST',body:JSON.stringify({deviceId:btn.dataset.device,action:'delete'})});
   if(r.error){say('<div class="msg err">'+esc(r.error)+'</div>');return;}
   say('<div class="msg ok">Installation deleted'+(r.orphan?' — it belonged to no company.':'.')+'</div>');
@@ -2146,7 +2734,7 @@ async function delInstall(btn){
 }
 async function act(btn){
   const deviceId=btn.dataset.device,action=btn.dataset.action;
-  if(action==='revoke'&&!confirm('Revoke this installation?\\n\\nIt stops calculating at its next check, and its seat is freed for another machine. The company keeps running.'))return;
+  if(action==='revoke'&&!confirm('Revoke this installation?\\n\\nIt stops at its next check, and only this console can restore it. It frees no seat — seats are people. The company keeps running.'))return;
   if(action==='resetusage'&&!confirm('Start this machine\\'s transaction count and hours again from zero? Nothing saved is touched.'))return;
   const r=await api('/admin/api/licence',{method:'POST',body:JSON.stringify({deviceId,action,days:0})});
   if(r.error){say('<div class="msg err">'+esc(r.error)+'</div>');return;}

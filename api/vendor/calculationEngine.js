@@ -268,6 +268,21 @@
       errors.push('GUSSET is required and must be greater than 0.');
     }
 
+    /* 4.72.0 (audit #71) — a valve bag's two patches are cut from PATCH less the patch allowance, so a valve bag
+       with no PATCH, or one no wider than the allowance, has patches of no size or of less than none. That used to
+       weigh the bag about a quarter light, with a NEGATIVE top patch hidden in the weight and no error. PATCH is
+       required on a valve bag now, as WIDTH is. Validation only: no formula moves, and a bag with a real patch
+       weighs exactly what it did. (A PATCH that is not a number, or negative, is already said above.) */
+    const PATCH_ALLOW_REQ = KD_('PATCH SIZE ALLOWANCE', 5);
+    const patchTyped = input.PATCH;
+    const patchUnreadable = isNotBlank(patchTyped) && !(Number.isFinite(Number(patchTyped)) && Number(patchTyped) >= 0);
+    const valvePatchMissing = has('PATCH') && has('VALVE') && isNotBlank(VALVE) && VALVE > 0 && !patchUnreadable &&
+      (isBlank(PATCH) || PATCH <= PATCH_ALLOW_REQ);
+    if (valvePatchMissing) {
+      errors.push('PATCH is required on a valve bag and must be more than the patch allowance (' + PATCH_ALLOW_REQ +
+        ' mm) — both patches are cut from it.');
+    }
+
     /* 4.59.0 — "500mm width and 100mm gusset will cover 400mm zipper
        because 100 will be collaps inside gusset". A gusset as wide as the
        bag leaves nothing for the zipper to run across. */
@@ -644,6 +659,31 @@
       { name: 'Zipper', weight: ZC3 },
       { name: 'Pinch easy-open strip', weight: PEOC3 }
     ].filter((c) => c.weight && c.weight > 0.0001);
+
+    /* 4.72.0 (audit #71) — a part that works out at less than nothing is a size that cannot be cut (a patch
+       narrower than its allowance, a patch wider than the bag). The list above leaves such a part out, but RESULT
+       WEIGHT would still take it away from the bag — so it is an error, said by name, instead of a lighter bag.
+       The patches are not named twice when the missing PATCH above already explains them. */
+    [
+      { name: 'Body', area: MBC2, weight: MBC3 },
+      { name: 'Top patch', area: TPC2, weight: TPC3, patch: true },
+      { name: 'Bottom patch', area: BPC2, weight: BPC3, patch: true },
+      { name: 'Valve', area: VC2, weight: VC3 },
+      { name: 'Handle', area: HC2, weight: HC3 },
+      { name: 'Yarn / thread', weight: YC3 },
+      { name: 'Liner', weight: LNR_WT },
+      { name: 'Backseam granules', weight: BSC3 },
+      { name: 'Easy-open tapes', weight: PCTPC3 },
+      { name: 'Zipper', weight: ZC3 },
+      { name: 'Pinch easy-open strip', weight: PEOC3 }
+    ].forEach((c) => {
+      if (c.patch && valvePatchMissing) return;
+      const w = Number(c.weight), a = Number(c.area);
+      if ((Number.isFinite(w) && w < -1e-9) || (Number.isFinite(a) && a < -1e-6)) {
+        errors.push(c.name + ' works out below zero' + (Number.isFinite(w) && w < -1e-9 ? ' (' + w.toFixed(3) + ' g)' : '') +
+          ' — its size is less than nothing. Check PATCH, VALVE and WIDTH against the allowances.');
+      }
+    });
 
     const totalForPct = components.reduce((s, c) => s + c.weight, 0) || 1;
     components.forEach((c) => { c.percent = (c.weight / totalForPct) * 100; });

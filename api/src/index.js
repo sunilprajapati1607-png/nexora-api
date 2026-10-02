@@ -12,10 +12,11 @@
  * may do. That is the difference between a trial you can move the PC's
  * date past and one you cannot.
  */
-import { ensureSchema, q, dbAlive } from './db.js';
-import { activate, authorise, touch, issueToken, reportUsage, companyUsage, describe, tokenSecretOk, MISCONFIGURED } from './licence.js';
+import { ensureSchema, q, dbAlive, consoleCall } from './db.js';
+import { activate, authorise, touch, issueToken, reportUsage, companyUsage, describe, tokenSecretOk, MISCONFIGURED, handOverDeviceKey, forgetCompanies } from './licence.js';
 import { runBom, missingRates } from './engine.js';
-import { adminGate, listLicences, licenceAction, companyAction, saveSettings, recentEvents, ADMIN_HTML } from './admin.js';
+import { adminGate, listLicences, licenceAction, companyAction, saveSettings, recentEvents, ADMIN_HTML,
+  consoleCaller, dbStatus, purgeArchivedSoon } from './admin.js';
 import { login, listUsers, userAction, pull, push, describeUser, userCap, setCompanyPasscode, releaseSession, maxSeq, listDevices, deviceAction, canSeeCost, PRICE_MASTER } from './sync.js';
 import { waitFor, wakeCompany, wakeChat, endSessionOn, WAIT_MS } from './waiters.js';
 import { calcForm, calcWeigh, calcNumbers, enquiryNumber } from './weigh.js';
@@ -23,7 +24,7 @@ import { quoteForm, quoteSheet } from './quoteSheet.js';
 import { checkBom as aiCheckBom, planRoute as aiPlanRoute, fillCalc as aiFillCalc, editBom as aiEditBom, quoteLetter as aiQuoteLetter, help as aiHelp, chat as aiChat, assist as aiAssist, speak as aiSpeak, pickLang, aiStatus, withKey as aiWithKey, checkKey as aiCheckKey } from './ai.js';
 import { companyAi, keyInfo as aiKeyInfo, setKey as aiSetKey, clearKey as aiClearKey, canKeep as aiCanKeep } from './aikey.js';
 import { send as chatSend, since as chatSince, remove as chatRemove, clearBy as chatClearBy, listBroadcasts, broadcastAction } from './chat.js';
-import { ensureInkSchema, getModel, listModels, train as inkTrain, estimate as inkEstimate, reset as inkReset } from './inkstore.js';
+import { ensureInkSchema, getModel, listModels, train as inkTrain, estimate as inkEstimate, reset as inkReset, restore as inkRestore } from './inkstore.js';
 import { register, gstAction, remoteIp } from './register.js';
 import { listInquiries, inquiryAction, publicInquiry } from './inquiry.js';
 import { listFeedback, feedbackShot, feedbackAction, publicFeedback, MAX_SHOT } from './feedback.js';
@@ -31,20 +32,121 @@ import { latestRelease, listReleases, releaseAction } from './appupdate.js';
 import { logoResponse } from './brand.js';
 import { customerCheck, sourcesOf } from './marketing.js';
 
-const CORS = {
+/* exported for server.js, whose early answers (a body over its limit) carry the same headers */
+export const CORS = {
   'access-control-allow-origin': '*',
   'access-control-allow-headers': 'authorization, content-type, x-admin-key',
   'access-control-allow-methods': 'GET, POST, OPTIONS'
 };
 
-function json(body, status) {
+/* 4.72.0 (audit 42) — WHAT EVERY JSON ANSWER SAYS ABOUT ITSELF (/health
+   included): it is JSON and nothing else (nosniff), it is never shown inside
+   another site's frame, a browser that opens it as a page runs nothing and
+   loads nothing from it, and no address is passed on from it. None of this
+   changes what the application, the phone, the website or the consoles
+   read: they fetch these answers, and a page's rules apply only to a page. */
+export const API_HEADERS = {
+  'x-content-type-options': 'nosniff',
+  'x-frame-options': 'DENY',
+  'referrer-policy': 'no-referrer',
+  'content-security-policy': "default-src 'none'; frame-ancestors 'none'"
+};
+
+function json(body, status, noCors) {
   return new Response(JSON.stringify(body), {
     status: status || 200,
     /* 4.58.1 — no-store. A figure in the console is "now" or it is wrong;
        without this a browser or a proxy is free to hand back the answer it
-       got last time, and Refresh appears to do nothing. */
-    headers: Object.assign({ 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' }, CORS)
+       got last time, and Refresh appears to do nothing.
+       4.72.0 (audit 42) — and API_HEADERS: an answer is JSON and is never read as anything else. */
+    headers: Object.assign({ 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' }, API_HEADERS, noCors ? {} : CORS)
   });
+}
+/* 4.72.0 (audit 9, 35) — THE CONSOLE'S ROUTES ANSWER WITHOUT CORS. The web console
+   is served from this same address and the phone console is an app, so neither
+   needs another site to be allowed in; with 'access-control-allow-origin: *' and
+   x-admin-key allowed, any web page a visitor opened could send console calls
+   from that visitor's browser — guessing the key from thousands of addresses at
+   once, past the per-address lock. Without it a browser refuses to send them.
+   Every other route (the application, the phone, the website) keeps CORS. */
+const isAdminPath = (p) => p === '/admin' || p.indexOf('/admin/') === 0;
+function adminJson(body, status) { return json(body, status, true); }
+
+/* 4.72.0 (audit 42) — THE CONSOLE PAGE'S OWN RULES. The page holds the admin
+   key, so the browser is told what it may do: run only its own scripts and
+   styles (inline ones, which the page is made of — its buttons use
+   onclick), talk only to this service, show only its own pictures and the
+   data: screenshots of problem reports, never be put inside another site's
+   frame, never send a form anywhere, and send no address on when a link is
+   followed. Nothing on the page loads from anywhere else, so nothing it
+   does is refused. */
+export const ADMIN_PAGE_HEADERS = {
+  'content-type': 'text/html; charset=utf-8',
+  'cache-control': 'no-store, must-revalidate',
+  'content-security-policy': "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; " +
+    "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; form-action 'none'; base-uri 'none'; object-src 'none'",
+  'x-frame-options': 'DENY',
+  'referrer-policy': 'no-referrer',
+  'x-content-type-options': 'nosniff'
+};
+
+/* 4.72.0 (audit 83) — WHAT A FAILURE LEAVES IN RENDER'S LOG. Until now a
+   request that failed was answered SERVER_ERROR and nothing was written
+   anywhere, so the log held no trace of what broke. One line now: the
+   route (method and path, never the query or the body), the error's code
+   and name, its message with anything in quotes taken out (a database error
+   can quote a value it was sent), and the first few places in the code.
+   Never a header, a token, a key or a body. */
+export function logFailure(where, e) {
+  try {
+    const code = String((e && (e.code || e.name)) || 'Error').slice(0, 40);
+    const msg = String((e && e.message) || e || '').replace(/"[^"]*"|'[^']*'|`[^`]*`/g, '"…"').replace(/\s+/g, ' ').slice(0, 240);
+    const at = String((e && e.stack) || '').split('\n').slice(1, 5).map((s) => s.trim()).filter(Boolean).join(' | ');
+    console.error('[nexora] ' + String(where || '').slice(0, 120) + ' failed: ' + code + ' — ' + msg + (at ? ' @ ' + at : ''));
+  } catch (x) { /* logging never fails a request */ }
+}
+
+/* 4.72.0 (C11, audit 43) — THE PHONE CONSOLE'S QUARTER-HOURLY LOOK. It used
+   to pull the whole licence listing (every company, every machine, every
+   person) to find out whether anything was new. This is the same question
+   in one statement of five counts: how many companies and installations
+   there are, and how many enquiries, problem reports and self-registrations
+   came in since `since` (an ISO time; the last 24 hours when it is missing
+   or not a time; a time still to come counts from now).
+   One clock: `at` is the DATABASE's now, taken in the same statement as the
+   counts (the moment they were counted at, not this process's clock, which
+   is another machine's), and an item counts when it came in strictly AFTER
+   `since` — so the phone, sending this `at` back as its next `since`,
+   never counts one item twice. `at` is cut to the millisecond downwards: an
+   item in that last part-millisecond is counted again rather than missed.
+   4.72.0 (audit 40) — a company the console deleted (archived for 30 days) is
+   counted nowhere, and neither are its installations, exactly as the listing
+   leaves them out. */
+export async function adminSummary(sinceParam) {
+  let since = sinceParam ? new Date(String(sinceParam)) : null;
+  if (since && isNaN(since.getTime())) since = null;
+  const r = (await q(
+    `WITH t AS (SELECT now() AS at,
+                       CASE WHEN $1::text IS NULL THEN now() - interval '24 hours'
+                            ELSE LEAST($1::timestamptz, now()) END AS since)
+     SELECT FLOOR(EXTRACT(EPOCH FROM t.at) * 1000)::bigint AS at_ms,
+            FLOOR(EXTRACT(EPOCH FROM t.since) * 1000)::bigint AS since_ms,
+            (SELECT COUNT(*)::int FROM companies WHERE deleted_at IS NULL) AS companies,
+            (SELECT COUNT(*)::int FROM licences l LEFT JOIN companies c ON c.id = l.company_id WHERE c.deleted_at IS NULL) AS licences,
+            (SELECT COUNT(*)::int FROM inquiries WHERE created_at > t.since) AS enquiries,
+            (SELECT COUNT(*)::int FROM feedback WHERE created_at > t.since) AS feedback,
+            (SELECT COUNT(*)::int FROM companies WHERE self_registered = true AND deleted_at IS NULL AND created_at > t.since) AS registrations
+       FROM t`,
+    [since ? since.toISOString() : null]))[0] || {};
+  return {
+    at: new Date(Number(r.at_ms)).toISOString(),
+    companies: Number(r.companies) || 0,
+    licences: Number(r.licences) || 0,
+    newEnquiries: Number(r.enquiries) || 0,
+    newFeedback: Number(r.feedback) || 0,
+    newRegistrations: Number(r.registrations) || 0,
+    since: new Date(Number(r.since_ms)).toISOString()
+  };
 }
 /* 4.67.17 — "costs and prices (Rs)": canSeeCost (sync.js since 4.71.0, where the price master is held back by the
    same rule) */
@@ -64,15 +166,31 @@ async function runAi(a, fn) {
    push is up to 200 records (a calculation with its trace is ~50 KB) and
    gets 32 MB; Nexora AI a minute of speech or a few photos (ai.js caps
    those at 8 MB) and gets 12 MB; everything else 8 MB. */
+/* 4.72.0 (audit 8, 88) — server.js now applies these BEFORE it reads a
+   byte (it imports bodyLimit), so a body over its route's limit is never
+   held in memory at all; and a route of the app that is not signed with a
+   good token gets no more than OPEN_BODY_LIMIT there, whatever its own
+   limit, because authorise() would refuse it anyway. The console's routes
+   carry a few fields (256 KB). A path that is none of these — nothing
+   takes a body there — gets 64 KB. */
 const KB = 1024, MB = 1024 * 1024;
+export const OPEN_BODY_LIMIT = 256 * KB;
 const BODY_LIMITS = { '/enquiry': 256 * KB, '/v1/register': 256 * KB, '/v1/activate': 256 * KB, '/v1/login': 256 * KB,
   '/feedback': MAX_SHOT + 256 * KB, '/v1/sync/push': 32 * MB };
-function bodyLimit(path) {
+export function bodyLimit(path) {
   if (BODY_LIMITS[path]) return BODY_LIMITS[path];
   if (path.indexOf('/v1/ai/') === 0) return 12 * MB;
-  return 8 * MB;
+  if (path.indexOf('/v1/') === 0) return 8 * MB;
+  if (path.indexOf('/admin/api/') === 0) return 256 * KB;
+  return 64 * KB;
+}
+/** Does this path need a good token, so that server.js may hold an unsigned body to OPEN_BODY_LIMIT? Every /v1/
+ *  route but the two that issue tokens (activate, register — already 256 KB). /feedback is open and keeps its own. */
+export function needsToken(path) {
+  return path.indexOf('/v1/') === 0 && path !== '/v1/activate' && path !== '/v1/register';
 }
 const TOO_LARGE = { error: 'TOO_LARGE', message: 'That is too much to send at once.' };
+let healthLogged = 0;
 function tooLarge() { return Object.assign(new Error('too large'), { tooLarge: true }); }
 async function readJson(request, limit) {
   const cap = limit || 8 * MB;
@@ -91,12 +209,13 @@ export default {
     const path = url.pathname.replace(/\/+$/, '') || '/';
     const method = request.method.toUpperCase();
 
-    if (method === 'OPTIONS') return new Response(null, { status: 204, headers: CORS });
+    /* 4.72.0 (audit 9, 35) — a browser asking leave to send console calls from another site is not given it */
+    if (method === 'OPTIONS') return new Response(null, { status: 204, headers: isAdminPath(path) ? {} : CORS });
     const readBody = () => readJson(request, bodyLimit(path));
 
     try {
       /* 4.71.0 (audit) — a body that says it is over the route's limit is refused before it is read */
-      if (method === 'POST' && parseInt(request.headers.get('content-length'), 10) > bodyLimit(path)) return json(TOO_LARGE, 413);
+      if (method === 'POST' && parseInt(request.headers.get('content-length'), 10) > bodyLimit(path)) return json(TOO_LARGE, 413, isAdminPath(path));
       /* 4.71.0 (audit) — no token secret, no tokens: every route that issues or reads one says so plainly
          (licence.js tokenSecretOk) instead of signing with an empty key */
       if (path.indexOf('/v1/') === 0 && !tokenSecretOk()) return json(MISCONFIGURED, 503);
@@ -114,7 +233,9 @@ export default {
         }
         /* 4.71.0 (audit) — the address Cloudflare saw, not one the sender wrote (register.js remoteIp) */
         const out = await publicFeedback(await readBody(), remoteIp(request), auth);
-        return json(out, out.ok ? 200 : (out.error === 'TOO_MANY' ? 429 : 400));
+        /* 4.72.0 — BUSY (the day's reports with no good token are used up) is 503: the desktop keeps the report and
+           sends it later; a 4xx would make it let the report go */
+        return json(out, out.ok ? 200 : (out.error === 'TOO_MANY' ? 429 : out.error === 'BUSY' ? 503 : 400));
       }
       if (path === '/health' || path === '/') {
         /* 4.71.0 (audit) — and whether the DATABASE answers: a cheap SELECT 1 with a two-second limit of its
@@ -128,6 +249,11 @@ export default {
         } catch (e) { db = false; }
         /* ai: whether Nexora AI is switched on and which model — never the key */
         const about = { service: 'nexora-api', version: '1.0.0', time: new Date().toISOString(), ai: Object.assign(aiStatus(), { ownKeys: aiCanKeep() }) };   /* 4.67.18 — ownKeys: a company's own Gemini key can be kept here (never a key) */
+        /* 4.72.0 (audit 83) — a database that does not answer is written in the log too, at most once a minute */
+        if (!db && Date.now() - healthLogged > 60000) { healthLogged = Date.now(); console.error('[nexora] /health: the database is not answering'); }
+        /* 4.72.0 (audit 40, 89) — the health check is what keeps this service awake in working hours, so it is
+           also what erases a company deleted more than 30 days ago (at most every six hours, never waited for) */
+        if (db) purgeArchivedSoon();
         return db ? json(Object.assign({ ok: true, db: 'ok' }, about)) : json(Object.assign({ ok: false, db: 'down' }, about), 503);
       }
 
@@ -146,7 +272,9 @@ export default {
       if (path === '/v1/activate' && method === 'POST') {
         await ensureSchema();
         const body = await readBody();
-        const out = await activate(body);
+        /* 4.72.0 (audit 97) — and the Authorization header, read only to see whether it carries this very device's
+           current token (licence.js provesDevice) */
+        const out = await activate(body, { authorization: request.headers.get('authorization') });
         return json(out.body, out.httpStatus);
       }
       /* 4.23.0 — a plant registers itself. Open like activate, because it
@@ -165,6 +293,14 @@ export default {
         if (!a.ok) return json(a.error, a.httpStatus);
         const body = await readBody();
         await touch(a.row.device_id, body.appVersion);
+        /* 4.72.0 (audit 97) — A ROW WITH NO DEVICE KEY YET TAKES THE ONE SENT HERE. The token this heartbeat carries
+           is proof that it is this machine, which the open /v1/activate hand-over cannot have. An app that hears
+           licence.device.keyHeld === false sends { deviceKey } with its next heartbeat; a row that holds a key, or
+           is withdrawn, is left exactly as it is (licence.js handOverDeviceKey). The licence answered says so. */
+        let licNow = a.licence;
+        if (body.deviceKey && !a.row.device_key_hash && await handOverDeviceKey(a.row, body.deviceKey)) {
+          licNow = describe(a.row, a.company, a.settings, a.usage);
+        }
 
         /* 4.3.0 — the heartbeat is where a machine reports what it has
            committed. Counts only: no calculation, material or price ever
@@ -183,13 +319,17 @@ export default {
            is re-issued WITHOUT them, so nothing further is done in their
            name even if the client ignores the notice. */
         const ended = a.superseded ? { sessionEnded: a.superseded } : null;
-        if (body.usage) {
+        /* 4.72.0 (audit 7) — counts are taken only from a machine with a person signed in on it. A token with
+           nobody on it is only a device id re-activated, and a device id is no secret: it could raise a company's
+           count until a limited licence went read-only. (licence.js also caps how far one report can raise it.)
+           A machine at its sign-in screen reports again once somebody signs in — the count is a running total. */
+        if (body.usage && a.user) {
           await reportUsage(a.row.device_id, body.usage);
           const fresh = await companyUsage(a.row.company_id || null);
           const lic = describe(a.row, a.company, a.settings, fresh);
           return json({ token: issueToken(a.row, uid), licence: lic, usage: fresh, user: describeUser(a.user), ...ended });
         }
-        return json({ token: issueToken(a.row, uid), licence: a.licence, usage: a.usage, user: describeUser(a.user), ...ended });
+        return json({ token: issueToken(a.row, uid), licence: licNow, usage: a.usage, user: describeUser(a.user), ...ended });
       }
 
       /* ---- 4.8.0 — people and company-wide sync ---------------------- */
@@ -304,9 +444,13 @@ export default {
           /* 4.29.0 — the allowance travels with the list, so the window can
              say '3 of 10' and grey Add before the service has to refuse. */
           const cap = await userCap(a.companyId);
-          return json({ users: await listUsers(a.companyId), me: describeUser(a.user), maxUsers: cap.max, count: cap.count });
+          /* 4.72.0 (audit 7) — the viewer: where a colleague is signed in (a device id) goes only to an
+             administrator and to the person themself (sync.js listUsers) */
+          return json({ users: await listUsers(a.companyId, a.user), me: describeUser(a.user), maxUsers: cap.max, count: cap.count });
         }
-        const out = await userAction(a.companyId, a.user, await readBody());
+        /* 4.72.0 (audit 38, 95) — and the machine asking, so a person changing their own PIN stays signed in on it
+           while every other place they are signed in is ended (sync.js userAction) */
+        const out = await userAction(a.companyId, a.user, await readBody(), a.row.device_id);
         return json(out.body, out.httpStatus);
       }
       /* 4.42.0 — an administrator sets a new company passcode from inside
@@ -471,7 +615,10 @@ export default {
         if (!a.ok) return json(a.error, a.httpStatus);
         if (!a.user) return json({ error: 'SIGN_IN', message: 'Sign in to use Nexora AI.' }, 401);
         const body = await readBody();
-        const out = await runAi(a, () => aiChat(a.companyId || a.row.device_id, body.chat, pickLang(body.lang)));
+        /* 4.72.0 — C14: whether this person may see costs, and the company's current price list — read (sync.js) only
+           for a phone question about rates, prices or costs from a person who may */
+        const out = await runAi(a, () => aiChat(a.companyId || a.row.device_id, body.chat, pickLang(body.lang), undefined,
+          { canCost: canSeeCost(a.user), loadRates: async () => (a.companyId ? (await import('./sync.js')).currentPriceList(a.companyId) : []) }));
         return json(out.body, out.httpStatus);
       }
       /* 4.67.3 — one Nexora AI on every window: an answer, and the steps to run */
@@ -529,25 +676,34 @@ export default {
          after WAIT_MS with nothing to say. Nothing waits on the database. */
       if (path === '/v1/sync/wait' && method === 'GET') {
         await ensureSchema();
-        const a = await authorise(request);
+        /* 4.72.0 (audit 10) — the light form: the company row may be ten seconds old and the licence's usage is not
+           counted (a wait answers neither); the device row and the person are read afresh as always */
+        const a = await authorise(request, { light: true });
         if (!a.ok) return json(a.error, a.httpStatus);
         if (!a.user) {
           if (a.superseded) return json({ sessionEnded: a.superseded });
           return json({ error: 'SIGN_IN', message: 'Sign in to synchronise.' }, 401);
         }
         const since = Math.max(0, parseInt(url.searchParams.get('since'), 10) || 0);
-        const top = await maxSeq(a.companyId);
-        if (top > since) return json({ changed: true, seq: top });
         /* Nexora Mobile: a phone also says the last chat message it holds, and is answered at once when there
            is a newer one — so nothing said between two waits is missed */
         const chatParam = url.searchParams.get('chat');
         const wantsChat = chatParam !== null && chatParam !== '';
         if (wantsChat) {
-          const c = await q(`SELECT COALESCE(MAX(id), 0) AS m FROM chat_messages WHERE company_id = $1`, [a.companyId]);
-          if (Number(c[0] && c[0].m) > (parseInt(chatParam, 10) || 0)) return json({ changed: true, chat: true });
+          /* 4.72.0 (audit 10) — the newest change and the newest message in ONE statement (they were two) */
+          const t = (await q(`SELECT (SELECT COALESCE(MAX(seq), 0) FROM sync_records WHERE company_id = $1) AS s,
+                                     (SELECT COALESCE(MAX(id), 0) FROM chat_messages WHERE company_id = $1) AS m`, [a.companyId]))[0] || {};
+          const top = Number(t.s) || 0;
+          if (top > since) return json({ changed: true, seq: top });
+          if (Number(t.m) > (parseInt(chatParam, 10) || 0)) return json({ changed: true, chat: true });
+        } else {
+          const top = await maxSeq(a.companyId);
+          if (top > since) return json({ changed: true, seq: top });
         }
         const ms = parseInt(url.searchParams.get('ms'), 10) || WAIT_MS;
-        const heard = await waitFor(a.companyId, a.user.id, a.row.device_id, ms, { chat: wantsChat });
+        /* 4.72.0 (audit 10) — let go the moment this machine's connection closes (server.js aborts the signal),
+           and at most a few open at once per machine, person and company (waiters.js) */
+        const heard = await waitFor(a.companyId, a.user.id, a.row.device_id, ms, { chat: wantsChat, signal: request.signal });
         if (heard.ended) return json({ sessionEnded: heard.ended });
         return json({ changed: !!heard.changed, chat: !!heard.chat });
       }
@@ -577,13 +733,25 @@ export default {
           const out = await inkEstimate(companyId, await readBody());
           return json(out.body, out.httpStatus);
         }
+        /* 4.72.0 (audit 7, 100) — the company's model is changed only by a person: training needs somebody signed
+           in (401 SIGN_IN, before the samples are even read), and resetting or restoring it needs an administrator
+           (403 ADMIN_ONLY, inkstore.js). Every train, reset and restore keeps the model it replaces, so the last
+           change can be undone (/v1/ink/restore). */
         if (path === '/v1/ink/train' && method === 'POST') {
+          if (!a.user) return json({ error: 'SIGN_IN', message: 'Sign in to train the company’s ink model.' }, 401);
           const out = await inkTrain(companyId, userId, await readBody());
           return json(out.body, out.httpStatus);
         }
         if (path === '/v1/ink/reset' && method === 'POST') {
+          if (!a.user) return json({ error: 'SIGN_IN', message: 'Sign in as your Nexora administrator to reset the company’s ink model.' }, 401);
           const body = await readBody();
-          const out = await inkReset(companyId, body.substrate);
+          const out = await inkReset(companyId, body.substrate, a.user || null);
+          return json(out.body, out.httpStatus);
+        }
+        if (path === '/v1/ink/restore' && method === 'POST') {
+          if (!a.user) return json({ error: 'SIGN_IN', message: 'Sign in as your Nexora administrator to restore the company’s ink model.' }, 401);
+          const body = await readBody();
+          const out = await inkRestore(companyId, body.substrate, a.user || null);
           return json(out.body, out.httpStatus);
         }
         return json({ error: 'NOT_FOUND', message: 'No such ink route.' }, 404);
@@ -640,57 +808,77 @@ export default {
            Wednesday and nobody can see why. no-store settles it: the page
            is re-fetched every time, which for a page one person opens a
            few times a day costs nothing worth counting. */
-        return new Response(ADMIN_HTML, {
-          status: 200,
-          headers: {
-            'content-type': 'text/html; charset=utf-8',
-            'cache-control': 'no-store, must-revalidate'
-          }
-        });
+        /* 4.72.0 (audit 42) — with the page's own rules (ADMIN_PAGE_HEADERS) */
+        return new Response(ADMIN_HTML, { status: 200, headers: Object.assign({}, ADMIN_PAGE_HEADERS) });
       }
       if (path.startsWith('/admin/api/')) {
         await ensureSchema();
         /* 4.71.0 (audit) — compared in constant time, and five wrong keys from one address shut it out for
-           fifteen minutes (admin.js adminGate) */
-        const gate = await adminGate(request, remoteIp(request));
-        if (!gate.ok) return json(gate.body, gate.httpStatus);
+           fifteen minutes (admin.js adminGate); 4.72.0 — fifty from every address together shut it for all */
+        const ip = remoteIp(request);
+        const gate = await adminGate(request, ip);
+        if (!gate.ok) return adminJson(gate.body, gate.httpStatus);
+        /* 4.72.0 (audit 40) — a company deleted more than 30 days ago is erased (at most every six hours) */
+        purgeArchivedSoon();
+        /* 4.72.0 (audit 39) — everything below runs knowing which console called, from where (db.js consoleCall):
+           every event it logs carries detail.via = { ip, app, ua } */
+        return await consoleCall.run(consoleCaller(request, ip), async () => {
+          /* 4.72.0 (audit 10) — anything the console changes may change a company: the copies kept for the waits
+             (licence.js companyOf) are dropped, so no wait goes on with the old one */
+          if (method === 'POST') forgetCompanies();
+          /* 4.72.0 (C11) — the phone console's quarter-hourly look: a few counts, not the whole listing */
+          if (path === '/admin/api/summary' && method === 'GET') return adminJson(await adminSummary(url.searchParams.get('since')));
 
-        if (path === '/admin/api/licences' && method === 'GET') return json(await listLicences());
-        if (path === '/admin/api/licence' && method === 'POST') return json(await licenceAction(await readBody()));
-        if (path === '/admin/api/gst' && method === 'POST') { const out = await gstAction(await readBody()); return json(out.body, out.httpStatus); }
-        if (path === '/admin/api/company' && method === 'POST') return json(await companyAction(await readBody()));
-        if (path === '/admin/api/settings' && method === 'POST') return json(await saveSettings(await readBody()));
-        if (path === '/admin/api/events' && method === 'GET') return json({ events: await recentEvents(url.searchParams.get('deviceId')) });
-        /* 4.42.0 — enquiries: the leads, before they are customers. */
-        if (path === '/admin/api/inquiries' && method === 'GET') return json(await listInquiries());
-        if (path === '/admin/api/inquiry' && method === 'POST') return json(await inquiryAction(await readBody()));
-        /* 4.45.0 — feedback and problem reports from the application. */
-        if (path === '/admin/api/feedback' && method === 'GET') return json(await listFeedback());
-        if (path === '/admin/api/feedback/shot' && method === 'GET') return json(await feedbackShot(url.searchParams.get('id')));
-        if (path === '/admin/api/feedback' && method === 'POST') return json(await feedbackAction(await readBody()));
-        /* 4.47.1 — Nexora speaks in every plant's room. */
-        if (path === '/admin/api/broadcast' && method === 'GET') return json(await listBroadcasts());
-        if (path === '/admin/api/broadcast' && method === 'POST') return json(await broadcastAction(await readBody()));
-        /* 4.44.0 — the phone console's own releases. */
-        if (path === '/admin/api/app' && method === 'GET') return json(await listReleases());
-        if (path === '/admin/api/app' && method === 'POST') return json(await releaseAction(await readBody()));
-        /* What a phone asks on every check. Behind the admin key like
-           everything else here: only the owner runs this application, and
-           an unlisted build is not an advertisement. */
-        if (path === '/admin/api/app/latest' && method === 'GET') return json(await latestRelease());
-        return json({ error: 'NOT_FOUND' }, 404);
+          if (path === '/admin/api/licences' && method === 'GET') return adminJson(await listLicences());
+          if (path === '/admin/api/licence' && method === 'POST') return adminJson(await licenceAction(await readBody()));
+          if (path === '/admin/api/gst' && method === 'POST') { const out = await gstAction(await readBody()); return adminJson(out.body, out.httpStatus); }
+          if (path === '/admin/api/company' && method === 'POST') return adminJson(await companyAction(await readBody()));
+          if (path === '/admin/api/settings' && method === 'POST') return adminJson(await saveSettings(await readBody()));
+          /* 4.72.0 (audit 39) — ?admin=1: only what was done from the console (the Activity list); ?limit= up to 500 */
+          if (path === '/admin/api/events' && method === 'GET') {
+            const adminOnly = /^(1|true|yes)$/i.test(url.searchParams.get('admin') || '');
+            return adminJson({ events: await recentEvents(url.searchParams.get('deviceId'), { admin: adminOnly, limit: url.searchParams.get('limit') }) });
+          }
+          /* 4.72.0 (audit 87) — how full the database is (asked for by Service settings only) */
+          if (path === '/admin/api/db' && method === 'GET') return adminJson(await dbStatus());
+          /* 4.42.0 — enquiries: the leads, before they are customers. */
+          if (path === '/admin/api/inquiries' && method === 'GET') return adminJson(await listInquiries());
+          if (path === '/admin/api/inquiry' && method === 'POST') return adminJson(await inquiryAction(await readBody()));
+          /* 4.45.0 — feedback and problem reports from the application. */
+          if (path === '/admin/api/feedback' && method === 'GET') return adminJson(await listFeedback());
+          if (path === '/admin/api/feedback/shot' && method === 'GET') return adminJson(await feedbackShot(url.searchParams.get('id')));
+          if (path === '/admin/api/feedback' && method === 'POST') return adminJson(await feedbackAction(await readBody()));
+          /* 4.47.1 — Nexora speaks in every plant's room. */
+          if (path === '/admin/api/broadcast' && method === 'GET') return adminJson(await listBroadcasts());
+          if (path === '/admin/api/broadcast' && method === 'POST') return adminJson(await broadcastAction(await readBody()));
+          /* 4.44.0 — the phone console's own releases. */
+          if (path === '/admin/api/app' && method === 'GET') return adminJson(await listReleases());
+          if (path === '/admin/api/app' && method === 'POST') return adminJson(await releaseAction(await readBody()));
+          /* What a phone asks on every check. Behind the admin key like
+             everything else here: only the owner runs this application, and
+             an unlisted build is not an advertisement. */
+          if (path === '/admin/api/app/latest' && method === 'GET') return adminJson(await latestRelease());
+          return adminJson({ error: 'NOT_FOUND' }, 404);
+        });
       }
 
       return json({ error: 'NOT_FOUND', path }, 404);
     } catch (e) {
-      if (e && e.tooLarge) return json(TOO_LARGE, 413);
-      if (e && e.misconfigured) return json(MISCONFIGURED, 503);
-      /* Rule #35: an error a person can read, and never a bare 500. */
-      return json({
+      /* 4.72.0 (audit 9, 35) — a console route's failure is answered without CORS too */
+      const answer = isAdminPath(path) ? adminJson : json;
+      if (e && e.tooLarge) return answer(TOO_LARGE, 413);
+      if (e && e.misconfigured) return answer(MISCONFIGURED, 503);
+      /* 4.72.0 (audit 83) — and a line in the log: the route and the error, never the body */
+      logFailure(method + ' ' + path, e);
+      /* Rule #35: an error a person can read, and never a bare 500.
+         4.72.0 review (audit 83) — the error's own words (`detail`: a database message names tables, columns and
+         the values it choked on; a connection failure, the database's host or user) go to the owner's console
+         only. Every other route answers with the readable message alone — the line above has the rest in
+         Render's log. No application reads `detail`. */
+      return answer(Object.assign({
         error: 'SERVER_ERROR',
-        message: 'The licence service could not complete that request. Your work is safe on this computer; try again shortly.',
-        detail: (e && e.message) ? String(e.message).slice(0, 300) : undefined
-      }, 500);
+        message: 'The licence service could not complete that request. Your work is safe on this computer; try again shortly.'
+      }, isAdminPath(path) && e && e.message ? { detail: String(e.message).slice(0, 300) } : {}), 500);
     }
   }
 };

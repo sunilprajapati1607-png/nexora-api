@@ -12,6 +12,7 @@
  * nothing outside this function can reach the database — the service IS
  * the only client, so it owns its own tables.
  */
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { createClient } from './pgmini.js';
 import { parsePlanFeatures } from './plans.js';
 
@@ -493,7 +494,41 @@ export function ensureSchema() {
     await q(`CREATE TABLE IF NOT EXISTS ai_usage (company_id TEXT NOT NULL, day TEXT NOT NULL, n INTEGER NOT NULL DEFAULT 0,
                                                 PRIMARY KEY (company_id, day))`);
     await q(`DELETE FROM ai_usage WHERE day < to_char(now() AT TIME ZONE 'Asia/Kolkata' - interval '40 days', 'YYYY-MM-DD')`);
-    for (const t of ['chat_messages', 'feedback', 'inquiries', 'app_releases', 'ai_usage']) {
+    /* 4.72.0 (audit 3, C12) — THE PREVIOUS COPY OF EVERY MASTER. A shared master
+       (materials, routes, processes, recipes, workflows …) used to be simply
+       overwritten — or deleted — by whoever pushed last, with nothing kept to go
+       back to but last night's whole-database backup. Before a master is
+       replaced, the copy being replaced is written here (sync.js keepHistory),
+       the last 20 for each master; the console puts one back (sync.js
+       restoreMaster). `updated_by` / `at` are who saved that copy and when;
+       `replaced_by` / `replaced_at` who replaced it (NULL: the console) and
+       when; `how` is push, delete or restore. */
+    await q(`
+      CREATE TABLE IF NOT EXISTS sync_history (
+        history_id  BIGSERIAL PRIMARY KEY,
+        company_id  BIGINT NOT NULL,
+        kind        TEXT NOT NULL,
+        id          TEXT NOT NULL,
+        body        JSONB,
+        updated_by  BIGINT,
+        at          TIMESTAMPTZ,
+        replaced_by BIGINT,
+        replaced_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        how         TEXT
+      )`);
+    await q(`CREATE INDEX IF NOT EXISTS sync_history_record_idx ON sync_history (company_id, kind, id, history_id DESC)`);
+    /* 4.72.0 (audit 40) — A DELETED COMPANY IS KEPT FOR 30 DAYS. The console's Delete
+       used to erase a company and everything it synced on the spot, with no way
+       back. It now sets deleted_at (and keeps the state it had in deleted_state,
+       so Restore puts back exactly that): the company is suspended, hidden from the
+       console's lists and refused everywhere, and erased with everything that
+       belongs to it once deleted_at is 30 days old (admin.js purgeArchived).
+       Two new, empty columns: no existing row is touched. */
+    await q(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ`);
+    await q(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS deleted_state TEXT`);
+    /* 4.72.0 — ink_model_history (inkstore.js, made with the ink tables) has row level security like
+       sync_history; on a database where it does not exist yet it is skipped and done on a later start */
+    for (const t of ['chat_messages', 'feedback', 'inquiries', 'app_releases', 'ai_usage', 'sync_history', 'ink_model_history']) {
       try {
         await q(`DO $rls$ BEGIN
                    IF EXISTS (SELECT 1 FROM pg_tables WHERE schemaname = current_schema() AND tablename = '${t}' AND tableowner = current_user)
@@ -567,10 +602,22 @@ export async function getSettings() {
   };
 }
 
+/* 4.72.0 (audit 39) — WHO DID IT, AND FROM WHERE. Every /admin/api request is
+   run inside this context (index.js), holding where the console call came from:
+   { ip, app: 'web' | 'android', ua }. Anything logged while it runs — the
+   console's own actions, and what they set off in sync.js, chat.js or
+   appupdate.js — carries it as detail.via, so the log can say which console,
+   from which address, did it. Never the key: only the address, the console's
+   kind and the first part of its user-agent. Outside a console call there is no
+   context and nothing is added. */
+export const consoleCall = new AsyncLocalStorage();
+
 export async function logEvent(deviceId, event, detail) {
   try {
+    const via = consoleCall.getStore();
+    const d = via ? Object.assign({}, detail || {}, { via }) : detail;
     await q(`INSERT INTO activation_log (device_id, event, detail) VALUES ($1, $2, $3)`,
-      [deviceId || null, event, detail ? JSON.stringify(detail) : null]);
+      [deviceId || null, event, d ? JSON.stringify(d) : null]);
   } catch (e) { /* logging must never break a request */ }
 }
 

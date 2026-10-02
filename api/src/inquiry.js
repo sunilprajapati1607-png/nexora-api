@@ -13,6 +13,7 @@
  * create a row and nothing else — it cannot read, change or delete one.
  */
 import { q, logEvent } from './db.js';
+import { plainEmail } from './register.js';
 
 /* The list the website's "I am interested in" select offers, plus the two
    the application itself sells. Anything else is kept verbatim but marked
@@ -36,11 +37,25 @@ export const STATES = ['NEW', 'CONTACTED', 'DEMO', 'QUOTED', 'WON', 'LOST'];
 
 const SOURCES = ['WEBSITE', 'MANUAL', 'PHONE', 'WHATSAPP', 'REFERRAL', 'VISIT', 'EXHIBITION'];
 
+/* 4.72.0 (audit 41) — every control character (a line break included) is a space: a name, a phone or an
+   address is one line wherever it is shown, and never carries a second one */
+const CONTROL = /[\u0000-\u001f\u007f]+/g;
 function clean(v, max) {
   if (v === null || v === undefined) return null;
-  const s = String(v).trim().replace(/\s+/g, ' ');
+  const s = String(v).replace(CONTROL, ' ').trim().replace(/\s+/g, ' ');
   if (!s) return null;
   return s.length > max ? s.slice(0, max) : s;
+}
+
+/* 4.72.0 (audit 41) — what the console may store as an e-mail address: blank, or a plain address (register.js
+   plainEmail — nothing a mailto: link could carry a hidden copy or a ready-made text on). The owner typing one
+   that is not is told so, rather than having it changed. */
+const BAD_EMAIL = 'That e-mail address does not look right: letters, digits and . _ + \' - before the @, a domain after it, no spaces.';
+function consoleEmail(v) {
+  const typed = clean(v, 160);
+  if (!typed) return { ok: true, value: null };
+  const e = plainEmail(typed);
+  return e ? { ok: true, value: e } : { ok: false };
 }
 
 /* A message keeps its line breaks — it is the one field somebody actually
@@ -96,6 +111,8 @@ export async function inquiryAction(body) {
   if (action === 'create') {
     const name = clean(body.name, 120);
     if (!name) return { error: 'A name is required.' };
+    const em = consoleEmail(body.email);
+    if (!em.ok) return { error: BAD_EMAIL };
     const rows = await q(
       `INSERT INTO inquiries (name, company, phone, email, product, message, state, source, channel, notes, follow_up)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
@@ -103,7 +120,7 @@ export async function inquiryAction(body) {
         name,
         clean(body.company, 160),
         clean(body.phone, 40),
-        clean(body.email, 160),
+        em.value,
         clean(body.product, 80) || 'Other',
         cleanText(body.message, 4000),
         STATES.includes(body.state) ? body.state : 'NEW',
@@ -142,7 +159,7 @@ export async function inquiryAction(body) {
     if ('name' in body) { const n = clean(body.name, 120); if (!n) return { error: 'A name is required.' }; set('name', n); }
     if ('company' in body) set('company', clean(body.company, 160));
     if ('phone' in body) set('phone', clean(body.phone, 40));
-    if ('email' in body) set('email', clean(body.email, 160));
+    if ('email' in body) { const em = consoleEmail(body.email); if (!em.ok) return { error: BAD_EMAIL }; set('email', em.value); }
     if ('product' in body) set('product', clean(body.product, 80) || 'Other');
     if ('message' in body) set('message', cleanText(body.message, 4000));
     if ('notes' in body) set('notes', cleanText(body.notes, 4000));
@@ -182,6 +199,15 @@ const SEEN = new Map();
 const WINDOW_MS = 60 * 60 * 1000;
 const PER_WINDOW = 6;
 
+/* 4.72.0 (audit 37) — AND THE WEBSITE AS A WHOLE, DAY_WEBSITE A DAY. The
+   per-address throttle stops one sender; many addresses at once used to be
+   able to write without end, pushing real leads out of the console's list
+   (which shows the newest thousand). Past this many website enquiries in a
+   day the form still answers { ok: true } — a robot learns nothing — but
+   nothing more is written, and the event log says so once that day. */
+export const DAY_WEBSITE = 200;
+let capLogged = '';
+
 function throttled(ip) {
   if (!ip) return false;
   const now = Date.now();
@@ -208,10 +234,24 @@ export async function publicInquiry(body, ip) {
 
   const name = clean(body.name, 120);
   const phone = clean(body.phone, 40);
-  const email = clean(body.email, 160);
+  const typedEmail = clean(body.email, 160);
   if (!name) return { ok: true };
-  if (!phone && !email) return { ok: true };
+  if (!phone && !typedEmail) return { ok: true };
   if (throttled(ip)) return { ok: true };
+
+  /* 4.72.0 (audit 37) — the website's day (DAY_WEBSITE) */
+  const day = (await q(`SELECT COUNT(*)::int AS n FROM inquiries WHERE source = 'WEBSITE' AND created_at > now() - interval '1 day'`))[0];
+  if (day && Number(day.n) >= DAY_WEBSITE) {
+    const today = new Date().toISOString().slice(0, 10);
+    if (capLogged !== today) { capLogged = today; await logEvent(null, 'INQUIRY_DAY_CAP', { website: Number(day.n) }); }
+    return { ok: true };
+  }
+
+  /* 4.72.0 (audit 41) — an address that is not a plain one is not kept as an address (the consoles make a
+     mailto: link of it); what was typed is kept, readable, at the end of the message, so the lead is not lost */
+  const email = plainEmail(typedEmail);
+  let message = cleanText(body.message, 4000);
+  if (typedEmail && !email) message = (message ? message + '\n\n' : '') + 'E-mail as typed: ' + typedEmail;
 
   const rows = await q(
     `INSERT INTO inquiries (name, company, phone, email, product, message, source, source_page, channel, remote_ip)
@@ -222,7 +262,7 @@ export async function publicInquiry(body, ip) {
       phone,
       email,
       clean(body.interest || body.product, 80) || 'Other',
-      cleanText(body.message, 4000),
+      message,
       clean(body.source_page || body.sourcePage, 300),
       clean(body.channel_chosen || body.channel, 40),
       ip || null

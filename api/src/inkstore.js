@@ -56,7 +56,45 @@ export async function ensureInkSchema() {
      table definition above is only ever read by a database that has
      never seen Nexora. */
   await q('ALTER TABLE ink_models ADD COLUMN IF NOT EXISTS thinner REAL');
+  /* 4.72.0 (audit 100) — THE MODEL BEFORE. A model fitted from months of
+     measured jobs was overwritten by the next training and thrown away by a
+     reset, with nothing kept. The row being replaced is now copied here first
+     (the last INK_KEEP per substrate), and restore() puts the latest one
+     back. Its own table rather than columns on ink_models, so ink_models —
+     and every reader of it — is exactly as it was. */
+  await q(`
+    CREATE TABLE IF NOT EXISTS ink_model_history (
+      history_id  BIGSERIAL PRIMARY KEY,
+      company_id  BIGINT NOT NULL,
+      substrate   TEXT   NOT NULL,
+      coeffs      JSONB  NOT NULL,
+      samples     INT    NOT NULL DEFAULT 0,
+      r2          REAL,
+      rmse        REAL,
+      confidence  TEXT,
+      thinner     REAL,
+      updated_at  TIMESTAMPTZ,
+      updated_by  BIGINT,
+      replaced_by BIGINT,
+      replaced_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      how         TEXT
+    )`);
+  await q('CREATE INDEX IF NOT EXISTS ink_model_history_idx ON ink_model_history (company_id, substrate, history_id DESC)');
   return true;
+}
+
+const INK_KEEP = 5;
+/** 4.72.0 — copy the company's current model for this substrate (if it has one) into ink_model_history. */
+async function keepModel(companyId, sub, byUserId, how) {
+  const kept = await q(
+    `INSERT INTO ink_model_history (company_id, substrate, coeffs, samples, r2, rmse, confidence, thinner, updated_at, updated_by, replaced_by, how)
+     SELECT company_id, substrate, coeffs, samples, r2, rmse, confidence, thinner, updated_at, updated_by, $3::bigint, $4::text
+       FROM ink_models WHERE company_id = $1 AND substrate = $2
+     RETURNING history_id`, [companyId, sub, byUserId == null ? null : byUserId, how]);
+  await q(`DELETE FROM ink_model_history WHERE company_id = $1 AND substrate = $2 AND history_id NOT IN
+           (SELECT history_id FROM ink_model_history WHERE company_id = $1 AND substrate = $2 ORDER BY history_id DESC LIMIT ${INK_KEEP})`,
+  [companyId, sub]);
+  return kept.length > 0;
 }
 
 const SUB = (v) => substrate(v).id;
@@ -97,6 +135,11 @@ export async function listModels(companyId) {
  * fitted here and thrown away.
  */
 export async function train(companyId, userId, body) {
+  /* 4.72.0 (audit 100) — training changes the company's model: a person signed in does it, never a
+     computer with nobody on it (index.js passes userId = a.user's id, or null) */
+  if (!userId) {
+    return { httpStatus: 401, body: { error: 'SIGN_IN', message: 'Sign in to train the company’s ink model.' } };
+  }
   const sub = SUB(body && body.substrate);
   const raw = (body && Array.isArray(body.samples) ? body.samples : []);
   if (!raw.length) {
@@ -129,6 +172,8 @@ export async function train(companyId, userId, body) {
   CHANNELS.forEach((ch) => { coeffs[ch] = result.coefficients[ch]; });
 
   if (companyId) {
+    /* 4.72.0 — the model this replaces is kept (restore puts it back) */
+    await keepModel(companyId, sub, userId, 'train');
     await q(
       `INSERT INTO ink_models (company_id, substrate, coeffs, samples, r2, rmse, confidence, thinner, updated_at, updated_by)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now(), $9)
@@ -197,9 +242,45 @@ export async function estimate(companyId, body) {
   };
 }
 
-/** Throw a company's model away and go back to the physics. */
-export async function reset(companyId, substrateId) {
+/** Throw a company's model away and go back to the physics.
+ *  4.72.0 (audit 100) — `actor`: the person asking (index.js passes a.user). When it is passed, only an
+ *  ADMINISTRATOR may reset (403 ADMIN_ONLY otherwise, and nobody signed in is refused too); and the
+ *  model thrown away is kept, so restore() can bring it back (restorable: true). */
+export async function reset(companyId, substrateId, actor) {
   const sub = SUB(substrateId);
-  if (companyId) await q(`DELETE FROM ink_models WHERE company_id = $1 AND substrate = $2`, [companyId, sub]);
-  return { httpStatus: 200, body: { substrate: sub, coefficients: defaultCoefficients(sub), n: 0, source: 'DEFAULT' } };
+  if (actor !== undefined && !(actor && actor.role === 'ADMIN')) {
+    return { httpStatus: 403, body: { error: 'ADMIN_ONLY', message: 'Only your Nexora administrator can reset the company’s ink model.' } };
+  }
+  let restorable = false;
+  if (companyId) {
+    restorable = await keepModel(companyId, sub, actor && actor.id != null ? actor.id : null, 'reset');
+    await q(`DELETE FROM ink_models WHERE company_id = $1 AND substrate = $2`, [companyId, sub]);
+  }
+  return { httpStatus: 200, body: { substrate: sub, coefficients: defaultCoefficients(sub), n: 0, source: 'DEFAULT', restorable } };
+}
+
+/** 4.72.0 (audit 100) — put back the model this company had before its last training or reset (the
+ *  latest kept in ink_model_history). The model it replaces is kept in turn, so a restore can be undone
+ *  the same way. ADMINISTRATOR only: `actor` must be passed (index.js: a.user). */
+export async function restore(companyId, substrateId, actor) {
+  const sub = SUB(substrateId);
+  if (!actor || actor.role !== 'ADMIN') {
+    return { httpStatus: 403, body: { error: 'ADMIN_ONLY', message: 'Only your Nexora administrator can restore the company’s ink model.' } };
+  }
+  if (!companyId) return { httpStatus: 404, body: { error: 'NO_PREVIOUS', message: 'There is no earlier ink model to go back to.' } };
+  const h = (await q(
+    `SELECT * FROM ink_model_history WHERE company_id = $1 AND substrate = $2 ORDER BY history_id DESC LIMIT 1`, [companyId, sub]))[0];
+  if (!h) return { httpStatus: 404, body: { error: 'NO_PREVIOUS', message: 'There is no earlier ink model to go back to.' } };
+  await keepModel(companyId, sub, actor.id, 'restore');
+  await q(
+    `INSERT INTO ink_models (company_id, substrate, coeffs, samples, r2, rmse, confidence, thinner, updated_at, updated_by)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, COALESCE($9::timestamptz, now()), $10)
+     ON CONFLICT (company_id, substrate) DO UPDATE SET
+       coeffs = EXCLUDED.coeffs, samples = EXCLUDED.samples, r2 = EXCLUDED.r2, rmse = EXCLUDED.rmse,
+       confidence = EXCLUDED.confidence, thinner = EXCLUDED.thinner,
+       updated_at = EXCLUDED.updated_at, updated_by = EXCLUDED.updated_by`,
+    [companyId, sub, JSON.stringify(typeof h.coeffs === 'string' ? JSON.parse(h.coeffs) : h.coeffs), h.samples || 0, h.r2, h.rmse, h.confidence,
+     h.thinner, h.updated_at || null, h.updated_by == null ? null : h.updated_by]);
+  await q(`DELETE FROM ink_model_history WHERE history_id = $1`, [h.history_id]);
+  return { httpStatus: 200, body: Object.assign({ restored: true }, await getModel(companyId, sub)) };
 }

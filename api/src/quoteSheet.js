@@ -32,7 +32,7 @@ const qnum = (v) => (v === undefined || v === null || v === '' || !isFinite(Numb
 function fmt(n, d) {
   if (n === undefined || n === null || isNaN(n)) return '—';
   const k = d != null ? d : 2;
-  return Number(n).toLocaleString('en-US', { minimumFractionDigits: k, maximumFractionDigits: k });
+  return Number(n).toLocaleString('en-IN', { minimumFractionDigits: k, maximumFractionDigits: k });   // 4.72.0 (audit 66) — as the computer prints
 }
 /* Indian dates, in Indian time: the service's clock is UTC */
 function dmy(v) {
@@ -89,6 +89,8 @@ function cleanQuote(x) {
       id: s(it && it.id, 40), calcId: it && it.calcId ? s(it.calcId, 80) : null, itemName: s(it && it.itemName, 160),
       quantity: qnum(it && it.quantity), rate: qnum(it && it.rate),
       basis: ['BAG', 'K', 'KG'].indexOf(it && it.basis) > -1 ? it.basis : 'BAG',
+      /* 4.72.0 (audit 69) — the weight a per-kg line was quoted at; quoteMath prices it on this before the calculation's */
+      gramsAtQuote: qnum(it && it.gramsAtQuote),
       text: (it && it.text && typeof it.text === 'object') ? it.text : {}
     })),
     charges: (Array.isArray(o.charges) ? o.charges : []).slice(0, 10).map((c) => ({ label: s(c && c.label, 80), amount: qnum(c && c.amount) })),
@@ -200,7 +202,11 @@ export function sheetWith(d, masters, quote, byId) {
     '</tbody></table>' +
     '<div style="' + h3 + '">Tax and total</div>' +
     '<table><tbody><tr><td style="' + cell + 'width:68%">Subtotal</td><td style="' + cell + r + '">' + rs(t.subtotal) + '</td></tr>' + taxRows +
-      '<tr><td style="' + cell + 'font-weight:700;font-size:13px">Grand total</td><td style="' + cell + r + 'font-weight:700;font-size:13px">' + rs(t.grand) + '</td></tr></tbody></table>' +
+      '<tr><td style="' + cell + 'font-weight:700;font-size:13px">Grand total</td><td style="' + cell + r + 'font-weight:700;font-size:13px">' + rs(t.grand) + '</td></tr>' +
+      /* 4.72.0 (audit 66) — the amount in words, as the computer's sheet prints it, for rupees only */
+      ((/^(|rs\.?|inr|₹)$/i.test(String(org.currency || '').trim()) && d.NexoraQuoteMath.inWords && d.NexoraQuoteMath.inWords(t.grand))
+        ? '<tr><td colspan="2" style="' + cell + '">Amount in words: ' + esc(d.NexoraQuoteMath.inWords(t.grand)) + '</td></tr>' : '') +
+      '</tbody></table>' +
     (blocks ? '<div style="' + h3 + '">Specification</div>' + blocks : '') +
     ((quote.payment || quote.delivery || quote.validityDays != null)
       ? '<div style="' + h3 + '">Terms</div><table><tbody>' +

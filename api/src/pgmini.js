@@ -205,6 +205,14 @@ function parseUrl(url) {
      provider's root in PGSSLROOTCERT and ask for verify-full. */
   const mode = (u.searchParams.get('sslmode') || 'require').toLowerCase();
   const rootcert = u.searchParams.get('sslrootcert') || process.env.PGSSLROOTCERT || '';
+  const caPem = dbCaPem();
+  /* 4.72.0 (audit 11) — an authority to check against, and a URL that asks for no TLS at all, cannot both be
+     meant: the check would quietly never run. Refused, plainly, so the mistake is seen. */
+  if (caPem && mode === 'disable') {
+    const e = new Error('NEXORA_DB_CA is set but DATABASE_URL says sslmode=disable — the certificate could never be checked. Remove one of the two.');
+    e.code = 'DB_CA_NO_TLS';
+    throw e;
+  }
   return {
     host: u.hostname,
     port: u.port ? Number(u.port) : 5432,
@@ -214,8 +222,48 @@ function parseUrl(url) {
     ssl: mode !== 'disable',
     sslmode: mode,
     verify: mode === 'verify-ca' || mode === 'verify-full',
-    rootcert: rootcert
+    rootcert: rootcert,
+    caPem: caPem
   };
+}
+
+/* 4.72.0 (audit 11) — THE DATABASE'S CERTIFICATE, CHECKED WHEN ITS
+   AUTHORITY IS GIVEN. With sslmode=require (what the live DATABASE_URL
+   says) the connection is encrypted but whoever answers is believed, so a
+   machine placed between Render and Supabase could pose as the database.
+   NEXORA_DB_CA holds the authority's certificate as PEM text (Supabase:
+   Dashboard → Database → SSL → "prod-ca-2021.crt"; line breaks may be
+   written as \n). When it is set, the database must present a certificate
+   signed by it or the connection is refused — checked the way libpq's
+   verify-ca checks (the chain, not the host name, because Supabase's pooler
+   answers on a shared name), or verify-full when the URL asks for it. When
+   it is NOT set, nothing here changes: everything is exactly as before.
+   A value that is not a certificate is refused rather than ignored, so a
+   pasting mistake can never quietly turn the check off. */
+export function dbCaPem() {
+  const raw = process.env.NEXORA_DB_CA;
+  if (raw === undefined || String(raw).trim() === '') return '';
+  const pem = String(raw).replace(/\\n/g, '\n').replace(/\r\n/g, '\n').trim();
+  if (!/-----BEGIN CERTIFICATE-----[\s\S]+-----END CERTIFICATE-----/.test(pem)) {
+    const e = new Error('NEXORA_DB_CA is set but is not a PEM certificate (-----BEGIN CERTIFICATE----- … -----END CERTIFICATE-----).');
+    e.code = 'DB_CA_INVALID';
+    throw e;
+  }
+  return pem + '\n';
+}
+
+/** The TLS options for one connection — kept apart from the socket work so the rules above can be read and tested. */
+export function tlsOptions(cfg, socket) {
+  const opts = { socket, servername: cfg.host, rejectUnauthorized: cfg.verify };
+  if (cfg.caPem) {
+    opts.rejectUnauthorized = true;
+    opts.ca = cfg.caPem;
+    /* verify-ca (the default with NEXORA_DB_CA): the chain only, as libpq; verify-full: the host name too */
+    if (cfg.sslmode !== 'verify-full') opts.checkServerIdentity = () => undefined;
+    return opts;
+  }
+  if (cfg.verify && cfg.rootcert) opts.ca = readFileSync(cfg.rootcert);
+  return opts;
 }
 
 async function openConnection(url) {
@@ -242,11 +290,9 @@ async function openConnection(url) {
     plain.once('error', reject);
     plain.once('data', (d) => {
       if (d[0] !== 0x53) return reject(new Error('The database refused a TLS connection.'));
-      const opts = { socket: plain, servername: cfg.host, rejectUnauthorized: cfg.verify };
-      if (cfg.verify && cfg.rootcert) {
-        try { opts.ca = readFileSync(cfg.rootcert); }
-        catch (e) { return reject(new Error('Could not read the CA certificate at ' + cfg.rootcert + ': ' + e.message)); }
-      }
+      let opts;
+      try { opts = tlsOptions(cfg, plain); }
+      catch (e) { try { plain.destroy(); } catch (x) { /* gone */ } return reject(new Error('Could not read the CA certificate at ' + cfg.rootcert + ': ' + e.message)); }
       const secure = tlsConnect(opts, () => resolve());
       conn.socket = secure;
       /* 4.34.0 — a TLS failure used to be filed under conn.dead and the
@@ -255,7 +301,12 @@ async function openConnection(url) {
          while the connection is being opened, and only afterwards is it
          a fault on a live socket. */
       secure.once('error', (e) => {
-        const why = e && e.code === 'SELF_SIGNED_CERT_IN_CHAIN'
+        /* 4.72.0 (audit 11) — with NEXORA_DB_CA set, what failed is said as it is, and what the check needs */
+        const why = cfg.caPem
+          ? ((e && (e.code ? e.code + ': ' : '') + (e.message || '')) || String(e)) +
+            ' — NEXORA_DB_CA is set, so the database must present a certificate signed by that authority' +
+            (cfg.sslmode === 'verify-full' ? ', for this host name (verify-full).' : '.')
+          : e && e.code === 'SELF_SIGNED_CERT_IN_CHAIN'
           ? 'the database presents its own certificate authority, which nothing here trusts. Use sslmode=require, or sslmode=verify-full with sslrootcert= pointing at that authority.'
           : (e && e.message) || String(e);
         conn.dead = e;

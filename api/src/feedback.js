@@ -19,17 +19,34 @@
  * application typed in.
  */
 import { q, logEvent } from './db.js';
+import { plainEmail } from './register.js';
 
 export const KINDS = ['FEEDBACK', 'BUG'];
 export const STATES = ['NEW', 'SEEN', 'FIXED', 'CLOSED'];
 
 /* A 1400px-wide JPEG of a busy screen is 150–350 KB as base64; this is
-   room for a large one and a wall against a 30 MB bitmap. */
-export const MAX_SHOT = 2500000;
+   room for a large one and a wall against a 30 MB bitmap.
+   4.72.0 (audit 37) — 1 MB, down from 2.5 MB: the desktop never sends a
+   picture wider than 1400px at JPEG quality 72 (main.js captureScreen). */
+export const MAX_SHOT = 1000000;
 
+/* 4.72.0 (audit 8, 37) — WHAT ONE DAY MAY ADD TO THE TABLE, whoever sends it.
+   The per-address throttle below stops one sender; these stop many. A
+   report from a machine with no good token (nothing says whose it is) is
+   kept up to DAY_UNSIGNED a day; past that it is answered 503 BUSY, which
+   the desktop reads as "keep it and send it later" (its outbox), so a real
+   report is delayed, never lost. Pictures come only with a good token, and
+   at most DAY_SHOT_BYTES of them a day: past that the report is still kept,
+   without its picture. */
+export const DAY_UNSIGNED = 300;
+export const DAY_SHOT_BYTES = 50 * 1024 * 1024;
+
+/* Every control character (a line break included) is a space: a name, an
+   address or a subject is one line wherever it is shown. */
+const CONTROL = /[\u0000-\u001f\u007f]+/g;
 function clean(v, max) {
   if (v === null || v === undefined) return null;
-  const s = String(v).trim().replace(/\s+/g, ' ');
+  const s = String(v).replace(CONTROL, ' ').trim().replace(/\s+/g, ' ');
   if (!s) return null;
   return s.length > max ? s.slice(0, max) : s;
 }
@@ -39,11 +56,38 @@ function cleanText(v, max) {
   if (!s) return null;
   return s.length > max ? s.slice(0, max) : s;
 }
+const SHOT_RE = /^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/;
 function cleanShot(v) {
   if (typeof v !== 'string') return null;
-  if (!/^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(v)) return null;
   if (v.length > MAX_SHOT) return null;
+  if (!SHOT_RE.test(v)) return null;
   return v;
+}
+
+/* 4.72.0 (audit 37) — PICTURES ARE NOT KEPT FOR EVER. A report's picture is
+   cleared FEEDBACK_SHOT_DAYS days after it came in (90 unless set on Render;
+   0 keeps them for ever); the report itself, its words and its state stay.
+   Done at most twice a day, when a report arrives. */
+const SWEEP_EVERY_MS = 12 * 60 * 60 * 1000;
+let lastSweep = 0;
+export function shotDays() {
+  const raw = process.env.FEEDBACK_SHOT_DAYS;
+  if (raw === undefined || String(raw).trim() === '') return 90;
+  const n = parseInt(raw, 10);
+  return n > 0 ? n : 0;
+}
+export async function sweepOldShots(force) {
+  const days = shotDays();
+  if (!days) return 0;
+  if (!force && Date.now() - lastSweep < SWEEP_EVERY_MS) return 0;
+  lastSweep = Date.now();
+  try {
+    const rows = await q(`UPDATE feedback SET shot = NULL
+                           WHERE shot IS NOT NULL AND created_at < now() - make_interval(days => $1::int)
+                       RETURNING id`, [days]);
+    if (rows.length) await logEvent(null, 'FEEDBACK_SHOTS_CLEARED', { count: rows.length, olderThanDays: days });
+    return rows.length;
+  } catch (e) { return 0; }
 }
 
 function describe(r, withShot) {
@@ -100,7 +144,12 @@ export async function feedbackShot(id) {
   if (!(n > 0)) return { error: 'Which report?' };
   const rows = await q(`SELECT id, shot FROM feedback WHERE id = $1`, [n]);
   if (!rows.length) return { error: 'That report is no longer here.' };
-  return { id: n, shot: rows[0].shot || null };
+  /* 4.72.0 (audit 42) — the console puts this straight into an <img src="…">, so it goes out only if it is
+     still exactly what cleanShot() lets in: a data: picture in base64 and nothing else. A row changed some
+     other way (by hand in the database, say) is never handed to the page. */
+  const shot = rows[0].shot || null;
+  if (shot && !SHOT_RE.test(shot)) return { id: n, shot: null, error: 'That picture could not be shown safely.' };
+  return { id: n, shot };
 }
 
 export async function feedbackAction(body) {
@@ -138,6 +187,7 @@ export async function feedbackAction(body) {
 const SEEN = new Map();
 const WINDOW_MS = 60 * 60 * 1000;
 const PER_WINDOW = 10;
+let capLogged = '';   /* the day the day-cap was last logged: once a day, not once per refusal */
 
 function throttled(ip) {
   if (!ip) return false;
@@ -158,9 +208,32 @@ function throttled(ip) {
  *               token and the token was good; null otherwise
  */
 export async function publicFeedback(body, ip, auth) {
-  const message = cleanText(body.message, 6000);
+  let message = cleanText(body.message, 6000);
   if (!message) return { error: 'EMPTY', message: 'Write a line about it first.' };
   if (throttled(ip)) return { error: 'TOO_MANY', message: 'That is enough reports from here for an hour — thank you, we have them.' };
+
+  /* 4.72.0 (audit 8, 37) — a picture only from a machine with a good token; the day's totals (one statement:
+     reports with no good token, and the pictures' bytes) only when one of the two caps can apply */
+  const signed = !!(auth && auth.company && auth.company.id);
+  const shotOffered = typeof body.shot === 'string' && body.shot.length > 0;
+  let shot = signed && shotOffered ? cleanShot(body.shot) : null;
+  if (!signed || shot) {
+    const day = (await q(`SELECT COUNT(*) FILTER (WHERE company_id IS NULL)::int AS unsigned,
+                                 COALESCE(SUM(octet_length(shot)), 0)::bigint AS shot_bytes
+                            FROM feedback WHERE created_at > now() - interval '1 day'`))[0] || {};
+    if (!signed && Number(day.unsigned) >= DAY_UNSIGNED) {
+      const today = new Date().toISOString().slice(0, 10);
+      if (capLogged !== today) { capLogged = today; await logEvent(null, 'FEEDBACK_DAY_CAP', { unsigned: Number(day.unsigned) }); }
+      return { error: 'BUSY', busy: true, message: 'Nexora has had a great many reports today. This one is kept on this computer and sent again later.' };
+    }
+    if (shot && Number(day.shot_bytes) + shot.length > DAY_SHOT_BYTES) shot = null;
+  }
+
+  /* 4.72.0 (audit 41) — an address that is not a plain one is not kept as an address (the consoles make a mailto:
+     link of it); what was typed stays readable at the end of the message */
+  const typedEmail = clean(body.email, 160);
+  const email = plainEmail(typedEmail);
+  if (typedEmail && !email) message = message + '\n\nE-mail as typed: ' + typedEmail;
 
   const kind = KINDS.includes(body.kind) ? body.kind : 'FEEDBACK';
   const company = (auth && auth.company && auth.company.name) || clean(body.company, 160);
@@ -180,7 +253,7 @@ export async function publicFeedback(body, ip, auth) {
       message,
       clean(body.name, 120),
       clean(body.phone, 40),
-      clean(body.email, 160),
+      email,
       company,
       companyId,
       licenceKey,
@@ -190,11 +263,13 @@ export async function publicFeedback(body, ip, auth) {
       clean(body.appVersion, 40),
       clean(body.edition, 20),
       clean(body.view, 80),
-      cleanShot(body.shot),
+      shot,
       ip || null
     ]
   );
   const id = Number(rows[0].id);
   await logEvent(deviceId || null, kind === 'BUG' ? 'FEEDBACK_BUG' : 'FEEDBACK', { id, company, subject: clean(body.subject, 160) });
-  return { ok: true, id };
+  await sweepOldShots(false);
+  /* shotKept: whether the picture sent was kept (false: none came with a good token, or the day's are used up) */
+  return shotOffered ? { ok: true, id, shotKept: !!shot } : { ok: true, id };
 }
