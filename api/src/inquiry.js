@@ -98,8 +98,8 @@ function describe(r) {
    (the same day) "E-mail રાખો, પણ ફરજિયાત નહીં" — keep the e-mail, not required. The form adds three things
    and posts { …as before…, form: 2, location, website, products: [ticks], productOther }. With form 2 the
    service requires what the page requires — the fields it always required (name, company, phone, interest,
-   message) and the three new ones (location, website, at least one product tick; the words beside "Other"
-   when Other is ticked) — answering 400 { error: 'MISSING', field, message } for the first one missing, in the
+   message) and the new ones (location, at least one product tick; the words beside "Other" when Other is
+   ticked; the website is optional since 4.74.0, owner) — answering 400 { error: 'MISSING', field, message } for the first one missing, in the
    page's own order (fields: every one). The e-mail may be left empty; one that is given must be a plain
    address (register.js plainEmail, as the page checks it too) or it is 400 { error: 'BAD_EMAIL', field:
    'email', message }. A post without `form` is a page cached from before (or another form) and is taken
@@ -119,7 +119,7 @@ const FORM2_WORDS = {
   phone: 'Please enter your WhatsApp / mobile number.',
   email: 'Please enter a valid email address, like name@company.com — or leave it empty.',
   location: 'Please enter your manufacturing location — city and state.',
-  website: 'Please enter your company website.',
+  website: 'Please enter your company website — or leave it empty.',
   products: 'Please tick at least one product in your range.',
   productOther: 'Please write your other products.',
   interest: 'Please choose what you are interested in.',
@@ -136,7 +136,8 @@ export function readForm2(body) {
   if (!clean(b.company, 160)) missing.push('company');
   if (!clean(b.phone, 40)) missing.push('phone');
   if (!out.location) missing.push('location');
-  if (!out.website) missing.push('website');
+  /* 4.74.0 — owner: "website par enquiry form ma website mendetory mathi optional kri do": a plant without a
+     website may still ask (the field stays on the form; empty is fine) */
   if (!out.products.length) missing.push('products');
   else if (out.products.indexOf('Other') > -1 && !out.productOther) missing.push('productOther');
   if (!clean(b.interest || b.product, 80)) missing.push('interest');

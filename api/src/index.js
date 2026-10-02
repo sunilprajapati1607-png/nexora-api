@@ -652,9 +652,10 @@ export default {
         if (!a.user) return json({ error: 'SIGN_IN', message: 'Sign in to use Nexora AI.' }, 401);
         const body = await readBody();
         /* 4.72.0 — C14: whether this person may see costs, and the company's current price list — read (sync.js) only
-           for a phone question about rates, prices or costs from a person who may */
+           for a phone question about rates, prices or costs from a person who may.
+           4.74.0 — C21: "caps": ["query"] beside "chat" (or inside it) — the phone runs queries (ai.js capsOf) */
         const out = await runAi(a, () => aiChat(a.companyId || a.row.device_id, body.chat, pickLang(body.lang), undefined,
-          { canCost: canSeeCost(a.user), loadRates: async () => (a.companyId ? (await import('./sync.js')).currentPriceList(a.companyId) : []) }));
+          { canCost: canSeeCost(a.user), loadRates: async () => (a.companyId ? (await import('./sync.js')).currentPriceList(a.companyId) : []), caps: body.caps }));
         return json(out.body, out.httpStatus);
       }
       /* 4.67.3 — one Nexora AI on every window: an answer, and the steps to run */
@@ -664,7 +665,8 @@ export default {
         if (!a.ok) return json(a.error, a.httpStatus);
         if (!a.user) return json({ error: 'SIGN_IN', message: 'Sign in to use Nexora AI.' }, 401);
         const body = await readBody();
-        const out = await runAi(a, () => aiAssist(a.companyId || a.row.device_id, body.assist, pickLang(body.lang), undefined, { canCost: canSeeCost(a.user) }));
+        /* 4.74.0 — C21: "caps": ["query"] beside "assist" (or inside it) — the computer runs queries (ai.js capsOf) */
+        const out = await runAi(a, () => aiAssist(a.companyId || a.row.device_id, body.assist, pickLang(body.lang), undefined, { canCost: canSeeCost(a.user), caps: body.caps }));
         return json(out.body, out.httpStatus);
       }
       /* 4.67.8 — an answer read aloud (Gujarati, when this computer has no Gujarati voice) */

@@ -33,6 +33,9 @@ import { AsyncLocalStorage } from 'node:async_hooks';
  * is used up, every question is told so at once (AI_GOOGLE_DAILY) until Google's day turns; each question carries
  * only the parts of the plant and the rules it needs (AI_PROMPT_MAX_TOKENS); the answer's JSON shape goes with it
  * (GEMINI_SCHEMA=off to stop that); private names arrive as [C1]-style codes and are copied, never expanded.
+ * 4.74.0 (C21): a question about saved records ("which is lowest cost of bag") is answered with ONE query that the
+ * computer or the phone runs on its own records — the figures never come here; this service recognises such a
+ * question, describes the query in a fixed text, and cleans the query that comes back (dataAsked, cleanQuery).
  */
 
 const API = 'https://generativelanguage.googleapis.com/v1beta';
@@ -435,10 +438,22 @@ function inputsSchema(fields) {
   });
   return jo(props);
 }
+/* 4.74.0 — C21: the query's parts (the computer's {"do":"query"} step and the phone's "query" — the same shape) */
+const QUERY_VALUE = { anyOf: [JS.s, JS.n, JS.b, ja({ anyOf: [JS.s, JS.n, JS.b] }, 20)] };
+function queryProps() {
+  return {
+    where: ja(jo({ field: JS.s, op: je(DATA_OPS), value: QUERY_VALUE }, ['field', 'op']), 12),
+    period: jo({ field: JS.s, range: JS.s }, ['range']),
+    sort: ja(jo({ field: JS.s, dir: je(['asc', 'desc']) }, ['field']), 3),
+    limit: JS.n, group: JS.s, agg: ja(jo({ fn: je(DATA_FNS), field: JS.s }, ['fn']), 6), show: ja(JS.s, 12), say: JS.s
+  };
+}
+export const querySchema = () => jo(Object.assign({ from: je(DATA_COLLECTIONS) }, queryProps()), ['from']);
 export const SCHEMAS = {
   'check-bom': () => jo({ summary: JS.s, findings: ja(jo({ level: je(['problem', 'check', 'ok']), stage: JS.n, title: JS.s, detail: JS.s, fix: JS.s }, ['level', 'title']), 8) }, ['summary', 'findings']),
   help: () => jo({ transcript: JS.s, answer: JS.s, topics: ja(JS.s, 5) }, ['answer']),
-  chat: () => jo({ transcript: JS.s, answer: JS.s }, ['answer']),
+  /* 4.74.0 — C21: the phone's question about saved records may carry its "query" */
+  chat: (query) => jo(Object.assign({ transcript: JS.s, answer: JS.s }, query ? { query: querySchema() } : {}), ['answer']),
   'quote-letter': () => jo({ answer: JS.s, subject: JS.s, letter: JS.s, whatsapp: JS.s }, ['answer']),
   'plan-route': () => jo({ answer: JS.s, summary: JS.s, choice: je(['workflow', 'route', 'new', 'none']), workflowId: JS.s, routeId: JS.s,
     route: jo({ name: JS.s, steps: ja(jo({ code: JS.s, why: JS.s }, ['code']), 30) }), notes: ja(JS.s, 6) }, ['answer', 'choice']),
@@ -471,6 +486,8 @@ export const SCHEMAS = {
     };
     const props = { do: je(texts.map((x) => (/^\{"do":"(\w+)"/.exec(x) || [])[1]).filter((n, i, a) => n && a.indexOf(n) === i)) };
     texts.forEach((x) => { (x.match(/"(\w+)":/g) || []).forEach((m) => { const k = m.slice(1, -2); if (ALL[k] && !props[k]) props[k] = ALL[k]; }); });
+    /* 4.74.0 — C21: a question about saved records may write its query whole (its parts are described in QUERY) */
+    if (props.do.enum.indexOf('query') > -1) { const qp = queryProps(); Object.keys(qp).forEach((k) => { if (!props[k]) props[k] = qp[k]; }); if (!props.from) props.from = JS.s; }
     /* a calculation step whose question named no fields: no inputs to describe */
     if (props.inputs && !(fields && fields.length)) delete props.inputs;
     return jo({ transcript: JS.s, lang: je(['en', 'gu', 'hi']), answer: JS.s, steps: ja(jo(props, ['do']), 24), remember: JS.s, forget: ja(JS.s, 10), next: ja(JS.s, 3), run: JS.b }, ['answer', 'steps']);
@@ -1587,20 +1604,23 @@ export async function help(companyId, payload, lang, fetchImpl) {
 /* 4.72.0 — C14: `canCost` (the person has "costs and prices", VIEW_COST): each saved BOM's cost per bag and per kg
    (perBag, perKg — Rs, the saved BOM's totals) and each quotation's amount (Rs, its total before tax) are kept, as
    the phone sent them; for anybody else they never are */
+/* 4.74.0 review — owner 2026-10-02 ("બંધ કરો"): a bag's cost, a BOM's cost and a quotation's amount never go to Google
+   from the phone, for anybody — the BOMs' perBag / perKg and the quotations' amount (kept for "costs and prices" since
+   4.72.0, C14) are no longer kept; the phone answers such a question itself (a search, C21) or shows it on its page.
+   The materials' RATES for "costs and prices" stay as C14 sends them. `canCost` is no longer read here. */
 export function cleanPhone(d, canCost) {
   const x = d && typeof d === 'object' ? d : {};
   const c = x.counts && typeof x.counts === 'object' ? x.counts : {};
-  const yes = canCost === true;
   return {
     about: str(x.about, 700),
     counts: { calcs: nr(c.calcs), boms: nr(c.boms), quotes: nr(c.quotes), enquiries: nr(c.enquiries) },
     calcs: list(x.calcs, 150).map((r) => ({ n: str(r && r.n, 30), construction: str(r && r.construction, 60), width: nr(r && r.width), length: nr(r && r.length),
       gsm: nr(r && r.gsm), weight: nr(r && r.weight), target: nr(r && r.target), bags: nr(r && r.bags), status: str(r && r.status, 16), date: str(r && r.date, 10),
       bom: r && r.bom != null ? !!r.bom : null, rev: nr(r && r.rev) })).filter((r) => r.n),
-    boms: list(x.boms, 120).map((b) => Object.assign({ n: str(b && b.n, 30), calc: str(b && b.calc, 30), construction: str(b && b.construction, 60), route: str(b && b.route, 80),
-      mode: str(b && b.mode, 10), date: str(b && b.date, 10) }, yes ? { perBag: money(b && b.perBag), perKg: money(b && b.perKg) } : {})).filter((b) => b.n),
-    quotes: list(x.quotes, 120).map((q) => Object.assign({ n: str(q && q.n, 30), calcs: list(q && q.calcs, 10).map((v) => str(v, 30)), bags: nr(q && q.bags), items: nr(q && q.items),
-      status: str(q && q.status, 16), date: str(q && q.date, 10) }, yes ? { amount: money(q && q.amount) } : {})).filter((q) => q.n),
+    boms: list(x.boms, 120).map((b) => ({ n: str(b && b.n, 30), calc: str(b && b.calc, 30), construction: str(b && b.construction, 60), route: str(b && b.route, 80),
+      mode: str(b && b.mode, 10), date: str(b && b.date, 10) })).filter((b) => b.n),
+    quotes: list(x.quotes, 120).map((q) => ({ n: str(q && q.n, 30), calcs: list(q && q.calcs, 10).map((v) => str(v, 30)), bags: nr(q && q.bags), items: nr(q && q.items),
+      status: str(q && q.status, 16), date: str(q && q.date, 10) })).filter((q) => q.n),
     marketing: cleanMarketing(x.marketing)
   };
 }
@@ -1618,6 +1638,9 @@ export function cleanPhone(d, canCost) {
    name, rate, unit and the date it applies from, the materials the question names first, at most 60 and within the
    question's budget (AI_PROMPT_MAX_TOKENS). Material names are not private (C9); customer and item names stay
    coded by the phone. Every other kind, and the computer's /v1/ai/assist, is as before.
+   4.74.0 review — owner 2026-10-02 ("બંધ કરો"): the phone's own perBag / perKg / amount are NO LONGER kept for anybody —
+   a bag's cost, a BOM's cost and a quotation's amount never go to Google from the phone (cleanPhone, CHAT_KINDS.phone);
+   the RATES above are unchanged.
    ========================================================================== */
 /** a money figure as given (to 4 places — a rate of 0.125 Rs/pc stays 0.125); none for an empty value */
 function money(v) {
@@ -1726,8 +1749,10 @@ const CHAT_KINDS = {
   edit: (d) => cleanEdit(d),
   quote: (d) => cleanQuote(d).quote,
   help: (d) => { const h = cleanHelp(d); return { topics: h.topics, glossary: h.glossary, screen: h.screen }; },
-  /* C14 — for a person who may not see costs, every money field and figure is taken out FIRST, whatever the phone sent */
-  phone: (d, canCost) => cleanPhone(canCost === true ? d : stripMoney(d), canCost === true)
+  /* C14 — for a person who may not see costs, every money field and figure is taken out FIRST, whatever the phone sent.
+     4.74.0 review — owner 2026-10-02: for EVERY person — a bag's cost, a BOM's cost and a quotation's amount never go to
+     Google from the phone (an older phone still sends them); the materials' RATES for "costs and prices" are added later */
+  phone: (d, canCost) => cleanPhone(stripMoney(d), canCost === true)
 };
 const CHAT_WHAT = {
   bom: 'the bill of materials (its stages, sources, recipes and waste)',
@@ -1747,9 +1772,15 @@ const CHAT_JSON = 'Answer ONLY with JSON: {"transcript": string, "answer": strin
 const CHAT_SYSTEM = CHAT_HEAD.concat([CHAT_NO_PRICES, PRIVATE_LINE, CHAT_JSON]).join(' ');
 /* 4.72.0 — C14: the phone's instructions, by whether the person may see costs */
 const PHONE_COSTS_CLOSED = 'COSTS AND PRICES ARE NOT OPEN TO THIS PERSON: their administrator has not given them the "costs and prices" right, and nothing here holds a rate, a price, a cost or an amount in rupees. When they ask for one — a material’s rate or price (bhav, kimat, ભાવ, કિંમત, भाव, कीमत), a bag’s or a BOM’s cost (kharch, ખર્ચ, खर्च, lagat), a quotation’s value or margin — answer plainly, in their language, that costs and prices are not open to them in Nexora and that their administrator can give them the "costs and prices" right. Never give a figure, a guess, an estimate or a range. Their other questions are answered as usual.';
-const PHONE_COSTS_OPEN = 'COSTS AND PRICES ARE OPEN TO THIS PERSON (their administrator gave them the "costs and prices" right). In the CONTEXT, boms "perBag" and "perKg" are each saved BOM’s cost in Rs per bag and per kg, and quotes "amount" is each quotation’s total in Rs before tax. RATES, sent when the question is about rates, prices or costs, are the raw materials’ current rates from the company’s price master: code, name, rate, unit, since (the date that rate applies from). Rates are Rs per kg unless a unit is given (then Rs per that unit). Quote every figure exactly as given, with its unit and its date — never round it, convert it, work out a new one, estimate or guess. A material not in RATES has no rate here: say so (when RATES_LEFT_OUT is given, more materials have rates than were sent — ask for the material by its name or code). Never recompute weights or costs — Nexora’s engines do that. If the question needs something not in the CONTEXT, say so plainly.';
-export function phoneSystem(canCost) {
-  return CHAT_HEAD.concat(canCost === true ? [PHONE_COSTS_OPEN] : [CHAT_NO_PRICES, PHONE_COSTS_CLOSED], [PRIVATE_LINE, CHAT_JSON]).join(' ');
+/* 4.74.0 review — owner 2026-10-02: a bag's cost, a BOM's cost and a quotation's amount no longer come here (cleanPhone);
+   the person is told where the phone shows them, or (a phone that runs searches, C21) the search finds them */
+const PHONE_COSTS_OPEN = 'COSTS AND PRICES ARE OPEN TO THIS PERSON (their administrator gave them the "costs and prices" right). RATES, sent when the question is about rates, prices or costs, are the raw materials’ current rates from the company’s price master: code, name, rate, unit, since (the date that rate applies from). Rates are Rs per kg unless a unit is given (then Rs per that unit). Quote every figure exactly as given, with its unit and its date — never round it, convert it, work out a new one, estimate or guess. A material not in RATES has no rate here: say so (when RATES_LEFT_OUT is given, more materials have rates than were sent — ask for the material by its name or code). A BAG’S COST, A BOM’S COST AND A QUOTATION’S AMOUNT NEVER COME TO YOU — they stay on the phone: never give one, work one out, estimate or guess one; say that the phone shows it on that BOM’s or that quotation’s page in the app (when QUERY is given below, answer with a query instead — the phone shows the figure under your answer). Never recompute weights or costs — Nexora’s engines do that. If the question needs something not in the CONTEXT, say so plainly.';
+/* 4.74.0 — C21: a question about saved records also gets the data rule and the dictionary (fixed per "costs and prices",
+   after the lines every phone question shares, so Google's cache keeps them), and may answer with a "query" */
+const CHAT_JSON_QUERY = 'Answer ONLY with JSON: {"transcript": string, "answer": string, "query": a QUERY or null}.';
+export function phoneSystem(canCost, data) {
+  return CHAT_HEAD.concat(canCost === true ? [PHONE_COSTS_OPEN] : [CHAT_NO_PRICES, PHONE_COSTS_CLOSED], [PRIVATE_LINE],
+    data ? [DATA_RULE_PHONE, dataDictionary({ phone: true, cost: canCost === true })] : [], [data ? CHAT_JSON_QUERY : CHAT_JSON]).join(' ');
 }
 const RATES_MAX = 60;
 /** C14 — RATES for the phone's CONTEXT: the ranked price list, at most 60, the named ones always, the rest while the
@@ -1785,6 +1816,8 @@ export function cleanChat(p, canCost) {
   const hide = kind === 'phone' && canCost !== true;
   return {
     kind: kind,
+    /* 4.74.0 — C21: what the asking app can do ("caps": ["query"]) — never sent on */
+    can: { query: !!capsOf(x.caps).query },
     text: str(x.text, 800),
     context: CHAT_KINDS[kind](x.context || {}, canCost === true),
     history: list(kept, 24).map((h) => ({ role: h && h.role === 'model' ? 'model' : 'user', text: str(hide ? hideMoneyWords(h && h.text) : h && h.text, 1500) })).filter((h) => h.text)
@@ -1806,7 +1839,15 @@ export async function chat(companyId, payload, lang, fetchImpl, who) {
   const question = langLine(lang, 'the answer') + (m.audio ? 'The question is in the attached recording.' + (p.text ? ' Also typed: ' + p.text : '') : p.text);
   const turns = answeredOnly(p.history);
   const phone = p.kind === 'phone';
-  const system = phone ? phoneSystem(canCost) : CHAT_SYSTEM;
+  /* 4.74.0 — C21: a question about saved records (or a short follow-up of one) is answered with a query the phone runs on
+     its own records: the instructions say how to write one, and the answer's shape may carry it. A recording's words are
+     not known here: it may be one. Only for a phone that says it runs queries ("caps": ["query"]) — any other phone is
+     answered exactly as by the 4.73.0 service. */
+  if (who && capsOf(who.caps).query) p.can.query = true;
+  const runsQuery = phone && queryOn(p);
+  const dataOn = runsQuery && (!!m.audio || phoneDataAsked(p.text, asked));
+  const system = phone ? phoneSystem(canCost, dataOn) : CHAT_SYSTEM;
+  const schema = SCHEMAS.chat(dataOn);
   let ctx = p.context;
   if (phone) {
     /* C14 — a question about rates, prices or costs (or a short follow-up of one); the price list is read only for
@@ -1819,8 +1860,10 @@ export async function chat(companyId, payload, lang, fetchImpl, who) {
       catch (e) { unread = true; }
     }
     ctx = phoneContext(p.context, p.text + ' ' + asked.map((h) => h.text).join(' '), { rates: ratesOn, costs: canCost && ratesOn, materialNamed: !!(ranked && ranked.named) });
+    /* 4.74.0 review — a search compares dates with today's (India's date; the fixed dictionary never carries it) */
+    if (dataOn) ctx.TODAY = today();
     if (ranked && ranked.rows.length) {
-      const fixed = estTokens(system) + estTokens(CHAT_WHAT.phone) + estTokens(question) + estTokens(JSON.stringify(SCHEMAS.chat())) +
+      const fixed = estTokens(system) + estTokens(CHAT_WHAT.phone) + estTokens(question) + estTokens(JSON.stringify(schema)) +
         turns.reduce((n, h) => n + estTokens(h.text) + 8, 0) + 60;
       Object.assign(ctx, ratesBlock(ranked, promptMax() - fixed - estTokens(JSON.stringify(ctx))));
     } else if (ranked) ctx.RATES_NOTE = 'No material has a rate in the company’s price master yet.';
@@ -1830,10 +1873,21 @@ export async function chat(companyId, payload, lang, fetchImpl, who) {
     { role: 'model', parts: [{ text: '{"transcript":"","answer":"Understood. Ask me."}' }] }];
   turns.forEach((h) => contents.push({ role: h.role, parts: [{ text: h.role === 'model' ? JSON.stringify({ transcript: '', answer: h.text }) : h.text }] }));
   contents.push({ role: 'user', parts: m.parts.concat([{ text: question }]) });
-  const a = await ask(companyId, system, { contents: contents }, fetchImpl, { kind: 'chat', schema: SCHEMAS.chat() });
+  const a = await ask(companyId, system, { contents: contents }, fetchImpl, { kind: 'chat', schema: schema });
   if (a.fail) return a.fail;
   const j = a.json || {};
-  return { httpStatus: 200, body: { ok: true, model: a.model, left: a.left, transcript: str(j.transcript, 800), answer: str(j.answer, 3000) } };
+  const body = { ok: true, model: a.model, left: a.left, transcript: str(j.transcript, 800), answer: str(j.answer, 3000) };
+  /* 4.74.0 — C21: the phone's query comes back CLEANED (cleanQuery, as the computer's step); a part it could not use is
+     named in "dropped". The phone runs it on its own records — the figures never come back here. */
+  /* 4.74.0 review — "query": {} is the model's way of writing "no query" (its JSON line says "a QUERY or null"): nothing
+     to run and nothing to say about it */
+  const emptyQuery = !!j.query && typeof j.query === 'object' && !Array.isArray(j.query) && !Object.keys(j.query).length;
+  if (runsQuery && j.query != null && !emptyQuery) {
+    const cq = cleanQuery(j.query);
+    if (cq.query) body.query = cq.query;
+    if (cq.dropped.length) body.dropped = cq.dropped;
+  }
+  return { httpStatus: 200, body: body };
 }
 
 /* ==========================================================================
@@ -1921,6 +1975,8 @@ export function cleanAssist(p) {
   const c = n.calc && typeof n.calc === 'object' ? n.calc : {};
   const fill = cleanFill({ constructions: x.constructions, fields: x.fields, current: c, units: x.units });
   return {
+    /* 4.74.0 — C21: what the asking app can do ("caps": ["query"]) — never sent on */
+    can: { query: !!capsOf(x.caps).query },
     screen: ASSIST_VIEWS.indexOf(x.screen) > -1 ? x.screen : 'dashboard',
     text: str(x.text, 1200),
     history: list(Array.isArray(x.history) ? x.history.slice(-20) : [], 20).map((h) => ({ role: h && h.role === 'model' ? 'model' : 'user', text: str(h && h.text, 2500) })).filter((h) => h.text),
@@ -1999,10 +2055,325 @@ export function cleanAssist(p) {
   };
 }
 
+/* ==========================================================================
+   4.74.0 — C21: DATA QUESTIONS — NEXORA AI WRITES A QUERY, THE DEVICE ANSWERS IT
+   --------------------------------------------------------------------------
+   Owner 2026-10-02, after "which is lowest cost of bag" got only an action: "dont write code for perticular questtion
+   i mean user can ask any information from software or on mobile". A bag's cost never comes here, and no list sent
+   with a question holds every saved record, so such a question could not be answered. Now a question about SAVED
+   RECORDS — which, how many, the lowest or the highest, a total, an average, a list, a summary …, in English, Gujarati
+   or Hindi — is answered with ONE query: the computer (assist: a {"do":"query"} step) or the phone (chat, kind "phone":
+   "query" beside the answer) runs it at once on its OWN records and shows the figures; they never come here and never
+   go to Google. This service:
+     · recognises such a question from its words, without asking any model (dataAsked) — the kinds of words, never a
+       list of particular questions;
+     · tells the model the query's shape and each collection's fields in a FIXED text (dataDictionary: the same words
+       every time — one text with costs, one without — so Google's implicit cache keeps them), only for such a question;
+     · sends no saved-record rows with a question about money (they never hold a cost; the device has every record),
+       and nothing of the work on a bag, a BOM or a master that the question's words ("cost", "bag") would have brought;
+     · cleans the query that comes back (cleanQuery — the same for the computer's step and the phone's "query").
+   ========================================================================== */
+/* 4.74.0 — C21, CAPS (lead 2026-10-02): only an app that can RUN a query says so — "caps": ["query"] in its request (in
+   the assist or chat payload, or beside it in the body: index.js passes body.caps as who.caps). Only then is a question
+   about saved records answered with a query (the data rule and the dictionary, the query step, the phone's "query",
+   cleanQuery). Without it every question is answered EXACTLY as the 4.73.0 service answered it, so a 4.73.0 desktop or a
+   1.0.2 phone (which cannot run one) is unchanged. An array of short strings; anything else in it, or around it, is
+   ignored. */
+export function capsOf() {
+  const out = {};
+  for (let i = 0; i < arguments.length; i++) {
+    const a = arguments[i];
+    if (Array.isArray(a)) a.slice(0, 20).forEach((c) => { if (typeof c === 'string' && c.length <= 40 && c.trim()) out[c.trim().toLowerCase()] = true; });
+  }
+  return out;
+}
+/** does this question's app run queries (cleanAssist / cleanChat put "can" on the question) */
+const queryOn = (p) => !!(p && p.can && p.can.query === true);
+export const DATA_COLLECTIONS = ['calcs', 'boms', 'quotes', 'enquiries', 'customers', 'followups'];
+export const DATA_OPS = ['is', 'not', 'has', 'starts', 'in', '>', '>=', '<', '<=', 'between', 'empty', 'notempty'];
+export const DATA_FNS = ['count', 'sum', 'avg', 'min', 'max'];
+/** each collection, what it is, and its fields as the computer and the phone name them ("$" a cost — shown only to a
+    person with "costs and prices"; "Q" a quotation's selling figure — not offered to a phone without that right, C14) */
+const DATA_FROM = [
+  ['calcs', 'saved calculations, latest revision', ['number', 'item', 'customer', 'construction', 'weightG (net g a bag)', 'costPerBag $', 'costPerKg $', 'bags', 'createdBy', 'createdAt', 'modifiedAt', 'input.<FIELD KEY> (e.g. input.WIDTH)']],
+  ['boms', 'saved BOMs', ['number', 'calc', 'item', 'construction', 'route', 'bags', 'totalKg', 'costPerBag $', 'costPerKg $', 'totalCost $', 'savedBy', 'savedAt']],
+  ['quotes', 'quotations', ['number', 'date', 'customer', 'items (lines)', 'bags', 'amount (grand total) Q', 'validTo', 'enquiry', 'createdBy']],
+  ['enquiries', 'Marketing enquiries', ['number', 'date', 'customer', 'source', 'status (NEW|CONTACTED|CALCULATED|QUOTED|NEGOTIATION|WON|LOST)', 'open (true unless WON or LOST)', 'assignedTo', 'bags', 'kg', 'nextFollowUp', 'wonAt', 'lostAt', 'location']],
+  ['customers', 'customers', ['name', 'city', 'state', 'gstin', 'contact', 'phone', 'enquiries (count)', 'wonEnquiries (count)', 'createdAt']],
+  ['followups', 'follow-ups written on enquiries', ['enquiry', 'customer', 'date', 'kind', 'by', 'next', 'note']]
+];
+/** the date a period is read on when the model names none */
+const DATA_DATE = { calcs: 'createdAt', boms: 'savedAt', quotes: 'date', enquiries: 'date', customers: 'createdAt', followups: 'date' };
+export const DATA_RULE = 'DATA QUESTIONS — YOU CANNOT SEE SAVED FIGURES. For a question about saved records (which / how many / lowest / highest / cheapest / costliest / total / average / sum / list / summary / compare / count …, in English, Gujarati or Hindi) answer with ONE query step and a short answer: the person’s computer runs it over ALL its own records and shows the figures under your answer — they never come to you. Never guess or invent figures, and never count, add up or pick from the lists in the CONTEXT for such a question (they hold only the newest few, and no cost). Never send the person to a window for such a question. Use find only to OPEN a record by its number.';
+export const DATA_RULE_PHONE = 'DATA QUESTIONS — YOU CANNOT SEE EVERY SAVED FIGURE. For a question about saved records (which / how many / lowest / highest / cheapest / costliest / total / average / sum / list / summary / compare / count …, in English, Gujarati or Hindi) answer with ONE "query" and a short answer: the phone runs it over ALL its own records and shows the figures under your answer — they never come to you. Never guess or invent figures, and never count, add up or pick from the lists in the CONTEXT for such a question (they may be cut short). Never tell the person to open the computer for it.';
+const dictMemo = {};
+/** The dictionary of the query — the same text every time for each kind ({phone, cost}): the computer's or the phone's,
+    with the costs ($) for a person with "costs and prices", without them for anybody else (on the phone also without a
+    quotation's amount, as C14 keeps it). */
+export function dataDictionary(o) {
+  const phone = !!(o && o.phone === true), cost = !(o && o.cost === false);
+  const key = (phone ? 'phone' : 'computer') + (cost ? '$' : '');
+  if (dictMemo[key]) return dictMemo[key];
+  const keep = (f) => (cost || !/ \$$/.test(f)) && (cost || !phone || !/ Q$/.test(f));
+  const from = DATA_FROM.map((c) => c[0] + ' = ' + c[1] + ': ' + c[2].filter(keep).map((f) => f.replace(/ Q$/, '')).join(', ')).join('; ');
+  const example = cost
+    ? '"which is the lowest cost bag" → {"from":"calcs","where":[{"field":"costPerBag","op":"notempty"}],"sort":[{"field":"costPerBag","dir":"asc"}],"limit":5,"show":["number","item","construction","costPerBag"],"say":"The lowest cost a bag is {costPerBag} — {number}, {item}."}; ' +
+      '"blockbottom bag cost summary" → {"from":"calcs","where":[{"field":"construction","op":"has","value":"block bottom"}],"agg":[{"fn":"count"},{"fn":"min","field":"costPerBag"},{"fn":"avg","field":"costPerBag"},{"fn":"max","field":"costPerBag"}],"say":"{count} block bottom bags: {min.costPerBag} to {max.costPerBag} a bag, {avg.costPerBag} on average."}'
+    : '"which saved bag is the heaviest" → {"from":"calcs","sort":[{"field":"weightG","dir":"desc"}],"limit":5,"show":["number","item","construction","weightG"],"say":"The heaviest is {number}, {item}: {weightG}."}; ' +
+      '"2L bag weight summary" → {"from":"calcs","where":[{"field":"construction","op":"has","value":"2L"}],"agg":[{"fn":"count"},{"fn":"min","field":"weightG"},{"fn":"avg","field":"weightG"},{"fn":"max","field":"weightG"}],"say":"{count} 2L bags: {min.weightG} to {max.weightG}, {avg.weightG} on average."}';
+  dictMemo[key] = 'QUERY — the search the person’s ' + (phone ? 'phone' : 'computer') + ' runs on its own records: {"from":C,"where":[{"field":F,"op":OP,"value":V}],"period":{"field":DATE F,"range":R},"sort":[{"field":F,"dir":"asc"|"desc"}],"limit":1-50,"group":F,"agg":[{"fn":"count"|"sum"|"avg"|"min"|"max","field":F}],"show":[F,…],"say":S} — "from" and only the parts the question needs' +
+    (phone ? ', in your JSON as "query".' : ', as a step {"do":"query",…}.') +
+    ' C and its fields F' + (cost ? ' ($ = a cost, shown only to a person with "costs and prices")' : '') + ': ' + from + '.' +
+    ' OP: is, not, has (contains), starts, in (value a list), >, >=, <, <=, between (value [a,b]), empty, notempty — text ignores case and spaces ("block bottom" has-matches "3L BLOCK BOTTOM"), dates YYYY-MM-DD, true/false.' +
+    ' DATE F: createdAt, modifiedAt, savedAt, date, validTo, nextFollowUp, wonAt, lostAt, next. R: today, yesterday, this-week (the last 7 days), last-week, this-month, last-month, this-year, last-N-days (e.g. last-30-days), YYYY-MM-DD..YYYY-MM-DD.' +
+    /* 4.74.0 review — owner 2026-10-02: "give me todays important followup list" (TODAY is in the CONTEXT, never here) */
+    ' TODAY in the CONTEXT is today’s date. Follow-ups due or overdue (today’s, pending or important follow-ups) = from enquiries where open is true and nextFollowUp <= TODAY’s date, sorted by nextFollowUp, earliest first.' +
+    ' agg works on the rows left after where and period (count = rows); with group, one row per value of F, largest first; without group, one summary line and the rows (show, sort, limit; 10 rows unless limit says).' +
+    ' S: one sentence in the person’s language that the device completes — {count}, {sum.F} {avg.F} {min.F} {max.F}, {F} = the first row’s F after sort ({group} = the first group’s value); write no figure yourself; a name the person gave goes as its code ([C1], [I1]).' +
+    ' For example ' + example + '; "ketla enquiry aa mahine won thaya" → {"from":"enquiries","where":[{"field":"status","op":"is","value":"WON"}],"period":{"field":"wonAt","range":"this-month"},"agg":[{"fn":"count"},{"fn":"sum","field":"bags"}],"say":"{count} enquiries won this month — {sum.bags} bags."}.';
+  return dictMemo[key];
+}
+
+/* ---- is it a question about saved records? (English, Gujarati and Hindi, in either script) -------------------------
+   A record (a bag, a calculation, a BOM, a quotation, an enquiry, a customer, a follow-up, an order …) asked about with
+   "which / how many" right before it, or with "the most / the lowest / a total / an average / a list / a summary /
+   above N" anywhere, or a list of them over a time ("quotations this month"). Not: the bag, BOM or quotation on screen
+   ("this bag", "aa bag", "इस बैग"), a record named by its number (find, compare, its own figures), a bag described to
+   calculate (a size, grams, gsm — unless saved records are asked about: "saved", "this month"), a recipe's figures, a
+   how-to or a place in the software, a conversion ("how many bags in one bale"), advice ("which route should …"). */
+const DQ_NOUN = '(?:\\b(?:bags?|sacks?|calc\\w*|boms?|quot\\w*|enquir\\w*|inquir\\w*|customers?|cost[ou]mers?|custmers?|part(?:y|ies)|buyers?|clients?|follow\\W?ups?|followups?|orders?|leads?|records?|sales|sold|won|lost|wins?|deals?|items?|thel[ia]\\w*|ganatri\\w*|kotesan\\w*|kotation\\w*|grahak\\w*|jeet\\w*|jit[aeiy]\\w*|jity\\w*|business|turnover|revenue|dhandh[oa])\\b' +
+  '|બેગ|થેલી|ગણતરી|કેલ્ક્યુલેશન|બીઓએમ|કોટેશન|ક્વોટેશન|ઇન્ક્વાયરી|એન્ક્વાયરી|ઈન્કવાયરી|ઇન્કવાયરી|ગ્રાહક|પાર્ટી|ફોલો|ઓર્ડર|જીત્ય|લીડ' +
+  '|बैग|बेग|थैल|गणना|कैलकुलेशन|बीओएम|कोटेशन|पूछताछ|इंक्वायरी|एन्क्वायरी|इन्क्वायरी|ग्राहक|पार्टी|फॉलो|ऑर्डर|जीत|लीड)';
+const DQ_WHICH = '(?:\\b(?:which|kai(?!\\s+rite)|kayi(?!\\s+rite)|kayu|kaya|kayo|kaun\\s*s[aie]|kaunsa|kaunsi|konsa|konsi|kis(?!\\s+(?:tarah|prakar))|how\\s+many|how\\s+much|number\\s+of|count\\s+of|ketl[aiuoe]|kitn[aeiy]|kul|what\\s+(?:are|were)(?:\\s+(?:my|the|all|our))?)\\b' +
+  '|કઈ(?!\\s*રીતે)|કઇ(?!\\s*રીતે)|કયું|કયા|કયો|કયી|કેટલ\\S*|કુલ|कौन\\s*स[ाीे]|किस(?!\\s*तरह)|कितन\\S*|कुल)';
+const DQ = {
+  noun: new RegExp(DQ_NOUN, 'i'),
+  /* "which …" / "how many …" with the records right after it (at most two words between) */
+  whichNoun: new RegExp(DQ_WHICH + '\\s*(?:\\S+\\s+){0,2}?' + DQ_NOUN, 'i'),
+  /* the most, the least, a total, an average, a list, a summary — the records named anywhere in the question */
+  most: new RegExp('(?:\\b(?:lowest|highest|cheapest|costliest|dearest|heaviest|lightest|biggest|smallest|largest|maximum|minimum|most\\s+\\w+|least\\s+\\w+|top\\s+(?:\\d+|customers?|parties|buyers?|sources?|items?|sellers?|selling)|bottom\\s+\\d+|total|totals|sum|average|avg|mean|summary|summery|sumary|summari[sz]e|report|breakdown|statistics|stats|compare|comparison|list|count|sauthi|sau\\s+thi|sabse|sab\\s+se|sast[aiou]|saste|mongh[aiou]|mehe?ng[aie]|mahe?ng[aie]|sarerash|saravali|ausat|yadi)\\b' +
+    '|સૌથી|સસ્ત|મોંઘ|સરેરાશ|યાદી|ટોટલ|લિસ્ટ|સમરી|सबसे|सस्त|महंग|महँग|मेहंग|औसत|सूची|लिस्ट|टोटल|समरी)', 'i'),
+  /* a figure the records are filtered on: "above 8", "more than 500", "500 thi vadhare", "500 से ज्यादा" (4.74.0 review —
+     and with the rupees said between: "5 rupiya thi ochhi", "5 रुपये से कम", "5 rs se kam") */
+  filter: /\b(?:above|below|more\s+than|less\s+than|over|under|greater\s+than|at\s+least|at\s+most|between)\s+(?:rs\.?\s*|₹\s*)?\d|\d+\s*(?:(?:rs\.?|₹|rupiya|rupees?|rupaye|rupaiya|rupya|રૂપિયા|રૂ\.?|रुपये|रुपए|रुपया|रु\.?|bags?|kgs?|kilo|nang|pcs|બેગ|થેલી|કિલો|बैग|किलो)\s*)?(?:thi|થી|से|se)\s*(?:vadh|ochh|ocha|vadhu|વધ|ઓછ|ज़्यादा|ज्यादा|कम|ऊपर|नीचे|zyada|jyada|kam\b|upar|niche)/i,
+  /* a time, or the records as saved — "this month", "aaje", "इस हफ़्ते", "saved", "bani", "बनाईं" (4.74.0 review — and
+     "todays", "aajna", "આજના") */
+  when: /\b(?:today|todays|yesterday|this\s+(?:week|month|year)|last\s+(?:week|month|year|\d+\s+days)|aaj|aaje|aajn[aiuo]|kale|aa\s+(?:mahine|mahina|varshe|varase|athvadiye)|is\s+(?:mahine|hafte|saal)|pichh?l[ae]\s+(?:mahine|hafte)|gaye?\s+mahine|january|february|march|april|june|july|august|september|october|november|december|saved|save\s+(?:thay\w*|kar\w*|kiy\w*|kie|kiye|hai|che|chhe)|stored|history|so\s+far|till\s+now|abhi\s+tak|atyar\s+sudhi|banya|bani|banel\w*|banavel\w*|aavya|aavi|aaye|thaya)\b|આજે|આજના|આજની|આજનું|આજનુ|આજનો|ગઈકાલે|આ\s*મહિને|આ\s*અઠવાડિયે|ગયા\s*મહિને|આ\s*વર્ષે|अब\s*तक|આવ્યા|આવી|બન્યા|બની|બનેલ|બનાવેલ|બનાવી|થયા|થઈ|અત્યાર\s*સુધી|आज|इस\s*महीने|इस\s*हफ़्ते|इस\s*हफ्ते|पिछले\s*महीने|इस\s*साल|सेव|बने|बनी|बनाए|बनाईं|आए|आई|\d{4}-\d{2}/i,
+  /* 4.74.0 review — the records grouped ("customer wise enquiries", "month-wise quotations") */
+  group: /\b(?:customer|party|parties|grahak|month|mahina|mahine|week|day|date|daily|year|source|person|people|salesman|salesmen|staff|user|construction|status|city|state|item|size|bag|route|quality|type)\s*-?\s*wise\b/i,
+  /* 4.74.0 review — a state the follow-ups or the enquiries are in: "pending follow-ups", "overdue followups", "lost
+     enquiries", "today's important follow-ups", "બાકી ફોલો અપ" (owner 2026-10-02: "give me todays important followup list") */
+  followish: /\b(?:follow\W?ups?|followups?|enquir\w*|inquir\w*|leads?)\b|ફોલો|ઇન્ક્વાયરી|એન્ક્વાયરી|ઈન્કવાયરી|ઇન્કવાયરી|લીડ|फॉलो|पूछताछ|इंक्वायरी|एन्क्वायरी|इन्क्वायरी|लीड/i,
+  state: /\b(?:overdue|pending|due|late|missed|important|urgent|open|closed|won|lost|baki|baaki)\b|બાકી|મહત્વ|જરૂરી|बाकी|ओवरड्यू|ज़रूरी|जरूरी|महत्वपूर्ण/i,
+  /* 4.74.0 review — an EDIT ("set the BOM total to 500 kg", "remove the total lamination from the BOM", "reduce the bag
+     cost to the lowest", "put the lowest waste in every stage", "bag ni total cost 7 karo", "badhi bag ni cost vadharo"):
+     work on a bag, a BOM, a quotation or a master — not a question about saved records ("how many did we change" is one) */
+  edit: new RegExp('(?<!\\b(?:did|do|does|we|i|you|they|was|were|been|be|is|are)\\s)\\b(?:set(?!\\s+of\\b)|change|remove|delete|reduce|increase|decrease|lower(?!\\s+than)|raise|put|add(?!\\s+up\\b)|update|replace|apply|fill|edit|modify|adjust|mark|move|copy|rename|cancel|clear|recalculate|recompute|optimi[sz]e)\\b' +
+    /* not a past or a passive: "kitne bag add hue", "ketla quotation update thaya", "ketli bags delete kari" */
+    '(?!\\s+(?:hue|hua|hui|huye|huyi|kiye|kiya|kie|ki|kari|karel\\w*|karya|thaya|thai|thayu|thayi|thay\\w*|gaye|gayi|gaya|hai|che|chhe)\\b)' +
+    '|\\b(?:vadharo|vadhari\\s*(?:do|dyo|aapo)|ghatado|ghatadi\\s*(?:do|dyo)|ghatao|ghata\\s*do|badhao|badha\\s*do|umero|umeri\\s*(?:do|dyo)|kadho|kadhi\\s*(?:do|dyo|nakho)|hatao|hata\\s*do|badlo|badli\\s*(?:do|dyo|nakho)|badal\\s*do|nakho|nakhi\\s*do|muko|mukho|muki\\s*do|jodo|jod\\s*do|dalo|daal\\s*do|lagao|laga\\s*do|kam\\s*kar(?:o|\\s*do)|ochh[iuo]\\s*kar(?:o|i\\s*do))\\b' +
+    '|\\d\\s*(?:\\S+\\s+)?(?:karo|kar\\s*do|kari\\s*do)\\b' +
+    '|વધારો|વધારી\\s*દો|ઘટાડો|ઘટાડી\\s*દો|ઉમેરો|ઉમેરી\\s*દો|કાઢો|કાઢી\\s*(?:દો|નાખો)|બદલો|બદલી\\s*(?:દો|નાખો)|નાખો|મૂકો|ઓછ\\S*\\s*કરો|\\d\\s*(?:\\S+\\s+)?(?:કરો|કરી\\s*દો)' +
+    '|बढ़ाओ|बढाओ|बढ़ा\\s*दो|बढा\\s*दो|घटाओ|घटा\\s*दो|जोड़ो|जोडो|जोड़\\s*दो|हटाओ|हटा\\s*दो|बदलो|बदल\\s*दो|डालो|डाल\\s*दो|लगाओ|लगा\\s*दो|कम\\s*कर(?:ो|\\s*दो)|\\d\\s*(?:\\S+\\s+)?(?:करो|कर\\s*दो)', 'i'),
+  /* 4.74.0 review — a QUANTITY to make ("total kg for 10000 bags", "5000 bag no total kharch"): a bag's work, not saved
+     records ("top 100 bags", "the last 100 bags" are records) */
+  qty: /(?<!\b(?:top|bottom|first|last|latest|newest|recent|oldest|chh?ell\w*|pichh?l\w*|aakh?ri)\s)\b\d[\d,]{2,}\s*(?:k\s+)?(?:bags?|sacks?|thel[ia]\w*|nang|nos|pcs|pieces)\b|\d[\d,]{2,}\s*(?:બેગ|થેલી|नग|बैग|बेग|थैल)/i,
+  all: /\b(?:all|every|badh[aiu]|sab|saare?|sabhi)\b|બધ|सभी|सारे|सब\s/i,
+  show: /\b(?:show|list|display|batav\w*|batao|bataao|dikha\w*)\b|બતાવ|દેખાડ|बताओ|बताइए|दिखाओ|दिखाइए/i,
+  /* a piece of work, not a question ("call the customer today", "add a follow-up today") */
+  work: /\b(?:add|make|create|note|remind|set|call|send|write|save|delete|remove|change|update|open|start|karo|kar\s*do|banavo|banao)\b|નોંધ|કરો|બનાવો|करो|बनाओ/i,
+  /* something to make or send ("kul 5000 bag nu quotation banavo", "make the cheapest bag", "सबसे सस्ता बैग बनाओ") — not
+     "how many did we make", not a list, a summary or a report to make */
+  make: /(?<!\b(?:did|do|does|to|we|i|you|they|can|could|will|would)\s)\b(?:make|create|prepare|send)\b|\b(?:banavo|banao|bana\s*do|banavi\s*(?:do|aapo|dyo)|moklo|mokli\s*do|bhejo|bhej\s*do)\b|બનાવો|બનાવી\s*(?:દો|આપો)|મોકલો|बनाओ|बना\s*दो|बनाइए|भेजो|भेज\s*दो/i,
+  listish: /\b(?:list|summary|summery|sumary|report|breakdown|statistics|stats|yadi|table)\b|યાદી|લિસ્ટ|સમરી|રિપોર્ટ|सूची|लिस्ट|समरी|रिपोर्ट/i,
+  /* the bag, BOM or quotation ON SCREEN: its own figures, not saved records */
+  onScreen: /\b(?:this|that)\s+(?:bag|sack|bom|calc\w*|quot\w*)\b|\b(?:aa|is|iss|ye|yeh)\s+(?:bag|bom|calc\w*|quot\w*|theli|ganatri)\b|(?:^|\s)(?:આ|એ)\s*(?:બેગ|થેલી|બીઓએમ|ગણતરી|કોટેશન|ક્વોટેશન|bag|bom)|(?:इस|यह|ये|उस)\s*(?:बैग|थैली|बीओएम|गणना|कोटेशन|bag|bom)/i,
+  number: /\b(?:CAL|BOM|QT|ENQ)-\d/i,
+  advice: /\bshould\b|\bshall\b|\brecommend|\bsuggest|\bbetter\s+(?:for|to)\b|\bcan\s+(?:i|we)\b|\blimit\b|\bdemo\b|\blicen[cs]e|joie|joiye|chahiye|चाहिए|જોઈએ/i,
+  /* a how-to, a place in the software, a conversion ("how many bags in one bale") */
+  help: /\bhow\s+(?:do|to|can|should)\b|\bsteps?\s+(?:to|for)\b|\bwhere\b|\bmeaning\b|\bexplain|\bwindow|\bscreen\b|\bbutton|\bmenu\b|\bkem\b|kevi\s+rite|kai\s+rite|\bkaise\b|\bkahan\b|\bkaha\b|કેવી\s*રીતે|ક્યાં|कैसे|कहाँ|कहां|\b(?:how\s+many|ketl[aiuoe]|kitn[aeiy])\s+\S+\s+(?:per|in\s+(?:one|a|an|1|each))\s+(?:bale|bundle|box|roll|kg|kilo|ton|tonne|meter|metre|mtr|truck|container|lot|packet|pallet)s?\b|\b(?:ek|1)\s+(?:bale|bundle|gaanth|gansdi|kg|kilo|ton)\s+ma/i,
+  money: /\b(?:amount|value|turnover|revenue|business|worth|costliest|dearest|priciest)\b|રકમ|रकम|વેલ્યુ|वैल्यू/i,
+  /* a calculation field asked about (its key is in FIELDS: input.<FIELD KEY>) */
+  fields: /\bwidth|\blength|\bgsm\b|\bmesh|meash|gusset|micron|denier|\bfold|\bliner|\bvalve|\bpatch|\bhandle|zipper|\bcoating|\bbopp\b|\bsize|પહોળ|લંબાઈ|लंबाई|चौड़|જીએસએમ|जीएसएम|સાઇઝ|साइज/i
+};
+/** C21 — a question about saved records? → null, or { money: about a cost, a price or an amount; fields: about a
+    calculation field } */
+export function dataAsked(text) {
+  const x = asciiDigits(String(text || ''));
+  if (!x.trim() || DQ.number.test(x) || DQ.onScreen.test(x) || DQ.help.test(x)) return null;
+  const when = DQ.when.test(x), filter = DQ.filter.test(x);
+  /* a bag described ("490x550 70 gram") or a recipe's figures: work — unless saved records are asked about */
+  if ((TW.calcSpec.test(x) || TW.recipeFig.test(x)) && !when && !filter) return null;
+  /* something to make or send, unless it is a list or a summary of saved records */
+  if (DQ.make.test(x) && !DQ.listish.test(x) && !when) return null;
+  /* 4.74.0 review — an edit ("set the BOM total to 500 kg"), unless a list or something to show is asked for, and a
+     quantity to make ("total kg for 10000 bags"): work, never taken from it by a search */
+  if (DQ.edit.test(x) && !DQ.listish.test(x) && !DQ.show.test(x)) return null;
+  if (DQ.qty.test(x) && !when && !filter && !DQ.whichNoun.test(x)) return null;
+  const noun = DQ.noun.test(x);
+  const strong = DQ.whichNoun.test(x) || (noun && (DQ.most.test(x) || filter || DQ.group.test(x)));
+  const weak = noun && (when || DQ.all.test(x) || (DQ.followish.test(x) && DQ.state.test(x))) && (DQ.show.test(x) || !DQ.work.test(x));
+  if (!strong && !weak) return null;
+  if (DQ.advice.test(x) && !DQ.most.test(x)) return null;
+  return { money: asksRates(x) || DQ.money.test(x), fields: DQ.fields.test(x) || TW.calcSpec.test(x) };
+}
+/** 4.74.0 review — a material's rate or price asked ("PP no bhav?", "price of LD") — not a bag's cost ("kharch", "cheapest") */
+const RATE_ONLY = /\b(?:rates?|prices?|pricing|priced|bhaa?v[aeiou]?|bhaw|kimm?at\w*|keemat\w*|qeemat\w*|daam)\b|ભાવ(?!ેશ|ના|િન|િક)|કિંમત|કીમત|રેટ|પ્રાઇસ|પ્રાઈસ|भाव(?!ेश|ना|िन|िक)|कीमत|क़ीमत|दाम|रेट|प्राइस/i;
+const rateOnly = (x) => RATE_ONLY.test(String(x || '').replace(NOT_MONEY_RATE, ' ')) && !DQ.most.test(x);
+/** 4.74.0 review — a short question that brings work of its own is never a follow-up of a search: an edit, something to
+    make, save or open, a material's rate, a process, a material, a constant or a route named ("lamination waste 4 karo",
+    "save it", "what is the rate of PP?" after "which is lowest cost of bag") */
+const OWN_NAV = /^\s*(?:please\s+)?(?:open|go\s*to|goto|take\s+me\s+to|khol\w*|ખોલ\w*|खोल\w*)\b/i;
+const OWN_VERB = /\b(?:add|make|create|note|remind|set|call|send|write|save|delete|remove|change|update|start|karo|kar\s*do|banavo|banao)\b|નોંધ|કરો|બનાવો|करो|बनाओ/i;
+const asksList = (x) => DQ.listish.test(x) || DQ.show.test(x);
+function ownWork(p, x) {
+  /* "and the open ones?", "show me last month's", "make a list of them", "list karo" are the search again, not work */
+  if (OWN_NAV.test(x) || rateOnly(x)) return true;
+  if ((DQ.edit.test(x) || DQ.make.test(x) || OWN_VERB.test(x)) && !asksList(x)) return true;
+  if (TW.process.test(x) || TW.material.test(x) || TW.constants.test(x) || TW.route.test(x) || TW.resources.test(x)) return true;
+  const up = ' ' + String(x || '').toUpperCase() + ' ';
+  return (p.processes || []).some((q) => String(q.name || '').length > 4 && up.indexOf(String(q.name).toUpperCase()) > -1) ||
+    (p.materials || []).some((m) => /\s/.test(String(m.name || '')) && up.indexOf(String(m.name).toUpperCase()) > -1);
+}
+/** C21 — the phone: its own words, or (a short follow-up, "and last month?") the nearest earlier question that names
+    anything, as phoneRatesAsked reads a conversation */
+export function phoneDataAsked(text, asked) {
+  if (dataAsked(text)) return true;
+  const x = asciiDigits(String(text || ''));
+  /* 4.74.0 review — owner 2026-10-02: a bag's cost, a BOM's cost and a quotation's amount never go to Google from the
+     phone, so one asked of a record by its number ("BOM-1 no kharch ketlo?", "QT-1 nu amount?") is a search the phone
+     runs on its own records (a material's rate — "BOM-1 ma PP no bhav?" — stays a RATES question) */
+  if (DQ.number.test(x) && (asksRates(x) || DQ.money.test(x)) && !RATE_ONLY.test(x.replace(NOT_MONEY_RATE, ' '))) return true;
+  if (x.length >= 60 || TW.calcSpec.test(x) || TW.recipeFig.test(x)) return false;
+  /* 4.74.0 review — a question of its own ("PP no bhav shu che?", something to change or make) is no follow-up of a search */
+  if (rateOnly(x) || ((DQ.edit.test(x) || DQ.make.test(x)) && !asksList(x))) return false;
+  const users = asked || [];
+  for (let i = users.length - 1; i >= 0 && i >= users.length - 4; i--) {
+    const u = String((users[i] && users[i].text) || '');
+    if (dataAsked(u)) return true;
+    const w = phoneWants(u);
+    if (w.calcs || w.boms || w.quotes || w.marketing || asksRates(u)) return false;
+  }
+  return false;
+}
+
+/* ---- the query that comes back, cleaned (the computer's step and the phone's "query") ---------------------------
+   Only these keys, each within its limits: from — one of the six collections, else the query is dropped; where — at
+   most 12 tests, each a field (at most 60 characters), an op from the list (a few spellings read: "=", "contains",
+   "like", "gte" …) and its value (text up to 200 characters, a number, true/false; a list of up to 20 for "in", two for
+   "between"; none for "empty"/"notempty"); period — a range from the list (a date field of the collection when none is
+   named); sort — at most 3, asc or desc; limit — 1 to 50 (10 when not said); group — a field; agg — at most 6, a fn from
+   the list ("count" needs no field); show — at most 12 fields; say — at most 400 characters. Anything else is dropped,
+   and each part that could not be used is named. Field names are the device's to know (an unknown one shows "—"). */
+const OP_SAME = { '=': 'is', '==': 'is', '===': 'is', eq: 'is', equals: 'is', equal: 'is', '!=': 'not', '<>': 'not', ne: 'not', isnot: 'not', 'is not': 'not',
+  contains: 'has', like: 'has', includes: 'has', gt: '>', gte: '>=', ge: '>=', lt: '<', lte: '<=', le: '<=', startswith: 'starts', 'starts with': 'starts',
+  begins: 'starts', 'begins with': 'starts', 'is empty': 'empty', isempty: 'empty', 'not empty': 'notempty', 'is not empty': 'notempty', isnotempty: 'notempty' };
+const FN_SAME = { average: 'avg', mean: 'avg', total: 'sum', minimum: 'min', maximum: 'max', number: 'count', cnt: 'count' };
+const qField = (v) => (typeof v === 'string' || typeof v === 'number' ? String(v).replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim() : '');
+/* 4.74.0 review — "today" (or "TODAY", "<TODAY>") as a value is today's date in India, as the CONTEXT's TODAY says it
+   ("follow-ups with nextFollowUp <= TODAY"): a date the device can compare */
+const TODAY_WORD = /^\s*[<{[(]?\s*today(?:['’]s\s+date)?\s*[>}\])]?\s*$/i;
+const qScalar = (v) => (typeof v === 'number' ? (isFinite(v) ? v : undefined) : typeof v === 'boolean' ? v : typeof v === 'string' ? (TODAY_WORD.test(v) ? today() : str(v, 200)) : undefined);
+function qOp(v) {
+  const k = String(v == null ? '' : v).trim().toLowerCase().replace(/[\s_]+/g, ' ');
+  const o = OP_SAME[k] || OP_SAME[k.replace(/ /g, '')] || k.replace(/ /g, '');
+  return DATA_OPS.indexOf(o) > -1 ? o : null;
+}
+function qRange(v) {
+  if (typeof v !== 'string' && typeof v !== 'number') return null;
+  let r = String(v).trim().toLowerCase().replace(/[\s_]+/g, '-');
+  if (/^\d{4}-\d{2}-\d{2}$/.test(r)) r = r + '..' + r;
+  r = r.replace(/^(\d{4}-\d{2}-\d{2})-?(?:to|\.{2,3}|–|—)-?(\d{4}-\d{2}-\d{2})$/, '$1..$2');
+  const m = /^(?:today|yesterday|this-week|last-week|this-month|last-month|this-year|last-(\d{1,4})-days|(\d{4}-\d{2}-\d{2})\.\.(\d{4}-\d{2}-\d{2}))$/.exec(r);
+  if (!m || (m[1] && !(Number(m[1]) >= 1 && Number(m[1]) <= 3660))) return null;
+  if (!m[2]) return r;
+  const a = pasteDate(m[2]), b = pasteDate(m[3]);
+  return a && b ? (a <= b ? a + '..' + b : b + '..' + a) : null;
+}
+const asList = (v) => (Array.isArray(v) ? v : v == null || v === '' ? [] : [v]);
+/** → { query: the cleaned query or null, dropped: [what could not be used] } */
+export function cleanQuery(raw) {
+  const dropped = [];
+  let x = raw;
+  if (typeof x === 'string') { try { x = JSON.parse(x); } catch (e) { x = null; } }
+  /* {"do":"query","query":{…}} — the query written one level down */
+  if (x && typeof x === 'object' && !Array.isArray(x) && x.from == null && x.query && typeof x.query === 'object') x = x.query;
+  if (!x || typeof x !== 'object' || Array.isArray(x)) return { query: null, dropped: dropped };
+  const from = String(typeof x.from === 'string' ? x.from : '').trim().toLowerCase();
+  if (DATA_COLLECTIONS.indexOf(from) < 0) { dropped.push('query — from "' + str(x.from, 30) + '" (no such records)'); return { query: null, dropped: dropped }; }
+  const q = { from: from };
+  const ws = asList(x.where);
+  if (ws.length > 12) dropped.push('query — ' + (ws.length - 12) + ' more tests (12 at most)');
+  const where = [];
+  ws.slice(0, 12).forEach((w) => {
+    if (!w || typeof w !== 'object' || Array.isArray(w)) { dropped.push('query — a test that is not one'); return; }
+    const f = qField(w.field), op = qOp(w.op);
+    if (!f || f.length > 60) { dropped.push(f ? 'query — a field name over 60 characters' : 'query — a test with no field'); return; }
+    if (!op) { dropped.push('query — "' + str(w.op, 20) + '" (no such test)'); return; }
+    if (op === 'empty' || op === 'notempty') { where.push({ field: f, op: op }); return; }
+    if (Array.isArray(w.value)) {
+      const vals = w.value.slice(0, 20).map(qScalar).filter((y) => y !== undefined && y !== '');
+      if ((op === 'in' || op === 'is') && vals.length) { where.push({ field: f, op: 'in', value: vals }); return; }
+      if (op === 'between' && vals.length === 2) { where.push({ field: f, op: 'between', value: vals }); return; }
+    } else {
+      const v = qScalar(w.value);
+      if (v !== undefined && v !== '' && op !== 'between') { where.push(op === 'in' ? { field: f, op: 'in', value: [v] } : { field: f, op: op, value: v }); return; }
+    }
+    dropped.push('query — ' + f + ' ' + op + ' (its value)');
+  });
+  if (where.length) q.where = where;
+  if (x.period != null && x.period !== '') {
+    const pr = typeof x.period === 'object' && !Array.isArray(x.period) ? x.period : { range: x.period };
+    const range = qRange(pr.range);
+    const pf = qField(pr.field);
+    if (!range) dropped.push('query — the time "' + str(typeof pr.range === 'object' ? '' : pr.range, 30) + '"');
+    else q.period = { field: pf && pf.length <= 60 ? pf : DATA_DATE[from], range: range };
+  }
+  const ss = asList(x.sort);
+  if (ss.length > 3) dropped.push('query — ' + (ss.length - 3) + ' more sorts (3 at most)');
+  const sort = [];
+  ss.slice(0, 3).forEach((s0) => {
+    let s = s0;
+    if (typeof s === 'string') { const sm = /^\s*(.*?)\s+(asc|desc)\w*\s*$/i.exec(s); s = sm ? { field: sm[1], dir: sm[2] } : { field: s }; }
+    const f = s && typeof s === 'object' ? qField(s.field) : '';
+    if (!f || f.length > 60) return;
+    sort.push({ field: f, dir: /^(?:desc|down|high)/i.test(String(s.dir == null ? '' : s.dir).trim()) ? 'desc' : 'asc' });
+  });
+  if (sort.length) q.sort = sort;
+  const n = Number(x.limit);
+  q.limit = x.limit != null && x.limit !== '' && typeof x.limit !== 'boolean' && isFinite(n) ? Math.min(50, Math.max(1, Math.round(n))) : 10;
+  const g = qField(x.group);
+  if (g && g.length <= 60) q.group = g;
+  const agg = [];
+  asList(x.agg).forEach((a0) => {
+    const a = typeof a0 === 'string' ? { fn: a0 } : a0;
+    if (!a || typeof a !== 'object' || Array.isArray(a)) return;
+    const k = String(a.fn == null ? '' : a.fn).trim().toLowerCase();
+    const fn = FN_SAME[k] || k;
+    if (DATA_FNS.indexOf(fn) < 0) { dropped.push('query — "' + str(a.fn, 20) + '" (no such figure)'); return; }
+    if (fn === 'count') { if (!agg.some((y) => y.fn === 'count')) agg.push({ fn: 'count' }); return; }
+    const f = qField(a.field);
+    if (!f || f.length > 60) { dropped.push('query — ' + fn + ' of no field'); return; }
+    if (!agg.some((y) => y.fn === fn && y.field === f)) agg.push({ fn: fn, field: f });
+  });
+  if (agg.length > 6) { dropped.push('query — ' + (agg.length - 6) + ' more figures (6 at most)'); agg.length = 6; }
+  if (agg.length) q.agg = agg;
+  const show = [];
+  (typeof x.show === 'string' ? x.show.split(',') : asList(x.show)).forEach((f0) => { const f = qField(f0); if (f && f.length <= 60 && show.indexOf(f) < 0) show.push(f); });
+  if (show.length > 12) { dropped.push('query — ' + (show.length - 12) + ' more columns (12 at most)'); show.length = 12; }
+  if (show.length) q.show = show;
+  const say = typeof x.say === 'string' ? str(x.say, 400).replace(/\s+/g, ' ').trim() : '';
+  if (say) q.say = say;
+  /* 4.74.0 review — what could not be used is said in a few lines, however much the model wrote */
+  if (dropped.length > 12) { const more = dropped.length - 11; dropped.length = 11; dropped.push('query — ' + more + ' more things it could not use'); }
+  return { query: q, dropped: dropped };
+}
+
 /* 4.72.0 — finding 46: each step and each rule says which kinds of question it is for (calc, bom, route, resources,
    quote, masters, costtools, records, marketing, voice, audio; "all" = every question), and a question is told only
    the ones it needs — a marketing question no longer carries the recipe rules, a calculation no longer the marketing
-   ones. assistSystemFor(null) is the whole text, as before. */
+   ones. assistSystemFor(null) is the whole text, as before.
+   4.74.0 — C21: "data" — a question about saved records (dataAsked): the query step, the data rule and the dictionary. */
 const STEP_DEFS = [
   ['calc', '{"do":"calc","construction":NAME,"inputs":{FIELD KEY: value},"targetWeight":grams or null,"bagQuantity":number or null,"fresh":true|false} — fill the calculation (fresh:true starts a new one; false changes the one on screen).'],
   ['calc bom route quote', '{"do":"save"} — save the calculation.'],
@@ -2024,6 +2395,8 @@ const STEP_DEFS = [
   ['masters costtools bom', '{"do":"price","material":MATERIAL CODE,"change":number or null,"pct":number or null,"set":number or null,"from":"YYYY-MM-DD" or null} — a new price version for a material: "+5" is change 5, "3 % up" is pct 3, "210 karo" is set 210.'],
   ['quote calc', '{"do":"quote","quantity":number,"rate":number or null,"margin":percent or null,"buyer":a [C1]-style code the person gave for the buyer, or null} — a quotation for the bag on screen (or the one just made): its quantity, and the selling rate the person said, or a margin over the bag’s cost that Nexora works out on the person’s computer. The buyer’s name is never yours to write: only a code the person gave.'],
   ['calc bom quote costtools masters', '{"do":"cost"} — show the cost per bag (worked out on the person’s screen; you never see it).'],
+  /* 4.74.0 — C21: its parts are in QUERY (the dictionary, given with it); SCHEMAS.assist adds them to the answer's shape */
+  ['data', '{"do":"query", …the QUERY} — answer a question about saved records: the person’s computer runs it at once on all its own records (no Run) and shows the figures.'],
   ['all', '{"do":"find","what":"calc"|"bom"|"quote","number":a NUMBER from RECORDS/BOMS/QUOTES or null,"construction":NAME or null,"q":search words (or a [C1]/[I1] code the person gave) or null,"open":true|false} — find saved work; open:true opens the one found (a calculation in the calculation window, a BOM on the BOM window, a quotation to edit), else its records window is shown filtered.'],
   ['records costtools', '{"do":"compare","a":CALC NUMBER or "current","b":CALC NUMBER} — two calculations side by side (weight, layers, and cost per bag for a person who may see it).'],
   ['costtools records', '{"do":"targetcost","calc":CALC NUMBER or "current","mode":"PRICE"|"COST","price":selling price per bag or null,"margin":percent or null,"cost":target cost per bag or null} — Target Cost: what to change to bring the bag to that cost; it searches the options on the person’s computer.'],
@@ -2044,6 +2417,10 @@ const ASSIST_LINES = [
   ['all', 'You are an expert in woven sacks: tape extrusion (PP with filler/CaCO3 and masterbatch, usually 2–8 % waste), circular weaving, BOPP printing and slitting, lamination/coating (PP/LD granule), backseam, block bottom, pinch, stitching, liners, valves, finishing and packing.'],
   ['all', 'You see the screen the person is on (NOW), the plant’s constructions (their fields and what they NEED), processes, routes, materials with their current rates, and what the plant has saved. You NEVER see — and must never ask for or guess — an item name, a customer name or the cost of a bag.'],
   ['all', PRIVATE_LINE],
+  /* 4.74.0 — C21: right after the lines every question shares, so every question about saved records starts with the
+     same words (Google's implicit cache); the dictionary without the costs for a person without "costs and prices" */
+  ['data', DATA_RULE],
+  ['data', (t, o) => dataDictionary({ cost: !(o && o.cost === false) })],
   ['calc bom route', 'THINK FOR YOURSELF, LIKE THE PLANT’S TECHNICAL MANAGER. Do the job the person MEANS, not only the words: a calculation ASKS every open field of its construction (the person may leave blank what the bag does not have — a handle, a liner — and Nexora goes on without it); a route has every process the construction’s layers and parts need (CONSTRUCTIONS[].needs — a coated/laminated (2L) bag has lamination; a BOPP bag BOPP printing and lamination; a backseamed bag backseam; patches or a valve block bottom; a pinch bag pinch bottom); "make a quotation" is a "quote" step, after the bag is saved; "how do I…" is answered in steps the person can follow, with an "open" step to take them there. Facts: the mesh is needed for the denier and the GPM; the coating GSM for any coated or laminated bag. When a thing is truly unclear, ask — but never leave out what the job obviously needs.'],
   ['all', 'STANDING INSTRUCTIONS: when the person says how things should ALWAYS be done ("from next time…", "always…", "hamesha…", "have thi…"), put it in "remember" as one short sentence. RULES are the instructions already given — follow every one of them, every time. When the person asks to drop one ("forget …", "no longer …"), put its exact text from RULES in "forget" (a list).'],
   ['all', 'STEPS'],
@@ -2081,20 +2458,23 @@ const ASSIST_LINES = [
   ['all', 'READING THE CONTEXT: a list written {"cols": [...], "rows": [[...]]} is a table — each row gives its values in the order of "cols" (null = not set). A value, a list or a flag that is not there is empty or false: CONSTRUCTIONS[].needs names only what the construction has, FIELDS[] carry "required"/"optional" only when true. Only the parts THIS question needs are sent: LEFT_OUT names the parts the plant has that were left out this time (ask the person to say what they need from one of them), a long list carries the rows that matter (the numbers named, the latest), and a construction given without "fields" is there by name only.'],
   ['all', 'Answer ONLY with JSON: {"transcript": string, "lang": "en"|"gu"|"hi", "answer": string, "steps": [ ... ], "remember": string or null, "forget": [string], "next": [string], "run": true|false}.']
 ];
+/* 4.74.0 — C21: a line may be worked out for the person (o.cost false: no "costs and prices") — each way a fixed text */
+const lineText = (l, t, o) => (typeof l[1] === 'function' ? l[1](t, o) : l[1]);
 /** The assistant's instructions for a question of these kinds (null = all of them, as before 4.72.0). */
-export function assistSystemFor(t) {
+export function assistSystemFor(t, o) {
   return ASSIST_LINES.filter((l) => tagged(l[0], t)).map((l) => l[1] === 'STEPS'
     ? 'Talk with the person about anything on this screen or in Nexora (HELP_TOPICS name its windows). When they ask for work to be done, return STEPS. Steps allowed: ' + stepsFor(t).map((d) => d[1]).join(' ')
-    : l[1]).join('\n');
+    : lineText(l, t, o)).join('\n');
 }
 const ASSIST_SYSTEM = assistSystemFor(null);
 /* 4.72.0 — finding 49: what Gemma (the last resort, when every Gemini model is overloaded) is told — the steps and the
-   few rules that keep an answer safe, not the whole manual: it takes no system instruction and has a small window */
-const GEMMA_KEEP = /^(You are Nexora AI, the assistant|PRIVATE NAMES|STEPS|Rules for the calculation|THE WEIGHT ALWAYS WINS|ASK, NEVER GUESS|NEVER SAY IT IS DONE|A WHOLE STAGE|Reply in the SAME|READING THE CONTEXT|Answer ONLY with JSON|RUN:)/;
-export function gemmaSystemFor(t) {
-  return ASSIST_LINES.filter((l) => tagged(l[0], t) && GEMMA_KEEP.test(l[1])).map((l) => l[1] === 'STEPS'
+   few rules that keep an answer safe, not the whole manual: it takes no system instruction and has a small window.
+   4.74.0 — C21: and, for a question about saved records, the data rule and the dictionary (without them no query) */
+const GEMMA_KEEP = /^(You are Nexora AI, the assistant|PRIVATE NAMES|DATA QUESTIONS|QUERY —|STEPS|Rules for the calculation|THE WEIGHT ALWAYS WINS|ASK, NEVER GUESS|NEVER SAY IT IS DONE|A WHOLE STAGE|Reply in the SAME|READING THE CONTEXT|Answer ONLY with JSON|RUN:)/;
+export function gemmaSystemFor(t, o) {
+  return ASSIST_LINES.filter((l) => tagged(l[0], t) && GEMMA_KEEP.test(lineText(l, t, o))).map((l) => l[1] === 'STEPS'
     ? 'Steps allowed (return them in "steps" when work is asked for): ' + stepsFor(t).map((d) => d[1]).join(' ')
-    : l[1]).join('\n');
+    : lineText(l, t, o)).join('\n');
 }
 
 /** What a construction needs, read from its own fields and its name: the processes its layers and parts call for. */
@@ -2359,6 +2739,15 @@ export function checkSteps(p, raw) {
       return;
     }
     if (d === 'open') { if (ASSIST_VIEWS.indexOf(s.view) > -1) out.push({ do: 'open', view: s.view }); else dropped.push('window ' + str(s.view, 20)); return; }
+    /* 4.74.0 — C21: a question about saved records — ONE search, cleaned; the person's computer runs it on its own records
+       (only an app that runs queries — "caps": ["query"]; for any other a "query" is an unknown step, as in 4.73.0) */
+    if (d === 'query' && queryOn(p)) {
+      if (out.some((y) => y.do === 'query')) { dropped.push('a second query (one search an answer)'); return; }
+      const cq = cleanQuery(s);
+      cq.dropped.forEach((y) => dropped.push(y));
+      if (cq.query) out.push(Object.assign({ do: 'query' }, cq.query));
+      return;
+    }
     /* 4.67.7 — the rest of Nexora */
     const recOf = (v) => { const k = String(v || '').trim().toUpperCase(); return k ? p.records.filter((r) => r.n.toUpperCase() === k)[0] || null : null; };
     const may = (k, what) => { if (p.allowed[k] === false) { dropped.push(what + ' (not in your access)'); return false; } return true; };
@@ -2487,7 +2876,7 @@ export function checkSteps(p, raw) {
   /* 4.67.17 — the bag was not planned (the words said another one): the steps that would work on "the bag"
      — save, route, BOM, recipes, cost… — would work on the one on screen instead, so they wait too */
   if (bagHeld) {
-    const FREE = { open: 1, guide: 1, find: 1, note: 1, price: 1, constant: 1, material: 1, priceimpact: 1 };
+    const FREE = { open: 1, guide: 1, find: 1, note: 1, price: 1, constant: 1, material: 1, priceimpact: 1, query: 1 };
     const held = out.filter((x) => !FREE[x.do]).map((x) => x.do);
     for (let i = out.length - 1; i >= 0; i--) if (!FREE[out[i].do]) out.splice(i, 1);
     if (held.length) dropped.push(held.filter((x, i, a) => a.indexOf(x) === i).join(', ') + ' (after the construction is chosen)');
@@ -2644,6 +3033,9 @@ function wordTopics(p, s) {
       const xn = x.replace(/\b(?:CAL|BOM|QT|ENQ)-\d[\d-]*/gi, ' ');
       if (TW.records.test(xn) || TW.recordsGuHi.test(xn)) t.records = true;
       if (TW.marketing.test(xn)) t.marketing = true;
+      /* 4.74.0 — C21: "show me the heaviest bag" asks about saved records: the search goes too (an app that runs it) */
+      const dq = queryOn(p) ? dataAsked(x) : null;
+      if (dq) dataTopics(t, dq.money, dq.fields, WORK_VIEWS[p.screen] === 1);
     }
     return t;
   }
@@ -2674,12 +3066,33 @@ function wordTopics(p, s) {
   const named = (list, min) => list.some((n) => String(n || '').length >= min && up.indexOf(' ' + String(n).toUpperCase() + ' ') > -1 || (String(n || '').length >= min + 4 && up.indexOf(String(n).toUpperCase()) > -1));
   if (named(p.constants.map((k) => k.name), 6)) t.constants = true;
   if (named(p.routes.map((r) => r.name).concat(p.workflowList.map((w) => w.name)), 8)) t.route = true;
+  /* 4.74.0 — C21: a question about saved records ("which is lowest cost of bag", "kai bag sauthi sasti") — asked from an
+     app that runs queries ("caps": ["query"]); for any other the kinds are exactly as 4.73.0 read them */
+  const dq = queryOn(p) ? dataAsked(x) : null;
+  if (dq) dataTopics(t, dq.money, dq.fields, WORK_VIEWS[p.screen] === 1);
+  return t;
+}
+/** 4.74.0 — C21: a question about saved records: the search and its dictionary ("data"; "dataMoney" — about a cost, a
+    price or an amount; "dataFields" — about a calculation field), and none of the work its words would have brought
+    ("cost", "bag", "block bottom", "quotation" say which records — not a bag to calculate, a BOM to change, a quotation
+    to make, a master or a window's help).
+    4.74.0 review — `keep`: asked on a window where a bag, a BOM or a quotation is being worked on (WORK_VIEWS), the
+    question may be about THAT one ("total weight of the bag", "bom summary", "how much is the bag cost"): its own work and
+    its window's stay, and the search is offered beside them — Nexora AI tells which from NOW */
+const WORK_VIEWS = { calculation: 1, bom: 1, quotation: 1, easycost: 1 };
+function dataTopics(t, money, fields, keep) {
+  if (!keep) ['calc', 'bom', 'route', 'work', 'resources', 'masters', 'constants', 'costtools', 'quote', 'help'].forEach((k) => { delete t[k]; });
+  t.data = true;
+  if (money) t.dataMoney = true;
+  if (fields) t.dataFields = true;
   return t;
 }
 /* 4.72.0 review — what the last answer's steps were doing says what a follow-up is about ("and 2 more" after a waste step) */
 const STEP_TOPICS = { calc: 'calc', save: 'calc', route: 'route', workflow: 'route', parts: 'route bom', bom: 'bom', check: 'bom', suggest: 'bom', recipe: 'bom',
   waste: 'bom', stage: 'bom', accept: 'bom', savebom: 'bom', saveworkflow: 'bom route', resources: 'resources bom', resource: 'resources bom', price: 'masters',
-  material: 'masters', constant: 'constants', quote: 'quote', find: 'records', compare: 'costtools records', targetcost: 'costtools records', priceimpact: 'costtools masters' };
+  material: 'masters', constant: 'constants', quote: 'quote', find: 'records', compare: 'costtools records', targetcost: 'costtools records', priceimpact: 'costtools masters',
+  /* 4.74.0 — C21 */
+  query: 'data' };
 /** the kinds of question an answer's steps belong to — read from its JSON ("do":"waste"), whole or cut short, or its "(steps: …)" */
 export function stepTopics(text) {
   const s = String(text || '');
@@ -2696,26 +3109,45 @@ export function topicsOf(p, audio, files) {
   const own = Object.keys(t).length;
   /* a short follow-up carries the kinds of the conversation before it: the nearest earlier question that names any —
      4.72.0 review: "1l stitch bag … 70 gram", "make it 75", then "now save it" is still the bag two questions back —
-     and what the last answer's steps were doing */
-  if (String(p.text || '').length < 60) {
+     and what the last answer's steps were doing.
+     4.74.0 — C21: a question about saved records says itself what it is about (nothing is carried into it); a short
+     follow-up of one ("and last month?", "only the 3L ones?", or after an answer's query step) is one too — unless it
+     describes a bag or a recipe's figures of its own */
+  if (String(p.text || '').length < 60 && !t.data) {
+    const carried = {};
     for (let i = users.length - 1; i >= 0 && i >= users.length - 4; i--) {
       const f = wordTopics(p, users[i].text);
       delete f.help;
-      if (Object.keys(f).length) { Object.keys(f).forEach((k) => { t[k] = true; }); break; }
+      if (Object.keys(f).length) { Object.assign(carried, f); break; }
     }
     const lastModel = p.history.filter((h) => h.role === 'model').slice(-1)[0];
-    Object.keys(stepTopics(lastModel && lastModel.text)).forEach((k) => { t[k] = true; });
+    Object.assign(carried, stepTopics(lastModel && lastModel.text));
+    const xt = asciiDigits(p.text || '');
+    /* 4.74.0 review — work of its own after a search ("lamination waste 4 karo", "save it", "open the BOM window", "what is
+       the rate of PP?") is that work, never a follow-up of the search (its own kinds were being thrown away) */
+    if (queryOn(p) && carried.data && !TW.calcSpec.test(xt) && !TW.recipeFig.test(xt) && !ownWork(p, xt)) {
+      /* the same saved work as the question before (its CONTEXT starts the same way — Google's cache) */
+      if (carried.records) t.records = true;
+      if (carried.marketing) t.marketing = true;
+      dataTopics(t, carried.dataMoney, carried.dataFields || t.dataFields, WORK_VIEWS[p.screen] === 1);
+    } else { ['data', 'dataMoney', 'dataFields'].forEach((k) => { delete carried[k]; }); Object.keys(carried).forEach((k) => { t[k] = true; }); }
   }
-  if (!own && TW.calcWeak.test(asciiDigits(p.text || ''))) t.calc = true;
-  (SCREEN_TOPICS[p.screen] || []).forEach((k) => { t[k] = true; });
-  /* a recording: its words are not known here — a bag and its work is what is usually said */
-  if (audio) { t.calc = t.route = t.bom = t.records = true; }
+  if (!own && (!t.data || WORK_VIEWS[p.screen] === 1) && TW.calcWeak.test(asciiDigits(p.text || ''))) t.calc = true;
+  /* 4.74.0 — C21: a question about saved records takes from its window only the saved work (the window's own parts are
+     for work on it) — 4.74.0 review: except a window where a bag, a BOM or a quotation is worked on (WORK_VIEWS) */
+  (SCREEN_TOPICS[p.screen] || []).forEach((k) => { if (!t.data || k === 'records' || k === 'marketing' || WORK_VIEWS[p.screen] === 1) t[k] = true; });
+  /* a recording: its words are not known here — a bag and its work is what is usually said (4.74.0 — or a question
+     about saved records) */
+  if (audio) { t.calc = t.route = t.bom = t.records = true; if (queryOn(p)) t.data = true; }
   /* 4.72.0 review — a photo, a drawing or a PDF attached is of the bag ("read its sizes and specification from them"):
      a calculation may be filled from it, even with no words typed */
   if (files) t.calc = true;
   /* nothing understood: a greeting or a thank-you needs only the help's titles; anything longer, or with a figure,
-     a broad but capped set */
-  if (!Object.keys(t).length) { t.help = true; if (/\d/.test(String(p.text || '')) || String(p.text || '').length > 25) { t.calc = true; t.records = true; } }
+     a broad but capped set (4.74.0 — the search among it) */
+  if (!Object.keys(t).length) { t.help = true; if (/\d/.test(String(p.text || '')) || String(p.text || '').length > 25) { t.calc = true; t.records = true; if (queryOn(p)) t.data = true; } }
+  /* 4.74.0 — C21: a question about a cost, a price or an amount: the saved-work lists never hold one — none go (the
+     person's computer runs the search on every record) */
+  if (t.dataMoney && !audio) { delete t.records; delete t.marketing; }
   if (t.calc && (t.bom || t.route)) { t.bom = t.route = t.work = true; }
   if (p.voice) t.voice = true;
   if (audio) t.audio = true;
@@ -2731,7 +3163,8 @@ const pickRows = (rows, cap, named) => {
 function capsFor(t) {
   return {
     cons: t.calc ? 'fields' : 'names',
-    fields: !!t.calc, figures: !!t.bom, groups: !!t.masters, constants: t.constants ? 150 : 0, help: !!t.help, workflowList: !!t.route,
+    /* 4.74.0 — C21: a question about saved records that names a calculation field gets the field keys (input.<KEY>) */
+    fields: !!t.calc || !!t.dataFields, figures: !!t.bom, groups: !!t.masters, constants: t.constants ? 150 : 0, help: !!t.help, workflowList: !!t.route,
     processes: !!(t.bom || t.route), resources: !!t.resources,
     materials: t.masters || t.costtools ? 120 : t.bom ? 40 : 0,
     routes: t.route ? 40 : 0, routeStages: t.route ? 3 : t.bom ? 1 : 0,
@@ -2835,7 +3268,12 @@ function trimmed(p, routesSent, t, c, named) {
     workflowRecipes: c.wfRecipes ? firstCons(L.workflowRecipes, 'construction').slice(0, c.wfRecipes) : []
   };
   if (Object.keys(q.learned).some((k) => q.learned[k].length)) want.LEARNED = 1;
-  return { q: q, routes: q._routes || [], want: want };
+  /* 4.74.0 — C21: for a question about saved records the saved work is not "left out" — the search reaches all of it
+     (LEFT_OUT would have the model ask the person for it) */
+  return { q: q, routes: q._routes || [], want: want, quiet: t.data ? { RECORDS: 1, BOMS: 1, QUOTES: 1, MARKETING: 1 } : null,
+    /* 4.74.0 review — owner 2026-10-02 ("give me todays important followup list"): a search compares dates with today's —
+       India's date, in the CONTEXT's changing end (never in the fixed dictionary, which Google's cache keeps) */
+    today: t.data ? today() : null };
 }
 /** the CONTEXT for a question: the parts it needs, in the usual order; LEFT_OUT names what the plant has that did not go */
 function compileContext(p, routesSent, tr) {
@@ -2845,8 +3283,8 @@ function compileContext(p, routesSent, tr) {
     PROCESSES: p.processes.length, MATERIALS: p.materials.length, LEARNED: Object.keys(p.learned).some((k) => (p.learned[k] || []).length) ? 1 : 0, ROUTES: routesSent.length, RECORDS: p.records.length, BOMS: p.boms.length, QUOTES: p.quotes.length,
     MARKETING: p.marketing ? 1 : 0, FIELDS: p.fields.length };
   Object.keys(full).forEach((k) => {
-    if (k === 'SCREEN') { if (left.length) out.LEFT_OUT = left; }
-    if (tr.want[k]) out[k] = full[k]; else if (has[k]) left.push(k);
+    if (k === 'SCREEN') { if (left.length) out.LEFT_OUT = left; if (tr.today) out.TODAY = tr.today; }
+    if (tr.want[k]) out[k] = full[k]; else if (has[k] && !(tr.quiet && tr.quiet[k])) left.push(k);
   });
   return out;
 }
@@ -2874,7 +3312,8 @@ export function assistPlan(p, routesSent, audio, question, budget, files) {
   const named = { cons: consNamed(p, p.text).concat(String(p.text || '').length < 60 ? consNamed(p, said) : [])
     .concat(p.now.calc.structure ? [p.now.calc.structure] : []).concat(p.now.bom && p.now.bom.construction ? [p.now.bom.construction] : [])
     .filter((n, i, a) => n && a.indexOf(n) === i && p.constructions.some((c) => c.name === n)), numbers: numbersNamed(said) };
-  const system = assistSystemFor(t);
+  /* 4.74.0 — C21: the dictionary with the costs only for a person who may see them */
+  const system = assistSystemFor(t, { cost: p.allowed.cost !== false });
   const turns = answeredOnly(p.history).slice(-8);
   const lastModel = turns.map((h) => h.role).lastIndexOf('model');
   let hist = turns.map((h, i) => ({ role: h.role, text: h.role === 'model' ? (i === lastModel ? str(h.text, 2500) : modelGist(h.text)) : str(h.text, 1200) }));
@@ -2905,6 +3344,8 @@ const topicList = (t) => Object.keys(t).filter((k) => t[k] === true);
 export async function assist(companyId, payload, lang, fetchImpl, who) {
   if (!aiConfigured()) return { httpStatus: 503, body: { error: 'AI_OFF', message: 'Nexora AI is not switched on at the service yet.' } };
   const p = cleanAssist(payload);
+  /* 4.74.0 — C21: "caps": ["query"] beside the assist payload in the body (index.js: who.caps) counts as in it */
+  if (who && capsOf(who.caps).query) p.can.query = true;
   /* 4.67.17 — the service knows who asks: a person the administrator has not given "costs and prices"
      sends no rates, whatever the application sent, and is offered no cost or price steps */
   if (who && who.canCost === false) {
@@ -2947,7 +3388,7 @@ export async function assist(companyId, payload, lang, fetchImpl, who) {
   let gemma = null;
   if (!m.parts.length && (genNames.length ? genNames : model.available || []).some((n) => /^gemma-\d/.test(n))) {
     const g = assistPlan(p, routesSent, false, question, 5500);
-    gemma = { system: gemmaSystemFor(g.topics), contents: [{ role: 'user', parts: [{ text: 'CONTEXT:\n' + g.ctxText }] }, ready]
+    gemma = { system: gemmaSystemFor(g.topics, { cost: p.allowed.cost !== false }), contents: [{ role: 'user', parts: [{ text: 'CONTEXT:\n' + g.ctxText }] }, ready]
       .concat(g.hist.slice(-4).map((h) => ({ role: h.role, parts: [{ text: h.text }] }))).concat([{ role: 'user', parts: [{ text: question }] }]) };
   }
   const a = await ask(companyId, plan.system, { contents: contents }, fetchImpl, { strong: !p.voice && !m.audio, maxTokens: 8192, kind: m.audio ? 'assist/voice' : 'assist',
@@ -2963,7 +3404,10 @@ export async function assist(companyId, payload, lang, fetchImpl, who) {
   const checked = checkSteps(p, j.steps);
   const l = String(j.lang || '').toLowerCase();
   let answer = str(j.answer, 6000);
-  if (!checked.steps.length && /\b(added|done|updated|changed|saved|removed|set it|applied)\b|ઉમેર્ય|ઉમેરી દ|કરી દી|કર્યુ|बदल दि|जोड़ दि|कर दिया|सेव कर/i.test(answer)) {
+  /* 4.74.0 — C21: an answer that searched ("the bags saved this month are below") changed nothing and claims nothing —
+     its search, if it could not be used, is named in "dropped" */
+  const searched = queryOn(p) && list(j.steps, 24).some((s) => s && String(s.do || '').toLowerCase() === 'query');
+  if (!checked.steps.length && !searched && /\b(added|done|updated|changed|saved|removed|set it|applied)\b|ઉમેર્ય|ઉમેરી દ|કરી દી|કર્યુ|बदल दि|जोड़ दि|कर दिया|सेव कर/i.test(answer)) {
     const lg = l === 'gu' || l === 'hi' ? l : 'en';
     answer += lg === 'gu' ? '\n\n(ધ્યાન: હજુ કશું બદલાયું નથી — આ માટે કોઈ પગલું બન્યું નથી. Stage અને શું ઉમેરવું તે ફરી કહો.)'
       : lg === 'hi' ? '\n\n(ध्यान दें: अभी कुछ नहीं बदला — इसके लिए कोई कदम नहीं बना। Stage और क्या जोड़ना है, फिर से कहें।)'
