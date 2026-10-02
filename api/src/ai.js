@@ -1845,7 +1845,9 @@ export async function chat(companyId, payload, lang, fetchImpl, who) {
      answered exactly as by the 4.73.0 service. */
   if (who && capsOf(who.caps).query) p.can.query = true;
   const runsQuery = phone && queryOn(p);
-  const dataOn = runsQuery && (!!m.audio || phoneDataAsked(p.text, asked));
+  /* 4.74.0, live — owner: "add as much as possibility so we dont need to add every time": a phone that runs searches is
+     offered the search with every question (Nexora AI tells which); the words no longer decide it */
+  const dataOn = runsQuery;
   const system = phone ? phoneSystem(canCost, dataOn) : CHAT_SYSTEM;
   const schema = SCHEMAS.chat(dataOn);
   let ctx = p.context;
@@ -2238,6 +2240,9 @@ const DQ = {
      "how many did we make", not a list, a summary or a report to make */
   make: /(?<!\b(?:did|do|does|to|we|i|you|they|can|could|will|would)\s)\b(?:make|create|prepare|send)\b|\b(?:banavo|banao|bana\s*do|banavi\s*(?:do|aapo|dyo)|moklo|mokli\s*do|bhejo|bhej\s*do)\b|બનાવો|બનાવી\s*(?:દો|આપો)|મોકલો|बनाओ|बना\s*दो|बनाइए|भेजो|भेज\s*दो/i,
   listish: /\b(?:list|summary|summery|sumary|report|breakdown|statistics|stats|yadi|table)\b|યાદી|લિસ્ટ|સમરી|રિપોર્ટ|सूची|लिस्ट|समरी|रिपोर्ट/i,
+  /* 4.74.0, live — the owner's own ways of asking for the records (00:09-00:13 IST, each got the old Find step):
+     "filter blockbottom bom", "saw me 1l stitch bag", "give me table of 1l stitch bag bom" */
+  filterVerb: /\bfilt(?:e)?r\w*|ફિલ્ટર|फ़िल्टर|फिल्टर/i,
   /* the bag, BOM or quotation ON SCREEN: its own figures, not saved records */
   onScreen: /\b(?:this|that)\s+(?:bag|sack|bom|calc\w*|quot\w*)\b|\b(?:aa|is|iss|ye|yeh)\s+(?:bag|bom|calc\w*|quot\w*|theli|ganatri)\b|(?:^|\s)(?:આ|એ)\s*(?:બેગ|થેલી|બીઓએમ|ગણતરી|કોટેશન|ક્વોટેશન|bag|bom)|(?:इस|यह|ये|उस)\s*(?:बैग|थैली|बीओएम|गणना|कोटेशन|bag|bom)/i,
   number: /\b(?:CAL|BOM|QT|ENQ)-\d/i,
@@ -2265,9 +2270,15 @@ export function dataAsked(text) {
   if (DQ.edit.test(x) && !DQ.listish.test(x) && !DQ.show.test(x)) return null;
   if (DQ.qty.test(x) && !when && !filter && !DQ.whichNoun.test(x)) return null;
   const noun = DQ.noun.test(x);
-  const strong = DQ.whichNoun.test(x) || (noun && (DQ.most.test(x) || filter || DQ.group.test(x)));
-  const weak = noun && (when || saved || DQ.all.test(x) || (DQ.followish.test(x) && DQ.state.test(x))) && (DQ.show.test(x) || !DQ.work.test(x));
+  /* 4.74.0, live — the records asked as a table, a list or a filter ("give me table of 1l stitch bag bom", "filter blockbottom
+     bom") are a search; so are the records SHOWN by kind ("saw me 1l stitch bag", "show block bottom boms") */
+  const strong = DQ.whichNoun.test(x) || (noun && (DQ.most.test(x) || filter || DQ.group.test(x) || DQ.listish.test(x) || DQ.filterVerb.test(x)));
+  const weak = noun && (when || saved || DQ.all.test(x) || DQ.show.test(x) || (DQ.followish.test(x) && DQ.state.test(x))) && (DQ.show.test(x) || !DQ.work.test(x));
   if (!strong && !weak) return null;
+  /* 4.74.0, live — "show the bom", "show the bag": the ONE on screen, when nothing asks for many (a list, a filter, the
+     most, a time, all of them) */
+  if (/\bthe\s+(?:bag|sack|bom|calc\w*|quot\w*)\b(?!s)/i.test(x) && !DQ.whichNoun.test(x) && !DQ.listish.test(x) && !DQ.filterVerb.test(x) &&
+    !DQ.most.test(x) && !DQ.group.test(x) && !when && !saved && !filter && !DQ.all.test(x)) return null;
   if (DQ.advice.test(x) && !DQ.most.test(x)) return null;
   return { money: asksRates(x) || DQ.money.test(x), fields: DQ.fields.test(x) || TW.calcSpec.test(x) };
 }
@@ -2480,7 +2491,7 @@ const STEP_DEFS = [
   ['quote calc', '{"do":"quote","quantity":number,"rate":number or null,"margin":percent or null,"buyer":a [C1]-style code the person gave for the buyer, or null} — a quotation for the bag on screen (or the one just made): its quantity, and the selling rate the person said, or a margin over the bag’s cost that Nexora works out on the person’s computer. The buyer’s name is never yours to write: only a code the person gave.'],
   ['calc bom quote costtools masters', '{"do":"cost"} — show the cost per bag (worked out on the person’s screen; you never see it).'],
   /* 4.74.0 — C21: its parts are in QUERY (the dictionary, given with it); SCHEMAS.assist adds them to the answer's shape */
-  ['data', '{"do":"query", …the QUERY} — answer a question about saved records: the person’s computer runs it at once on all its own records (no Run) and shows the figures.'],
+  ['data query', '{"do":"query", …the QUERY} — answer a question about saved records: the person’s computer runs it at once on all its own records (no Run) and shows the figures.'],
   ['all', '{"do":"find","what":"calc"|"bom"|"quote","number":a NUMBER from RECORDS/BOMS/QUOTES or null,"construction":NAME or null,"q":search words (or a [C1]/[I1] code the person gave) or null,"open":true|false} — find saved work; open:true opens the one found (a calculation in the calculation window, a BOM on the BOM window, a quotation to edit), else its records window is shown filtered.'],
   ['records costtools', '{"do":"compare","a":CALC NUMBER or "current","b":CALC NUMBER} — two calculations side by side (weight, layers, and cost per bag for a person who may see it).'],
   ['costtools records', '{"do":"targetcost","calc":CALC NUMBER or "current","mode":"PRICE"|"COST","price":selling price per bag or null,"margin":percent or null,"cost":target cost per bag or null} — Target Cost: what to change to bring the bag to that cost; it searches the options on the person’s computer.'],
@@ -2503,8 +2514,8 @@ const ASSIST_LINES = [
   ['all', PRIVATE_LINE],
   /* 4.74.0 — C21: right after the lines every question shares, so every question about saved records starts with the
      same words (Google's implicit cache); the dictionary without the costs for a person without "costs and prices" */
-  ['data', DATA_RULE],
-  ['data', (t, o) => dataDictionary({ cost: !(o && o.cost === false) })],
+  ['data query', DATA_RULE],
+  ['data query', (t, o) => dataDictionary({ cost: !(o && o.cost === false) })],
   ['calc bom route', 'THINK FOR YOURSELF, LIKE THE PLANT’S TECHNICAL MANAGER. Do the job the person MEANS, not only the words: a calculation ASKS every open field of its construction (the person may leave blank what the bag does not have — a handle, a liner — and Nexora goes on without it); a route has every process the construction’s layers and parts need (CONSTRUCTIONS[].needs — a coated/laminated (2L) bag has lamination; a BOPP bag BOPP printing and lamination; a backseamed bag backseam; patches or a valve block bottom; a pinch bag pinch bottom); "make a quotation" is a "quote" step, after the bag is saved; "how do I…" is answered in steps the person can follow, with an "open" step to take them there. Facts: the mesh is needed for the denier and the GPM; the coating GSM for any coated or laminated bag. When a thing is truly unclear, ask — but never leave out what the job obviously needs.'],
   ['all', 'STANDING INSTRUCTIONS: when the person says how things should ALWAYS be done ("from next time…", "always…", "hamesha…", "have thi…"), put it in "remember" as one short sentence. RULES are the instructions already given — follow every one of them, every time. When the person asks to drop one ("forget …", "no longer …"), put its exact text from RULES in "forget" (a list).'],
   ['all', 'STEPS'],
@@ -3235,6 +3246,12 @@ export function topicsOf(p, audio, files) {
   if (t.calc && (t.bom || t.route)) { t.bom = t.route = t.work = true; }
   if (p.voice) t.voice = true;
   if (audio) t.audio = true;
+  /* 4.74.0, live — owner: "add as much as possibility so we dont need to add every time". The words above only TRIM what
+     a question carries (t.data: a search, lean); they no longer decide whether Nexora AI may search. An app that runs
+     searches ("caps": ["query"]) is offered the search and its dictionary with EVERY question (fixed text, right after
+     the lines every question shares — Google's cache keeps it), beside its usual work; Nexora AI tells which from the
+     question. An app that does not run searches is answered exactly as before. */
+  if (queryOn(p)) t.query = true;
   return t;
 }
 /** CAL-…, BOM-…, QT-…, ENQ-… named in the words */
@@ -3357,7 +3374,7 @@ function trimmed(p, routesSent, t, c, named) {
   return { q: q, routes: q._routes || [], want: want, quiet: t.data ? { RECORDS: 1, BOMS: 1, QUOTES: 1, MARKETING: 1 } : null,
     /* 4.74.0 review — owner 2026-10-02 ("give me todays important followup list"): a search compares dates with today's —
        India's date, in the CONTEXT's changing end (never in the fixed dictionary, which Google's cache keeps) */
-    today: t.data ? today() : null };
+    today: t.data || t.query ? today() : null };
 }
 /** the CONTEXT for a question: the parts it needs, in the usual order; LEFT_OUT names what the plant has that did not go */
 function compileContext(p, routesSent, tr) {
