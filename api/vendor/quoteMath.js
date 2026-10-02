@@ -29,8 +29,18 @@
     return x < 0 ? -r : r;
   }
 
+  /* 4.72.0 — A SAVED QUOTATION NEVER CHANGES ITS TOTALS. The paisa arithmetic below (audit #74) applies to a
+     quotation dated from the moment 4.72.0 was finished; one dated before keeps, to the paisa, the arithmetic it
+     was printed with (quoteTotalsBefore472). Reopened or reprinted on any computer, phone or the service, an old
+     quotation shows exactly what its buyer was sent. No date = a quotation being made now. */
+  const PAISA_FROM = '2026-10-02T09:30:00.000Z';
+  function paisaMath(q) {
+    const d = String((q && q.date) || '');
+    return !d || d >= PAISA_FROM;
+  }
+
   /** One row’s arithmetic. */
-  function itemTotals(item, calc) {
+  function itemTotals(item, calc, opts) {
     const rate = Number(item.rate) || 0;
     const qty = Number(item.quantity) || 0;
     /* 4.71.0 (audit) — a saved quotation keeps the weight it was quoted at (gramsAtQuote): the calculation edited
@@ -47,13 +57,14 @@
     else if (item.basis === 'KG') amount = rate * kg;
     /* 4.72.0 (audit #74) — a row's amount is printed to the paisa, so it is kept to the paisa: the rows on the
        sheet then add up to the subtotal on the sheet */
-    amount = round2(amount);
+    if (!(opts && opts.paise === false)) amount = round2(amount);
     return { qty, kg, grams, amount,
       basisLabel: item.basis === 'BAG' ? 'per bag' : item.basis === 'K' ? 'per 1,000 bags' : 'per kg' };
   }
 
   /** The document’s arithmetic: every row, then the tax on the sum. */
   function quoteTotals(q, byId) {
+    if (!paisaMath(q)) return quoteTotalsBefore472(q, byId);
     const rows = (q.items || []).map((item) => itemTotals(item, byId[item.calcId]));
     const goods = round2(rows.reduce((a, r) => a + r.amount, 0));
     /* Freight and packing are taxable supplies, so they join the
@@ -70,6 +81,20 @@
     const tax = q.interState ? round2(subtotal * gstRate / 100) : round2(half * 2);
     return { rows, goods, charges, chargeTotal, subtotal, gstRate, tax,
       half: half, grand: round2(subtotal + tax),
+      bags: rows.reduce((a, r) => a + r.qty, 0) };
+  }
+
+  /** The arithmetic every quotation dated before 4.72.0 was printed with — kept exactly (see PAISA_FROM). */
+  function quoteTotalsBefore472(q, byId) {
+    const rows = (q.items || []).map((item) => itemTotals(item, byId[item.calcId], { paise: false }));
+    const goods = rows.reduce((a, r) => a + r.amount, 0);
+    const charges = (q.charges || []).filter((c) => c && (String(c.label || '').trim() || Number(c.amount)));
+    const chargeTotal = charges.reduce((a, c) => a + (Number(c.amount) || 0), 0);
+    const subtotal = goods + chargeTotal;
+    const gstRate = Number(q.gstRate) || 0;
+    const tax = subtotal * (gstRate / 100);
+    return { rows, goods, charges, chargeTotal, subtotal, gstRate, tax,
+      half: tax / 2, grand: subtotal + tax,
       bags: rows.reduce((a, r) => a + r.qty, 0) };
   }
 
@@ -106,5 +131,6 @@
     return 'Rupees ' + indianWords(rupees) + (paise ? ' and ' + below100(paise) + ' Paise' : '') + ' Only';
   }
 
-  return { qnum: qnum, round2: round2, itemTotals: itemTotals, quoteTotals: quoteTotals, inWords: inWords };
+  return { qnum: qnum, round2: round2, itemTotals: itemTotals, quoteTotals: quoteTotals, inWords: inWords,
+    paisaMath: paisaMath, PAISA_FROM: PAISA_FROM };
 });
