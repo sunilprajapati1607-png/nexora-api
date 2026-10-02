@@ -2104,17 +2104,61 @@ const DATA_FROM = [
 ];
 /** the date a period is read on when the model names none */
 const DATA_DATE = { calcs: 'createdAt', boms: 'savedAt', quotes: 'date', enquiries: 'date', customers: 'createdAt', followups: 'date' };
+/* 4.74.0, live (owner, 2026-10-03 ~00:00: "somewhere its not found perfect table" — "give me list of tasmi follow up"):
+   the model searched enquiries by "person" and showed "n", "next", "nextKind" — the short column names of the MARKETING
+   lists in the CONTEXT, not the query's fields. The device left the unknown test out and listed EVERY person's
+   follow-ups under "for Tasmi". Now each collection's own field names are known here; the names people and the CONTEXT
+   use for them are turned into those (n → number, person → assignedTo, next → nextFollowUp …), also inside "say"; and a
+   test on a field that is still unknown drops the WHOLE search — a list that is not what was asked for is never shown. */
+const DATA_FIELDS = {};
+DATA_FROM.forEach((c) => { DATA_FIELDS[c[0]] = c[2].map((f) => f.split(' ')[0]).filter((f) => f.indexOf('<') < 0); });
+const ALIAS_ALL = { n: 'number', no: 'number', num: 'number', id: 'number', ref: 'number', '#': 'number', buyer: 'customer', client: 'customer', party: 'customer' };
+const ALIAS = {
+  calcs: { calc: 'number', calcno: 'number', calcnumber: 'number', calcid: 'number', itemname: 'item', name: 'item', structure: 'construction', cons: 'construction', type: 'construction',
+    weight: 'weightG', weightgm: 'weightG', grams: 'weightG', g: 'weightG', netweight: 'weightG', bagweight: 'weightG', wt: 'weightG', cost: 'costPerBag', bagcost: 'costPerBag',
+    costbag: 'costPerBag', perbag: 'costPerBag', perkg: 'costPerKg', costkg: 'costPerKg', qty: 'bags', quantity: 'bags', bagquantity: 'bags', person: 'createdBy', by: 'createdBy',
+    user: 'createdBy', created: 'createdAt', date: 'createdAt', modified: 'modifiedAt', updated: 'modifiedAt' },
+  boms: { bom: 'number', bomno: 'number', bomnumber: 'number', calcno: 'calc', calcnumber: 'calc', structure: 'construction', cost: 'costPerBag', perbag: 'costPerBag',
+    perkg: 'costPerKg', total: 'totalCost', kg: 'totalKg', qty: 'bags', quantity: 'bags', person: 'savedBy', by: 'savedBy', user: 'savedBy', saved: 'savedAt', date: 'savedAt' },
+  quotes: { quote: 'number', quoteno: 'number', quotenumber: 'number', qt: 'number', total: 'amount', grandtotal: 'amount', value: 'amount', amt: 'amount', lines: 'items',
+    qty: 'bags', quantity: 'bags', valid: 'validTo', validtill: 'validTo', validupto: 'validTo', person: 'createdBy', by: 'createdBy', user: 'createdBy', enq: 'enquiry', enquiryno: 'enquiry' },
+  enquiries: { enq: 'number', enqno: 'number', enquiryno: 'number', enquirynumber: 'number', enquiryid: 'number', person: 'assignedTo', assigned: 'assignedTo',
+    assignee: 'assignedTo', assignedname: 'assignedTo', owner: 'assignedTo', salesperson: 'assignedTo', staff: 'assignedTo', by: 'assignedTo', user: 'assignedTo',
+    next: 'nextFollowUp', nextdate: 'nextFollowUp', followup: 'nextFollowUp', followupdate: 'nextFollowUp', fu: 'nextFollowUp', due: 'nextFollowUp', duedate: 'nextFollowUp',
+    st: 'status', stage: 'status', state: 'status', src: 'source', channel: 'source', won: 'wonAt', wondate: 'wonAt', lost: 'lostAt', lostdate: 'lostAt',
+    place: 'location', city: 'location', qty: 'bags', quantity: 'bags' },
+  customers: { customer: 'name', firm: 'name', company: 'name', mobile: 'phone', whatsapp: 'phone', person: 'contact', contactperson: 'contact', created: 'createdAt', date: 'createdAt' },
+  followups: { n: 'enquiry', no: 'enquiry', number: 'enquiry', id: 'enquiry', enq: 'enquiry', enquiryno: 'enquiry', enquirynumber: 'enquiry', person: 'by', user: 'by',
+    assignedto: 'by', staff: 'by', salesperson: 'by', type: 'kind', mode: 'kind', nextdate: 'next', nextfollowup: 'next', remark: 'note', remarks: 'note', notes: 'note',
+    when: 'date', at: 'date' }
+};
+/** a field as this collection names it ('' when it has no such field): its own name in any case, a name people or the
+    CONTEXT use for it, or a calculation's input.<FIELD KEY> */
+export function dataField(from, f) {
+  const s = String(f == null ? '' : f).trim();
+  if (!s || s.length > 60) return '';
+  const own = DATA_FIELDS[from] || [];
+  if (from === 'calcs' && /^input\.\S/i.test(s)) return 'input.' + s.slice(6);
+  const exact = own.filter((x) => x.toLowerCase() === s.toLowerCase())[0];
+  if (exact) return exact;
+  const k = s.toLowerCase().replace(/[\s_\-.]+/g, '');
+  const viaOwn = own.filter((x) => x.toLowerCase() === k)[0];
+  if (viaOwn) return viaOwn;
+  const a = (ALIAS[from] && ALIAS[from][k]) || ALIAS_ALL[k];
+  return a && own.indexOf(a) > -1 ? a : '';
+}
 export const DATA_RULE = 'DATA QUESTIONS — YOU CANNOT SEE SAVED FIGURES. For a question about saved records (which / how many / lowest / highest / cheapest / costliest / total / average / sum / list / summary / compare / count …, in English, Gujarati or Hindi) answer with ONE query step and a short answer: the person’s computer runs it over ALL its own records and shows the figures under your answer — they never come to you. Never guess or invent figures, and never count, add up or pick from the lists in the CONTEXT for such a question (they hold only the newest few, and no cost). Never send the person to a window for such a question. Use find only to OPEN a record by its number.';
 export const DATA_RULE_PHONE = 'DATA QUESTIONS — YOU CANNOT SEE EVERY SAVED FIGURE. For a question about saved records (which / how many / lowest / highest / cheapest / costliest / total / average / sum / list / summary / compare / count …, in English, Gujarati or Hindi) answer with ONE "query" and a short answer: the phone runs it over ALL its own records and shows the figures under your answer — they never come to you. Never guess or invent figures, and never count, add up or pick from the lists in the CONTEXT for such a question (they may be cut short). Never tell the person to open the computer for it.';
 const dictMemo = {};
 /** The dictionary of the query — the same text every time for each kind ({phone, cost}): the computer's or the phone's,
-    with the costs ($) for a person with "costs and prices", without them for anybody else (on the phone also without a
-    quotation's amount, as C14 keeps it). */
+    with the costs ($) for a person with "costs and prices", without them for anybody else. 4.74.0 (phone review): a
+    quotation's amount (Q) is named for everybody, on the phone too — no amount leaves the phone any more, and the phone,
+    like the computer, shows it to whoever may open quotations. */
 export function dataDictionary(o) {
   const phone = !!(o && o.phone === true), cost = !(o && o.cost === false);
   const key = (phone ? 'phone' : 'computer') + (cost ? '$' : '');
   if (dictMemo[key]) return dictMemo[key];
-  const keep = (f) => (cost || !/ \$$/.test(f)) && (cost || !phone || !/ Q$/.test(f));
+  const keep = (f) => cost || !/ \$$/.test(f);
   const from = DATA_FROM.map((c) => c[0] + ' = ' + c[1] + ': ' + c[2].filter(keep).map((f) => f.replace(/ Q$/, '')).join(', ')).join('; ');
   const example = cost
     ? '"which is the lowest cost bag" → {"from":"calcs","where":[{"field":"costPerBag","op":"notempty"}],"sort":[{"field":"costPerBag","dir":"asc"}],"limit":5,"show":["number","item","construction","costPerBag"],"say":"The lowest cost a bag is {costPerBag} — {number}, {item}."}; ' +
@@ -2124,6 +2168,10 @@ export function dataDictionary(o) {
   dictMemo[key] = 'QUERY — the search the person’s ' + (phone ? 'phone' : 'computer') + ' runs on its own records: {"from":C,"where":[{"field":F,"op":OP,"value":V}],"period":{"field":DATE F,"range":R},"sort":[{"field":F,"dir":"asc"|"desc"}],"limit":1-50,"group":F,"agg":[{"fn":"count"|"sum"|"avg"|"min"|"max","field":F}],"show":[F,…],"say":S} — "from" and only the parts the question needs' +
     (phone ? ', in your JSON as "query".' : ', as a step {"do":"query",…}.') +
     ' C and its fields F' + (cost ? ' ($ = a cost, shown only to a person with "costs and prices")' : '') + ': ' + from + '.' +
+    /* 4.74.0, live — "give me list of tasmi follow up" was searched by "person" and shown as "n", "next" (the CONTEXT's lists) */
+    ' Write F exactly as listed here — never the short column names of the CONTEXT’s lists (n, person, next …): an enquiry’s person is assignedTo, its number is number, its next follow-up is nextFollowUp.' +
+    /* 4.74.0, live — owner: "user can add column by nexora command like add date column in this" */
+    ' A change to the table just shown ("add the date column", "remove bags", "only Tasmi’s", "sort by date") = the same query again with that change, all its other parts kept.' +
     ' OP: is, not, has (contains), starts, in (value a list), >, >=, <, <=, between (value [a,b]), empty, notempty — text ignores case and spaces ("block bottom" has-matches "3L BLOCK BOTTOM"), dates YYYY-MM-DD, true/false.' +
     ' DATE F: createdAt, modifiedAt, savedAt, date, validTo, nextFollowUp, wonAt, lostAt, next. R: today, yesterday, this-week (the last 7 days), last-week, this-month, last-month, this-year, last-N-days (e.g. last-30-days), YYYY-MM-DD..YYYY-MM-DD.' +
     /* 4.74.0 review — owner 2026-10-02: "give me todays important followup list" (TODAY is in the CONTEXT, never here) */
@@ -2226,7 +2274,12 @@ const rateOnly = (x) => RATE_ONLY.test(String(x || '').replace(NOT_MONEY_RATE, '
 const OWN_NAV = /^\s*(?:please\s+)?(?:open|go\s*to|goto|take\s+me\s+to|khol\w*|ખોલ\w*|खोल\w*)\b/i;
 const OWN_VERB = /\b(?:add|make|create|note|remind|set|call|send|write|save|delete|remove|change|update|start|karo|kar\s*do|banavo|banao)\b|નોંધ|કરો|બનાવો|करो|बनाओ/i;
 const asksList = (x) => DQ.listish.test(x) || DQ.show.test(x);
+/* 4.74.0, live — owner: "user can add column by nexora command like add date column in this" (and before it "can i have
+   enquiry id in this table"): a change to the table just shown — a column added, taken out or sorted by — is that search
+   again, never work of its own, even with "add" or "remove" in it */
+const TABLE_EDIT = /\b(?:columns?|cols?|in\s+(?:this|the)\s+(?:table|list)|this\s+table)\b|કોલમ|કૉલમ|ખાન(?:ું|ા|ુ|ું)|कॉलम|कोलम|\bkhan(?:u|a|o)\b|\bkolam\b/i;
 function ownWork(p, x) {
+  if (TABLE_EDIT.test(x)) return false;
   /* "and the open ones?", "show me last month's", "make a list of them", "list karo" are the search again, not work */
   if (OWN_NAV.test(x) || rateOnly(x)) return true;
   if ((DQ.edit.test(x) || DQ.make.test(x) || OWN_VERB.test(x)) && !asksList(x)) return true;
@@ -2246,7 +2299,7 @@ export function phoneDataAsked(text, asked) {
   if (DQ.number.test(x) && (asksRates(x) || DQ.money.test(x)) && !RATE_ONLY.test(x.replace(NOT_MONEY_RATE, ' '))) return true;
   if (x.length >= 60 || TW.calcSpec.test(x) || TW.recipeFig.test(x)) return false;
   /* 4.74.0 review — a question of its own ("PP no bhav shu che?", something to change or make) is no follow-up of a search */
-  if (rateOnly(x) || ((DQ.edit.test(x) || DQ.make.test(x)) && !asksList(x))) return false;
+  if (!TABLE_EDIT.test(x) && (rateOnly(x) || ((DQ.edit.test(x) || DQ.make.test(x)) && !asksList(x)))) return false;
   const users = asked || [];
   for (let i = users.length - 1; i >= 0 && i >= users.length - 4; i--) {
     const u = String((users[i] && users[i].text) || '');
@@ -2302,14 +2355,27 @@ export function cleanQuery(raw) {
   const from = String(typeof x.from === 'string' ? x.from : '').trim().toLowerCase();
   if (DATA_COLLECTIONS.indexOf(from) < 0) { dropped.push('query — from "' + str(x.from, 30) + '" (no such records)'); return { query: null, dropped: dropped }; }
   const q = { from: from };
+  /* 4.74.0, live — the collection's own field for a name the model wrote; one it does not keep is said and left out */
+  const own = (f0, what) => {
+    const f = qField(f0);
+    if (!f) return '';
+    const g = dataField(from, f);
+    if (!g) dropped.push('query — ' + what + ' "' + str(f, 40) + '" (' + from + ' do not keep it)');
+    return g;
+  };
   const ws = asList(x.where);
-  if (ws.length > 12) dropped.push('query — ' + (ws.length - 12) + ' more tests (12 at most)');
+  /* 4.74.0, live — every test left out would widen the list: then nothing is searched (blind) */
+  let blind = false;
+  if (ws.length > 12) { dropped.push('query — ' + (ws.length - 12) + ' more tests (12 at most)'); blind = true; }
   const where = [];
   ws.slice(0, 12).forEach((w) => {
-    if (!w || typeof w !== 'object' || Array.isArray(w)) { dropped.push('query — a test that is not one'); return; }
-    const f = qField(w.field), op = qOp(w.op);
-    if (!f || f.length > 60) { dropped.push(f ? 'query — a field name over 60 characters' : 'query — a test with no field'); return; }
-    if (!op) { dropped.push('query — "' + str(w.op, 20) + '" (no such test)'); return; }
+    if (!w || typeof w !== 'object' || Array.isArray(w)) { dropped.push('query — a test that is not one'); blind = true; return; }
+    const f0 = qField(w.field), op = qOp(w.op);
+    if (!f0 || f0.length > 60) { dropped.push(f0 ? 'query — a field name over 60 characters' : 'query — a test with no field'); blind = true; return; }
+    const f = own(f0, 'the field');
+    /* a test on a field these records do not keep: without it the list would be another list (everybody's, not Tasmi's) */
+    if (!f) { blind = true; return; }
+    if (!op) { dropped.push('query — "' + str(w.op, 20) + '" (no such test)'); blind = true; return; }
     if (op === 'empty' || op === 'notempty') { where.push({ field: f, op: op }); return; }
     if (Array.isArray(w.value)) {
       const vals = w.value.slice(0, 20).map(qScalar).filter((y) => y !== undefined && y !== '');
@@ -2320,14 +2386,20 @@ export function cleanQuery(raw) {
       if (v !== undefined && v !== '' && op !== 'between') { where.push(op === 'in' ? { field: f, op: 'in', value: [v] } : { field: f, op: op, value: v }); return; }
     }
     dropped.push('query — ' + f + ' ' + op + ' (its value)');
+    blind = true;
   });
+  /* 4.74.0, live — never a wider list than was asked for: a test that could not be used drops the whole search */
+  const narrowedWrong = () => { dropped.push('query — nothing was searched: it could not be narrowed as asked'); return { query: null, dropped: dropped }; };
+  if (blind) return narrowedWrong();
   if (where.length) q.where = where;
   if (x.period != null && x.period !== '') {
     const pr = typeof x.period === 'object' && !Array.isArray(x.period) ? x.period : { range: x.period };
     const range = qRange(pr.range);
-    const pf = qField(pr.field);
-    if (!range) dropped.push('query — the time "' + str(typeof pr.range === 'object' ? '' : pr.range, 30) + '"');
-    else q.period = { field: pf && pf.length <= 60 ? pf : DATA_DATE[from], range: range };
+    const pf = pr.field != null && pr.field !== '' ? own(pr.field, 'the date') : '';
+    /* a time that cannot be read, or a date these records do not keep, would widen the list too */
+    if (!range) { dropped.push('query — the time "' + str(typeof pr.range === 'object' ? '' : pr.range, 30) + '"'); return narrowedWrong(); }
+    if (pr.field != null && pr.field !== '' && !pf) return narrowedWrong();
+    q.period = { field: pf || DATA_DATE[from], range: range };
   }
   const ss = asList(x.sort);
   if (ss.length > 3) dropped.push('query — ' + (ss.length - 3) + ' more sorts (3 at most)');
@@ -2335,15 +2407,15 @@ export function cleanQuery(raw) {
   ss.slice(0, 3).forEach((s0) => {
     let s = s0;
     if (typeof s === 'string') { const sm = /^\s*(.*?)\s+(asc|desc)\w*\s*$/i.exec(s); s = sm ? { field: sm[1], dir: sm[2] } : { field: s }; }
-    const f = s && typeof s === 'object' ? qField(s.field) : '';
-    if (!f || f.length > 60) return;
+    const f = s && typeof s === 'object' ? own(s.field, 'the order by') : '';
+    if (!f) return;
     sort.push({ field: f, dir: /^(?:desc|down|high)/i.test(String(s.dir == null ? '' : s.dir).trim()) ? 'desc' : 'asc' });
   });
   if (sort.length) q.sort = sort;
   const n = Number(x.limit);
   q.limit = x.limit != null && x.limit !== '' && typeof x.limit !== 'boolean' && isFinite(n) ? Math.min(50, Math.max(1, Math.round(n))) : 10;
-  const g = qField(x.group);
-  if (g && g.length <= 60) q.group = g;
+  const g = x.group != null && x.group !== '' ? own(x.group, 'the grouping by') : '';
+  if (g) q.group = g;
   const agg = [];
   asList(x.agg).forEach((a0) => {
     const a = typeof a0 === 'string' ? { fn: a0 } : a0;
@@ -2352,17 +2424,23 @@ export function cleanQuery(raw) {
     const fn = FN_SAME[k] || k;
     if (DATA_FNS.indexOf(fn) < 0) { dropped.push('query — "' + str(a.fn, 20) + '" (no such figure)'); return; }
     if (fn === 'count') { if (!agg.some((y) => y.fn === 'count')) agg.push({ fn: 'count' }); return; }
-    const f = qField(a.field);
-    if (!f || f.length > 60) { dropped.push('query — ' + fn + ' of no field'); return; }
+    if (!qField(a.field)) { dropped.push('query — ' + fn + ' of no field'); return; }
+    const f = own(a.field, 'the figure of');
+    if (!f) return;
     if (!agg.some((y) => y.fn === fn && y.field === f)) agg.push({ fn: fn, field: f });
   });
   if (agg.length > 6) { dropped.push('query — ' + (agg.length - 6) + ' more figures (6 at most)'); agg.length = 6; }
   if (agg.length) q.agg = agg;
   const show = [];
-  (typeof x.show === 'string' ? x.show.split(',') : asList(x.show)).forEach((f0) => { const f = qField(f0); if (f && f.length <= 60 && show.indexOf(f) < 0) show.push(f); });
+  (typeof x.show === 'string' ? x.show.split(',') : asList(x.show)).forEach((f0) => { const f = qField(f0) ? own(f0, 'the column') : ''; if (f && show.indexOf(f) < 0) show.push(f); });
   if (show.length > 12) { dropped.push('query — ' + (show.length - 12) + ' more columns (12 at most)'); show.length = 12; }
   if (show.length) q.show = show;
-  const say = typeof x.say === 'string' ? str(x.say, 400).replace(/\s+/g, ' ').trim() : '';
+  /* 4.74.0, live — the sentence's {places} by the same names ({n} → {number}, {min.next} → {min.nextFollowUp}) */
+  const say = typeof x.say === 'string' ? str(x.say, 400).replace(/\s+/g, ' ').trim().replace(/\{(?:(count|sum|avg|min|max)\.)?([^{}.\s][^{}\s]{0,59})\}/g, (m, fn, name) => {
+    if (!fn && (name === 'count' || name === 'group')) return m;
+    const f = dataField(from, name);
+    return f ? '{' + (fn ? fn + '.' : '') + f + '}' : m;
+  }) : '';
   if (say) q.say = say;
   /* 4.74.0 review — what could not be used is said in a few lines, however much the model wrote */
   if (dropped.length > 12) { const more = dropped.length - 11; dropped.length = 11; dropped.push('query — ' + more + ' more things it could not use'); }
