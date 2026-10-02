@@ -578,7 +578,83 @@ async function tryModel(name, base, fetchImpl, ms, kind, cancel) {
     else break;
     res = await tryModelOnce(name, base, fetchImpl, ms, kind, cancel);
   }
+  if (!res.ok && namesNothing(res) && !base.classic) res = await plainer(name, base, fetchImpl, ms, kind, cancel, res);
   return res;
+}
+/** Google's 400 that says only "Request contains an invalid argument." — a 400 that says what (too many tokens, a file
+    type) is said as it is */
+export const namesNothing = (res) => !!res && res.status === 400 &&
+  /request contains an invalid argument/i.test(String((res.r && res.r.body && res.r.body.error && res.r.body.error.message) || ''));
+/* 4.72.1 — owner 2026-10-02 (a screenshot): "Nexora AI could not answer (400): Request contains an invalid argument." on
+   every question since 4.72.0. Google's 400 named nothing, so nothing above was dropped and the question failed. Now such
+   a 400 is asked again on the same model, plainer each time: without the answer's shape, then without the thinking
+   setting, then without the earlier conversation (the CONTEXT, its "Ready." and the question stay). The shape and the
+   thinking setting a model refused stay off for it until the service restarts; the conversation was only this
+   question's. When nothing helps, nothing is remembered and the 400 is said. */
+async function plainer(name, base, fetchImpl, ms, kind, cancel, res) {
+  const undo = [];
+  const stages = [];
+  if (base.generationConfig && base.generationConfig.responseJsonSchema && schemaOn() && !noSchema.has(name)) {
+    stages.push(['shape', (b) => { noSchema.add(name); undo.push(() => noSchema.delete(name)); return b; }]);
+  }
+  if (thinkingFor(name)) stages.push(['thinking', (b) => { noThinking.add(name); undo.push(() => noThinking.delete(name)); return b; }]);
+  stages.push(['conversation', shortTalk]);
+  let cur = base;
+  for (const [what, make] of stages) {
+    const next = make(cur);
+    if (!next) continue;
+    cur = next;
+    const again = await tryModelOnce(name, cur, fetchImpl, ms, kind + '/plain-' + what, cancel);
+    if (again.ok) return again;
+    if (again.status !== 400) { undo.forEach((u) => u()); return again; }
+  }
+  undo.forEach((u) => u());
+  return res;
+}
+/** The CONTEXT turn (and the model's "Ready." after it) and the question — the earlier conversation left out; null when
+    there is none to leave out */
+export function shortTalk(b) {
+  const c = (b && b.contents) || [];
+  const head = c.slice(0, c[1] && c[1].role === 'model' ? 2 : 1);
+  if (c.length <= head.length + 1) return null;
+  const last = c[c.length - 1];
+  const end = head[head.length - 1];
+  const contents = end.role === 'user'
+    ? head.slice(0, -1).concat([{ role: 'user', parts: (end.parts || []).concat(last.parts || []) }])
+    : head.concat([last]);
+  const out = Object.assign({}, b, { contents: contents });
+  if (b.gemma && Array.isArray(b.gemma.contents)) {
+    const g = shortTalk({ contents: b.gemma.contents });
+    if (g) out.gemma = Object.assign({}, b.gemma, { contents: g.contents });
+  }
+  return out;
+}
+/** 4.72.1 — a 400 names nothing: what the refused request was MADE of goes to the log (never a word of it) — its parts,
+    the answer's shape (size, property names a schema may not take), every turn's role and length, empty texts, broken
+    characters, and whatever Google adds besides its message */
+export function shapeOf(payload, body) {
+  const p = typeof payload === 'string' ? JSON.parse(payload) : payload;
+  const g = p.generationConfig || {};
+  let odd = 0;
+  (function walk(o) {
+    if (!o || typeof o !== 'object') return;
+    if (o.properties) Object.keys(o.properties).forEach((k) => { if (!/^[A-Za-z0-9_.-]+$/.test(k)) odd++; walk(o.properties[k]); });
+    if (o.items) walk(o.items);
+  })(g.responseJsonSchema);
+  let empty = 0, lone = 0;
+  const texts = [];
+  const turns = (p.contents || []).map((c) => (c.role || '?') + ':' + (c.parts || []).map((x) => {
+    if (typeof x.text === 'string') { texts.push(x.text); if (!x.text) empty++; return x.text.length; }
+    return Object.keys(x).join('+');
+  }).join('+')).join('>');
+  const sys = ((p.systemInstruction && p.systemInstruction.parts) || []).map((x) => String(x.text || ''));
+  sys.concat(texts).forEach((t) => { lone += (t.match(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g) || []).length; });
+  const err = (body && body.error) || {};
+  return 'top=' + Object.keys(p).join(',') + ' gen=' + Object.keys(g).join(',') +
+    (g.thinkingConfig ? ' thinking=' + JSON.stringify(g.thinkingConfig) : '') +
+    (g.responseJsonSchema ? ' schema=' + JSON.stringify(g.responseJsonSchema).length + (odd ? ' oddNames=' + odd : '') : '') +
+    ' sys=' + sys.reduce((n, t) => n + t.length, 0) + ' turns=' + turns + (empty ? ' empty=' + empty : '') + (lone ? ' broken=' + lone : '') +
+    (err.status ? ' status=' + scrub(err.status, 40) : '') + (err.details ? ' details=' + scrub(JSON.stringify(err.details), 400) : '');
 }
 async function tryModelOnce(name, base, fetchImpl, ms, kind, cancel) {
   const payload = base.classic
@@ -616,6 +692,7 @@ async function tryModelOnce(name, base, fetchImpl, ms, kind, cancel) {
     /* a quota refusal names its metric and limit (tokens or requests, per minute or per day): kept whole */
     rec.code = r.status === 429 ? scrub(msg, 600).replace(/\s+/g, ' ') : scrub(msg).slice(0, 80);
     noteCall(rec);
+    if (r.status === 400 && process.env.RENDER) { try { console.log('[ai] 400 shape ' + kind + ' ' + name + ' ' + shapeOf(payload, r.body)); } catch (e) { /* no log */ } }
     if (gone) blocked.add(name);
     /* 4.67.1 — Google names the model to use instead: that one is asked next */
     const named = gone ? ((msg.match(/models\/(gemini-[\w.\-]+)/g) || []).map((x) => x.replace(/^models\//, '')).filter((n) => n !== name && !blocked.has(n))[0] || null) : null;
@@ -820,6 +897,8 @@ async function ask(companyId, system, prompt, fetchImpl, opts) {
   if (res.why === 'network') return { fail: { httpStatus: 502, body: { error: 'AI_UNREACHABLE', message: 'Nexora AI could not reach Google just now. Try again in a moment.' } } };
   if (res.why === 'http' && res.status >= 500) return { fail: { httpStatus: 503, body: { error: 'AI_OVERLOADED', retryAfter: 60, message: 'Google’s AI is overloaded just now (it says “high demand”) — Nexora AI asked it several times. Try again in a minute.' } } };
   if (res.why === 'unreadable') return { fail: { httpStatus: 502, body: { error: 'AI_UNREADABLE', message: res.finish === 'MAX_TOKENS' ? 'Nexora AI’s answer ran too long and was cut off. Ask a narrower question.' : 'Nexora AI answered in a form Nexora could not read. Try again.' } } };
+  /* 4.72.1 — Google refused the question itself (400 naming nothing) even asked plainer: said in words, not as Google's code */
+  if (res.why === 'http' && namesNothing(res)) return { fail: { httpStatus: 502, body: { error: 'AI_FAILED', message: 'Nexora AI could not get this question through to Google. Ask it in other words — or press Clear and ask again.' } } };
   const busy = res.why === 'busy';
   /* 4.72.0 — Google's own RetryInfo says how long when it says (else a minute) */
   const wait = busy ? (res.retryAfter || 60) : undefined;
