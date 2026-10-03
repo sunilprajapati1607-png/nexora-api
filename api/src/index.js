@@ -702,7 +702,10 @@ export default {
          sizes (ai.js enquiryPaste). For a person who may make enquiries (MKT_SAVE, read as the applications read
          it; an administrator always); one Nexora AI question of the company's day. The plant's constructions,
          fields and units (as the phone's form has them) and its enquiry sources are read here, on the service;
-         private names arrive as [C1]-style codes (C9) and go back as they came. Nothing is saved here. */
+         private names arrive as [C1]-style codes (C9) and go back as they came. Nothing is saved here.
+         4.75.0 — C23: beside "text" or instead of it, "attachments" — at most 4 photos or PDFs of the enquiry, sent by
+         the application only after the person agreed to Google reading them (ai.js enquiryPhotos: mediaParts' 8 MB,
+         inside this route's 12 MB); the same right, the same answer. */
       if (path === '/v1/ai/enquiry-paste' && method === 'POST') {
         await ensureSchema();
         const a = await authorise(request);
