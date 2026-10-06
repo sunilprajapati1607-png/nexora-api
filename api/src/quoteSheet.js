@@ -135,7 +135,10 @@ export function sheetWith(d, masters, quote, byId) {
   const specOf = (item) => {
     const calc = item.calcId ? byId[item.calcId] : null;
     const subject = calc || { structure: '', inputs: {}, result: null, targetWeight: null };
-    return SPEC.map((line) => {
+    /* 4.76.0 — a line taken off the quotation (item.show[id] false: the buyer's last ticks, Nexora Mobile 1.0.5) is
+       not printed, as on the computer's sheet; a line the quotation says nothing about is */
+    const shown = (line) => !(item.show && item.show[line.id] === false);
+    return SPEC.filter(shown).map((line) => {
       const typed = item.text && item.text[line.id];
       const v = typed != null && String(typed).trim() !== '' ? String(typed).trim() : line.read(subject);
       return { label: line.label, value: v };
