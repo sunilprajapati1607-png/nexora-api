@@ -550,7 +550,7 @@ async function hasApprovedPc(companyId, exceptDevice) {
  *  heartbeat, sign-out and sign-in: the phone's own (PHONE_PENDING, 403), so one answer means "ask your
  *  administrator" on both; `platform` says which. */
 export const PC_PENDING = { error: 'PHONE_PENDING', platform: 'desktop', pending: true,
-  message: 'Your Nexora administrator has to approve this computer first — ask them to approve it in Settings → Users → Devices, or to sign in on it once.' };
+  message: 'Your Nexora administrator has to approve this computer first — ask them to approve it in Settings → Users & access → Computers & phones, or to sign in on it once.' };
 
 /** 4.71.0 (audit) — a machine the Nexora console revoked (admin.js 'revoke'). Only the console restores it:
  *  until now /v1/devices/approve turned ANY revoked row back to TRIAL, so once computers were let through
@@ -942,7 +942,7 @@ export async function activate({ deviceId, deviceName, company, email, appVersio
      COMPANY WAITS FOR ITS ADMINISTRATOR, exactly as a phone always has. A
      licence key or a company passcode that has been passed round is then no
      longer enough to put a new computer onto the plant's data: the
-     administrator approves it (Settings → Users → Devices, the same
+     administrator approves it (Settings → Users & access → Computers & phones, the same
      /v1/devices the phones use), or signs in on it once. The company's
      FIRST computer is approved as it joins — there is nobody yet to ask. */
   let approvePc = !phone;
