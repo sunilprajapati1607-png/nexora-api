@@ -1281,13 +1281,13 @@ th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;le
 .co:has(.pill.s-SUSPENDED),.co:has(.pill.s-REVOKED),.co.suspended{box-shadow:var(--shadow-sm),inset 5px 0 0 var(--k-red);border-color:color-mix(in srgb,var(--k-red) 40%,var(--border))}
 .fact{border-radius:12px;background:var(--bg-sunken)}
 .pill{text-transform:capitalize}
-/* 2026-10-07 (console) — every Nexora software in the one console: each software its own colour */
+/* 2026-10-07 (console) — every Nexora software in the one console: each software its own colour (Fabric Stock green, as on the phone console) */
 .pill.sw-weight{background:var(--k-blue-bg);color:var(--k-blue);border-color:color-mix(in srgb,var(--k-blue) 35%,transparent)}
-.pill.sw-fabric{background:var(--k-violet-bg);color:var(--k-violet);border-color:color-mix(in srgb,var(--k-violet) 35%,transparent)}
+.pill.sw-fabric{background:var(--k-green-bg);color:var(--k-green);border-color:color-mix(in srgb,var(--k-green) 35%,transparent)}
 .sw-cap{display:flex;align-items:center;gap:8px;margin:12px 0 6px;font-size:12px;font-weight:800;letter-spacing:.02em}
 .sw-cap::after{content:'';flex:1;height:1px;background:var(--border)}
-.sw-cap.sw-weight{color:var(--k-blue)}.sw-cap.sw-fabric{color:var(--k-violet)}
-.co.fabric-only{box-shadow:var(--shadow-sm),inset 5px 0 0 var(--k-violet)}
+.sw-cap.sw-weight{color:var(--k-blue)}.sw-cap.sw-fabric{color:var(--k-green)}
+.co.fabric-only{box-shadow:var(--shadow-sm),inset 5px 0 0 var(--k-green)}
 .sw-off{border:1px dashed var(--border);border-radius:12px;padding:10px 12px;color:var(--muted);margin:6px 0}
 .s-TRIAL,.s-DEMO{background:var(--k-teal-bg);color:var(--k-teal)}.s-LICENSED{background:var(--k-blue-bg);color:var(--k-blue)}
 .s-EXPIRED{background:var(--k-amber-bg);color:var(--k-amber)}.s-REVOKED,.s-SUSPENDED,.s-FAILED{background:var(--k-red-bg);color:var(--k-red)}
@@ -2361,7 +2361,7 @@ function fabricNote(){
   const p=fabricProduct();
   if(!p)return COVIEW==='fabric'?'<p class="help">Reading Fabric Stock…</p>':'';
   if(p.ok)return '';
-  return '<div class="sw-off"><b style="color:var(--k-violet)">Fabric Stock is not connected.</b> '+esc(p.message||'')+' <button class="small" onclick="loadProducts()">Try again</button></div>';
+  return '<div class="sw-off"><b style="color:var(--k-green)">Fabric Stock is not connected.</b> '+esc(p.message||'')+' <button class="small" onclick="loadProducts()">Try again</button></div>';
 }
 function fabricFacts(f){
   const used=+f.people||0, seats=+f.seats||1, pct=Math.min(100,Math.round(used/Math.max(1,seats)*100));
