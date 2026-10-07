@@ -2393,8 +2393,8 @@ function fabricManage(f,c){
   const id=f.id, d=FDETAIL[id];
   return '<div class="group"><h4>Licence</h4><div class="acts">'+
       (f.isDemo?'<button class="primary" data-fid="'+id+'" onclick="fsLicense(this)">Make licensed for 1 year</button><span class="why">turns this demo into a paying customer</span>':'')+
-      '<button data-fid="'+id+'" onclick="fsRenew(this)">Renew from today…</button>'+
-      '<button data-fid="'+id+'" data-days="365" onclick="fsRenew(this)">1 year from today</button><span class="why">a new period from today; it replaces the old end date</span>'+
+      '<button data-fid="'+id+'" onclick="fsRenew(this)">Add days…</button>'+
+      '<button data-fid="'+id+'" data-days="365" onclick="fsRenew(this)">+1 year</button><span class="why">added to the days still left; one that has ended starts again from today</span>'+
     '</div></div>'+
     '<div class="group"><h4>Machines</h4><div class="acts">'+
       '<button data-fid="'+id+'" data-now="'+(+f.seats||1)+'" onclick="fsSeats(this)">Seats…</button><span class="why">how many people may sign in to Fabric Stock</span>'+
@@ -2499,15 +2499,19 @@ async function fsLicense(btn){
   if(!confirm('Make '+fsName(btn.dataset.fid)+' a licensed Fabric Stock customer for 1 year from today?'))return;
   await fsCall({action:'update',id:+btn.dataset.fid,state:'LICENSED',days:365},'Fabric Stock licensed for 1 year.');
 }
+/* Fabric Stock sets a new period FROM TODAY; to ADD days, as Weight Calc's buttons do, the days still left go
+   with them (an ended licence starts again from today) — the same as the phone console 1.9.0 */
 async function fsRenew(btn){
-  let days=+btn.dataset.days||0;
-  if(!days){
-    const v=prompt('Renew Fabric Stock for how many days from today?  The new end date replaces the old one.','365');
+  const f=fabricAll().find(x=>String(x.id)===String(btn.dataset.fid));if(!f)return;
+  let add=+btn.dataset.days||0;
+  if(!add){
+    const v=prompt('Add how many days to Fabric Stock at '+f.name+'?','30');
     if(v===null)return;
-    days=parseInt(v,10);
-    if(!(days>0)){say('<div class="msg err">Enter a number of days.</div>');return;}
-  }else if(!confirm('Renew '+fsName(btn.dataset.fid)+' for '+days+' days from today?'))return;
-  await fsCall({action:'update',id:+btn.dataset.fid,days},'Fabric Stock renewed for '+days+' days from today.');
+    add=parseInt(v,10);
+    if(!(add>0)){say('<div class="msg err">Enter a number of days.</div>');return;}
+  }else if(!confirm('Add '+add+' days to Fabric Stock at '+f.name+'?'))return;
+  const left=(f.expired||f.shownState==='EXPIRED')?0:(+f.daysLeft||0);
+  await fsCall({action:'update',id:f.id,days:left+add},'Fabric Stock now runs '+(left+add)+' days from today'+(left?' ('+left+' left + '+add+')':'')+'.');
 }
 async function fsSeats(btn){
   const v=prompt('How many people may sign in to Fabric Stock at '+fsName(btn.dataset.fid)+'?',btn.dataset.now||'3');
