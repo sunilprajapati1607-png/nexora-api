@@ -34,7 +34,7 @@ import { listFeedback, feedbackShot, feedbackAction, publicFeedback, MAX_SHOT } 
 import { latestRelease, listReleases, releaseAction } from './appupdate.js';
 import { logoResponse } from './brand.js';
 import { customerCheck, sourcesOf } from './marketing.js';
-import { listProducts, fabricAction } from './products.js';
+import { listProducts, fabricAction, consoleLinks } from './products.js';
 
 /* exported for server.js, whose early answers (a body over its limit) carry the same headers */
 export const CORS = {
@@ -241,6 +241,8 @@ export default {
            sends it later; a 4xx would make it let the report go */
         return json(out, out.ok ? 200 : (out.error === 'TOO_MANY' ? 429 : out.error === 'BUSY' ? 503 : 400));
       }
+      /* 2026-10-07 (console) — whether the other software's console API answers the console key (products.js) */
+      if (path === '/console/links' && method === 'GET') return json(await consoleLinks());
       if (path === '/health' || path === '/') {
         /* 4.71.0 (audit) — and whether the DATABASE answers: a cheap SELECT 1 with a two-second limit of its
            own. Until now /health said ok whenever this process was up, so a service that could reach no data

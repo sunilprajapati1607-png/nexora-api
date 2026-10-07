@@ -67,6 +67,19 @@ export async function fabricCall(method, path, body) {
   return { status: r.status, body: out };
 }
 
+/* GET /console/links — is each software's console API answering the console key? Only the word, never a
+   company: it lets the key set on Fabric Stock be checked without anybody reading it. Asked at most once in
+   five minutes, whoever asks; the smallest console call there is (one event), its answer thrown away. */
+let linkSeen = null;
+export async function consoleLinks() {
+  if (linkSeen && Date.now() - linkSeen.at < 5 * 60000) return linkSeen.out;
+  const r = await fabricCall('GET', '/admin/api/events?limit=1');
+  const fabric = r.status === 200 ? 'connected' : r.body.error === 'FABRIC_KEY' ? 'key refused' : 'not answering';
+  const out = { fabric, checkedAt: new Date().toISOString() };
+  linkSeen = { at: Date.now(), out };
+  return out;
+}
+
 /* ---- the links: which weight-calculation company another software's company is ---- */
 /* company_id NULL = kept apart on purpose (a same-GSTIN pair the owner said are two companies) */
 async function linksOf(product) {
