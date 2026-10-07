@@ -1005,6 +1005,7 @@ const PURGE_SQL = `
        ai AS (DELETE FROM ai_usage          WHERE company_id IN (SELECT id::text FROM due) RETURNING 1),
        rb AS (DELETE FROM recycle_bin       WHERE company_id IN (SELECT id FROM due) RETURNING 1),
        bs AS (DELETE FROM backup_secrets    WHERE company_id IN (SELECT id FROM due) RETURNING 1),
+       pl AS (DELETE FROM product_links     WHERE company_id IN (SELECT id FROM due) RETURNING 1),
        iq AS (UPDATE inquiries SET company_id = NULL WHERE company_id IN (SELECT id FROM due) RETURNING 1),
        co AS (DELETE FROM companies         WHERE id IN (SELECT id FROM due) RETURNING 1)
   SELECT (SELECT COUNT(*) FROM co)::int AS companies, (SELECT COUNT(*) FROM l)::int AS installations,
@@ -1280,6 +1281,14 @@ th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;le
 .co:has(.pill.s-SUSPENDED),.co:has(.pill.s-REVOKED),.co.suspended{box-shadow:var(--shadow-sm),inset 5px 0 0 var(--k-red);border-color:color-mix(in srgb,var(--k-red) 40%,var(--border))}
 .fact{border-radius:12px;background:var(--bg-sunken)}
 .pill{text-transform:capitalize}
+/* 2026-10-07 (console) — every Nexora software in the one console: each software its own colour */
+.pill.sw-weight{background:var(--k-blue-bg);color:var(--k-blue);border-color:color-mix(in srgb,var(--k-blue) 35%,transparent)}
+.pill.sw-fabric{background:var(--k-violet-bg);color:var(--k-violet);border-color:color-mix(in srgb,var(--k-violet) 35%,transparent)}
+.sw-cap{display:flex;align-items:center;gap:8px;margin:12px 0 6px;font-size:12px;font-weight:800;letter-spacing:.02em}
+.sw-cap::after{content:'';flex:1;height:1px;background:var(--border)}
+.sw-cap.sw-weight{color:var(--k-blue)}.sw-cap.sw-fabric{color:var(--k-violet)}
+.co.fabric-only{box-shadow:var(--shadow-sm),inset 5px 0 0 var(--k-violet)}
+.sw-off{border:1px dashed var(--border);border-radius:12px;padding:10px 12px;color:var(--muted);margin:6px 0}
 .s-TRIAL,.s-DEMO{background:var(--k-teal-bg);color:var(--k-teal)}.s-LICENSED{background:var(--k-blue-bg);color:var(--k-blue)}
 .s-EXPIRED{background:var(--k-amber-bg);color:var(--k-amber)}.s-REVOKED,.s-SUSPENDED,.s-FAILED{background:var(--k-red-bg);color:var(--k-red)}
 .jump button.tab{border-radius:999px}
@@ -1383,8 +1392,9 @@ button.primary{background:linear-gradient(120deg,#0A66E0,#1EA0FF);border-color:t
       </div>
       <div id="newco" style="display:none;border:1px solid var(--border);border-radius:10px;padding:12px;margin:8px 0 12px">
         <div class="row">
+          <label>Software<select id="nSoft"><option value="weight">Weight Calc</option><option value="fabric">Fabric Stock</option><option value="both">Both — each its own licence</option></select></label>
           <label>Company name<input id="nName" placeholder="Company name" style="min-width:220px"></label>
-          <label>Plan<select id="nPlan"><option value="PRO">Pro — everything</option><option value="STANDARD">Standard — calculation &amp; costing</option></select></label>
+          <label>Plan (Weight Calc)<select id="nPlan"><option value="PRO">Pro — everything</option><option value="STANDARD">Standard — calculation &amp; costing</option></select></label>
           <label>Seats<input id="nSeats" type="number" min="1" max="500" value="1" style="width:80px"></label>
           <label>Licence days<input id="nDays" type="number" min="1" max="3650" value="365" style="width:90px"></label>
           <label>Offline days<input id="nGrace" type="number" min="0" max="365" value="3" style="width:90px"></label>
@@ -1400,6 +1410,7 @@ button.primary{background:linear-gradient(120deg,#0A66E0,#1EA0FF);border-color:t
       <div id="coMsg"></div>
       <div id="colist"></div>
       <div class="legend">
+        <div><b>Software</b>each Nexora software has its own licence: its own key, period, seats, people and rights. Weight Calc and Fabric Stock are shown together when they are the same company (the same GSTIN, or linked by hand); renewing, suspending or restoring one never touches the other.</div>
         <div><b>Plan</b>is Standard (calculation and costing) or Pro (everything ticked under Plans); seats are set separately. A demo has everything until it is made licensed.</div>
         <div><b>Suspend</b>stops every machine of the company at its next check. Nothing is deleted; Restore puts it all back. Use it when a customer has not paid.</div>
         <div><b>Revoke</b>(on one installation) stops that one machine. It frees no seat — seats are people, and a machine never held one. The company keeps running.</div>
@@ -1636,6 +1647,7 @@ async function load(){
     loadReleases();
     loadFeedback();
     loadBroadcasts();
+    loadProducts();
   }catch(e){
     /* signed in already: say it HERE and keep the key — the service may
        only be waking, and the next press will work */
@@ -1692,20 +1704,22 @@ function renderCompanies(){
    that end within 30 days (the plants to ring about renewing), or the ones
    Delete has archived, which can be restored for 30 days. */
 let COVIEW='all';
-function coView(v){COVIEW=(v==='ending'||v==='deleted')?v:'all';renderCompanies();}
+function coView(v){COVIEW=['ending','deleted','weight','fabric'].indexOf(v)>=0?v:'all';renderCompanies();}
 function renderCompanyList(){
   const term=(document.getElementById('cq').value||'').toLowerCase();
   const allCos=DATA.companies||[], arch=DATA.archived||[];
   const nEnd=allCos.filter(c=>c.ending_soon).length;
   const fl=document.getElementById('cofilters');
   if(fl)fl.innerHTML=
-    '<button class="small'+(COVIEW==='all'?' primary':'')+'" data-view="all" onclick="coView(this.dataset.view)">All '+allCos.length+'</button>'+
+    '<button class="small'+(COVIEW==='all'?' primary':'')+'" data-view="all" onclick="coView(this.dataset.view)">All '+(allCos.length+fabricOnly().length)+'</button>'+
+    '<button class="small'+(COVIEW==='weight'?' primary':'')+'" data-view="weight" onclick="coView(this.dataset.view)" title="Nexora Bag Weight Calculation">Weight Calc '+allCos.length+'</button>'+
+    '<button class="small'+(COVIEW==='fabric'?' primary':'')+'" data-view="fabric" onclick="coView(this.dataset.view)" title="Nexora Loom &amp; Fabric Stock — its own licences">Fabric Stock '+(fabricProduct()&&fabricProduct().ok?fabricAll().length:'…')+'</button>'+
     '<button class="small'+(COVIEW==='ending'?' primary':'')+'" data-view="ending" onclick="coView(this.dataset.view)" title="Paying licences that end within 30 days — ring them to renew">Ending in 30 days '+nEnd+'</button>'+
     '<button class="small'+(COVIEW==='deleted'?' primary':'')+'" data-view="deleted" onclick="coView(this.dataset.view)" title="Deleted companies are kept for 30 days and can be restored until then">Deleted '+arch.length+'</button>';
   if(COVIEW==='deleted'){document.getElementById('colist').innerHTML=archivedHtml(arch,term);return;}
-  const cos=allCos.filter(c=>(COVIEW!=='ending'||c.ending_soon)&&(!term||[c.name,c.licence_key,c.email,c.gstin,c.login_id,c.phone].some(v=>String(v||'').toLowerCase().includes(term))));
+  const cos=allCos.filter(c=>(COVIEW!=='ending'||c.ending_soon)&&(COVIEW!=='fabric'||fabricOf(c.id))&&(!term||[c.name,c.licence_key,c.email,c.gstin,c.login_id,c.phone].some(v=>String(v||'').toLowerCase().includes(term))));
   if(COVIEW==='ending'&&!cos.length){document.getElementById('colist').innerHTML='<p class="help">No paying licence ends within the next 30 days.</p>';return;}
-  document.getElementById('colist').innerHTML=cos.map(c=>{
+  const wcHtml=cos.map(c=>{
     const state=(c.expired&&c.state!=='SUSPENDED')?'EXPIRED':c.state;
     const used=c.seats_used, seats=c.seats, pct=Math.min(100,Math.round(used/Math.max(1,seats)*100));
     const open=OPEN===c.id;
@@ -1715,6 +1729,7 @@ function renderCompanyList(){
           '<span class="co-name">'+esc(c.name)+'</span> '+
           '<span class="pill s-'+state+'">'+(state==='DEMO'?'demo':state.toLowerCase())+'</span> '+
           (c.is_demo?'':'<span class="pill s-'+(c.plan==='STANDARD'?'SELF':'LICENSED')+'" title="'+(c.plan==='STANDARD'?'Standard: calculation and costing':'Pro: everything')+'">'+(c.plan==='STANDARD'?'standard':'pro')+'</span> ')+
+          swPills(c)+
           (c.self_registered?'<span class="pill s-SELF" title="Registered by the plant itself on '+esc(fmt(c.registered_at))+(c.registered_ip?' from '+esc(c.registered_ip):'')+'">self-registered</span> ':'')+
           (c.gstin?gstPill(c):'')+
           '<div class="co-meta">'+
@@ -1728,6 +1743,7 @@ function renderCompanyList(){
         '</div>'+
         '<div><button'+(open?' class="primary"':'')+' data-id="'+c.id+'" onclick="manage(this)">'+(open?'Close':'Manage')+'</button></div>'+
       '</div>'+
+      '<div class="sw-cap sw-weight">Weight Calc</div>'+
       '<div class="co-facts">'+
         /* 4.42.0 — A SEAT IS A PERSON, and a plant asking for another one
            wants to know how many are LEFT, which 'seat 3 of 5' never said.
@@ -1754,7 +1770,9 @@ function renderCompanyList(){
         '<div class="fact"><span>Hours in use</span><b>'+hoursText(c.usage_minutes)+'</b></div>'+
         '<div class="fact"><span>People</span>'+usersCell(c)+'</div>'+
       '</div>'+
+      (fabricOf(c.id)?'<div class="sw-cap sw-fabric">Fabric Stock</div>'+fabricFacts(fabricOf(c.id)):'')+
       '<div class="manage'+(open?' open':'')+'" id="mg-'+c.id+'">'+
+        '<div class="sw-cap sw-weight">Weight Calc</div>'+
         '<div class="group"><h4>Licence</h4><div class="acts">'+
           (c.is_demo?'<button class="primary" data-id="'+c.id+'" data-action="licence" data-days="365" onclick="coAct(this)">Make licensed for 1 year</button><span class="why">turns this demo into a paying customer</span>':'')+
           '<button data-id="'+c.id+'" data-plan="'+esc(c.plan||'PRO')+'" onclick="coPlan(this)">Plan: '+(c.plan==='STANDARD'?'Standard':'Pro')+'…</button><span class="why">Standard = calculation and costing; Pro = everything ticked under Plans. Seats are set separately.</span>'+
@@ -1799,9 +1817,12 @@ function renderCompanyList(){
             :'<button class="danger" data-id="'+c.id+'" data-action="suspend" data-days="0" onclick="coAct(this)">Suspend</button><span class="why">every machine stops at its next check; nothing is deleted</span>')+
           '<button class="danger" data-id="'+c.id+'" data-name="'+esc(c.name)+'" onclick="coDelete(this)">Delete…</button><span class="why">stops it now and keeps it 30 days (Restore under Deleted); then it and everything that belongs to it are erased</span>'+
         '</div></div>'+
+        '<div class="sw-cap sw-fabric">Fabric Stock</div>'+fabricManage(fabricOf(c.id),c)+
       '</div>'+
     '</div>';
-  }).join('')||'<p class="help">No companies yet. A plant that registers itself from the application appears here as a demo; a customer you set up yourself is created with New company.</p>';
+  }).join('');
+  const fsHtml=(COVIEW==='all'||COVIEW==='fabric')?fabricOnlyHtml(term):'';
+  document.getElementById('colist').innerHTML=(fabricNote()+wcHtml+fsHtml)||'<p class="help">No companies yet. A plant that registers itself from the application appears here as a demo; a customer you set up yourself is created with New company.</p>';
 }
 function manage(btn){
   const id=+btn.dataset.id;
@@ -1811,6 +1832,7 @@ function manage(btn){
     document.getElementById('co-'+OPEN).scrollIntoView({block:'nearest'});
     /* The people come with the company. */
     coUsers({dataset:{id:OPEN}});
+    const f=fabricOf(OPEN);if(f)fabricDetail(f.id);
   }
 }
 function copyKey(btn){const k=btn.dataset.key;try{navigator.clipboard.writeText(k);say('<div class="msg ok">Copied '+esc(k)+'</div>');}catch(e){prompt('Licence key',k);}}
@@ -1959,7 +1981,11 @@ async function loadDb(){
     '</tbody></table></div>';
 }
 /* 4.72.0 (audit 39) — what was done from the consoles, read-only */
-const ACT_WORDS={ADMIN_COMPANY_CREATE:'Company created',ADMIN_COMPANY_EXTEND:'Licence extended',ADMIN_COMPANY_LICENCE:'Made licensed',ADMIN_COMPANY_SEATS:'Seats changed',
+const ACT_WORDS={ADMIN_FABRIC_CREATE:'Fabric Stock: company made',ADMIN_FABRIC_UPDATE:'Fabric Stock: licence changed',ADMIN_FABRIC_SUSPEND:'Fabric Stock: suspended',
+  ADMIN_FABRIC_RESUME:'Fabric Stock: suspension lifted',ADMIN_FABRIC_ADMINUSER:'Fabric Stock: administrator set',ADMIN_FABRIC_USERSIGNOUT:'Fabric Stock: signed out',
+  ADMIN_FABRIC_PASSCODE:'Fabric Stock: new company passcode',ADMIN_FABRIC_LINK:'Fabric Stock: linked to a company',ADMIN_FABRIC_APART:'Fabric Stock: kept apart',
+  ADMIN_FABRIC_UNLINK:'Fabric Stock: link removed',ADMIN_FABRIC_DEVICE_REVOKE:'Fabric Stock: computer withdrawn',ADMIN_FABRIC_DEVICE_RESTORE:'Fabric Stock: computer given back',
+  ADMIN_COMPANY_CREATE:'Company created',ADMIN_COMPANY_EXTEND:'Licence extended',ADMIN_COMPANY_LICENCE:'Made licensed',ADMIN_COMPANY_SEATS:'Seats changed',
   ADMIN_COMPANY_PLAN:'Plan changed',ADMIN_COMPANY_GRACE:'Offline days changed',ADMIN_COMPANY_SUSPEND:'Suspended',ADMIN_COMPANY_RESTORE:'Suspension lifted',
   ADMIN_COMPANY_RENAME:'Renamed',ADMIN_COMPANY_GSTIN:'GSTIN changed',ADMIN_COMPANY_AILIMIT:'Nexora AI limit changed',ADMIN_COMPANY_TXNLIMIT:'Transaction limit changed',
   ADMIN_COMPANY_RESETUSAGE:'Usage reset',ADMIN_COMPANY_PASSCODE:'Company passcode set',ADMIN_COMPANY_ADMINUSER:'Administrator set',
@@ -2270,19 +2296,277 @@ async function gstMark(btn){
 async function createCo(){
   const name=document.getElementById('nName').value.trim();
   if(!name){say('<div class="msg err">A company name is required.</div>');return;}
-  const r=await api('/admin/api/company',{method:'POST',body:JSON.stringify({
-    action:'create',name,
-    plan:document.getElementById('nPlan').value,
-    seats:+document.getElementById('nSeats').value,
-    days:+document.getElementById('nDays').value,
-    graceDays:+document.getElementById('nGrace').value,
-    gstin:document.getElementById('nGst').value.trim(),
-    email:document.getElementById('nEmail').value.trim()})});
-  if(r.error){say('<div class="msg err">'+esc(r.error)+'</div>');return;}
+  /* 2026-10-07 (console) — which software: each one made in its own service, with its own licence key */
+  const soft=(document.getElementById('nSoft')||{}).value||'weight';
+  const seats=+document.getElementById('nSeats').value, days=+document.getElementById('nDays').value, grace=+document.getElementById('nGrace').value;
+  const gstin=document.getElementById('nGst').value.trim(), email=document.getElementById('nEmail').value.trim();
+  let made=null, fsMade=null;
+  if(soft!=='fabric'){
+    const r=await api('/admin/api/company',{method:'POST',body:JSON.stringify({
+      action:'create',name,plan:document.getElementById('nPlan').value,seats,days,graceDays:grace,gstin,email})});
+    if(r.error){say('<div class="msg err">'+esc(r.error)+'</div>');return;}
+    made=r.company;
+  }
+  if(soft!=='weight'){
+    let f;
+    try{f=await api('/admin/api/fabric',{method:'POST',body:JSON.stringify({action:'create',name,state:'LICENSED',seats,days,graceDays:Math.min(30,grace),
+      gstin:gstin||undefined,email:email||undefined,linkTo:made?made.id:undefined})});}catch(e){f={error:e.message};}
+    if(f.error){
+      if(made)await load();
+      say('<div class="msg err">'+(made?'<b>'+esc(made.name)+'</b> was made in Weight Calc, but Fabric Stock said: ':'Fabric Stock: ')+esc(f.message||f.error)+'</div>');
+      return;
+    }
+    fsMade=f.company;
+  }
   document.getElementById('newco').style.display='none';
   document.getElementById('nName').value='';document.getElementById('nEmail').value='';document.getElementById('nGst').value='';
   await load();
-  say('<div class="msg ok"><b>'+esc(r.company.name)+'</b> created. Licence key <span class="key">'+esc(r.company.licence_key)+'</span> — give this to the customer; every machine types it at activation.</div>');
+  say('<div class="msg ok"><b>'+esc(name)+'</b> created.'+
+    (made?' Weight Calc licence key <span class="key">'+esc(made.licence_key)+'</span>.':'')+
+    (fsMade?' Fabric Stock licence key <span class="key">'+esc(fsMade.licenceKey)+'</span>.':'')+
+    ' Give each key to the customer for its own software; every machine types it at activation.</div>');
+}
+/* ---------- every Nexora software in the one console (2026-10-07) ----------
+   Owner 2026-10-07: "nexora console page single rahese badhi service tya thij update chalu bandh thase",
+   and "દરેક software અલગ": each software keeps its own licence, key, period, seats, people and rights in
+   its own service. /admin/api/products lists them, /admin/api/fabric changes Fabric Stock's (products.js).
+   A Fabric Stock company with the same GSTIN is the same company; any other is linked by hand. */
+let PRODUCTS=null, FDETAIL={}, OPENF=null;
+async function loadProducts(){
+  try{PRODUCTS=await api('/admin/api/products');}
+  catch(e){PRODUCTS={products:[{id:'weight',ok:true},{id:'fabric',ok:false,error:'FABRIC_DOWN',message:e.message,companies:[]}]};}
+  if(!DATA)return;
+  renderCompanies();
+  if(OPEN){const f=fabricOf(OPEN);if(f)fabricDetail(f.id);}
+  if(OPENF)fabricDetail(OPENF);
+}
+function fabricProduct(){return PRODUCTS&&(PRODUCTS.products||[]).find(p=>p.id==='fabric')||null;}
+function fabricAll(){const p=fabricProduct();return p&&p.ok?(p.companies||[]):[];}
+function fabricOf(id){return fabricAll().find(f=>f.companyId!=null&&String(f.companyId)===String(id))||null;}
+/* Fabric Stock's companies with no Weight Calc company of their own (a second one on the same company is listed too) */
+function fabricOnly(){
+  const ids=new Set(((DATA&&DATA.companies)||[]).map(c=>String(c.id)));
+  return fabricAll().filter(f=>f.companyId==null||!ids.has(String(f.companyId))||fabricOf(f.companyId)!==f);
+}
+function fsWord(f){return f.shownState==='DEMO'?'demo':String(f.shownState||'').toLowerCase();}
+function fsColour(f){return f.shownState==='LICENSED'?'var(--k-green)':f.shownState==='DEMO'?'var(--k-teal)':f.shownState==='EXPIRED'?'var(--k-amber)':'var(--k-red)';}
+function fsDays(f){return f.shownState==='EXPIRED'||f.shownState==='SUSPENDED'?'since '+fmt(f.expiresAt):(f.daysLeft===0?'ends today':f.daysLeft+' day'+(f.daysLeft===1?'':'s'));}
+function swPills(c){
+  const f=fabricOf(c.id);
+  return '<span class="pill sw-weight" title="Nexora Bag Weight Calculation">Weight Calc</span> '+
+    (f?'<span class="pill sw-fabric" title="Nexora Loom &amp; Fabric Stock — its own licence">Fabric Stock · '+esc(fsWord(f))+' · '+esc(fsDays(f))+'</span> ':'');
+}
+/* when Fabric Stock cannot be reached, the Weight Calc list is shown all the same, with this above it */
+function fabricNote(){
+  const p=fabricProduct();
+  if(!p)return COVIEW==='fabric'?'<p class="help">Reading Fabric Stock…</p>':'';
+  if(p.ok)return '';
+  return '<div class="sw-off"><b style="color:var(--k-violet)">Fabric Stock is not connected.</b> '+esc(p.message||'')+' <button class="small" onclick="loadProducts()">Try again</button></div>';
+}
+function fabricFacts(f){
+  const used=+f.people||0, seats=+f.seats||1, pct=Math.min(100,Math.round(used/Math.max(1,seats)*100));
+  const ended=f.shownState==='EXPIRED'||f.shownState==='SUSPENDED';
+  return '<div class="co-facts">'+
+    '<div class="fact"><span>Licence</span><b style="color:'+fsColour(f)+'">'+esc(fsWord(f))+'</b><small>'+(f.isDemo?'everything, while it is a demo':'plan '+esc(String(f.plan||'STANDARD').toLowerCase()))+'</small></div>'+
+    '<div class="fact"><span>Licence key</span><b class="key" style="font-size:13px">'+esc(f.licenceKey||'')+'</b><small><button class="small" data-key="'+esc(f.licenceKey||'')+'" onclick="copyKey(this)">Copy</button></small></div>'+
+    '<div class="fact"><span>Seats (people)</span><b>'+used+' of '+seats+'</b><small>'+(seats-used>0?(seats-used)+' available':'none available')+'</small><span class="bar'+(used>=seats?' full':'')+'"><i style="width:'+pct+'%"></i></span></div>'+
+    '<div class="fact"><span>Computers and phones</span><b>'+(+f.devices||0)+'</b><small>not counted against seats</small></div>'+
+    '<div class="fact"><span>'+(f.isDemo?'Demo started':'Licence started')+'</span><b>'+fmt(f.periodStartedAt||f.createdAt)+'</b><small>'+(f.periodDays?f.periodDays+'-day '+(f.isDemo?'demo':'licence'):'—')+'</small></div>'+
+    '<div class="fact"'+(f.endingSoon?' style="border-color:var(--warn)" title="Ends within 30 days — ring them to renew"':'')+'><span>'+(f.shownState==='EXPIRED'?'Ended':f.shownState==='SUSPENDED'?'Suspended · ends':'Days left')+'</span><b'+(f.endingSoon?' style="color:var(--warn)"':'')+'>'+(ended?fmt(f.expiresAt):(f.daysLeft===0?'today':f.daysLeft))+'</b>'+(ended?'':'<small>'+fmt(f.expiresAt)+(f.endingSoon?' · <b style="color:var(--warn);display:inline;font-size:inherit">renew soon</b>':'')+'</small>')+'</div>'+
+    '<div class="fact"><span>Offline allowed</span><b>'+(f.graceDays>0?f.graceDays+' days':'none')+'</b></div>'+
+    (f.loginId?'<div class="fact"><span>Login id</span><b><code>'+esc(f.loginId)+'</code></b></div>':'')+
+  '</div>';
+}
+function fabricManage(f,c){
+  const p=fabricProduct();
+  if(!p)return '<div class="sw-off">Reading Fabric Stock…</div>';
+  if(!p.ok)return fabricNote();
+  if(!f){
+    const loose=fabricOnly().filter(x=>x.companyId==null);
+    return '<div class="group"><h4>Not used yet</h4><div class="acts">'+
+      '<span class="why" style="flex-basis:100%">'+esc(c.name)+' does not use Fabric Stock yet. It gets a licence of its own: starting it changes nothing in Weight Calc.</span>'+
+      '<button class="primary" data-wc="'+c.id+'" data-state="DEMO" onclick="fsStart(this)">Start a 7-day demo</button>'+
+      '<button data-wc="'+c.id+'" data-state="LICENSED" onclick="fsStart(this)">Make licensed for 1 year</button>'+
+      (loose.length?'<select id="fslink-'+c.id+'"><option value="">Link an existing Fabric Stock company…</option>'+loose.map(x=>'<option value="'+x.id+'">'+esc(x.name)+(x.gstin?' · '+esc(x.gstin):'')+'</option>').join('')+'</select><button data-wc="'+c.id+'" onclick="fsLinkPick(this)">Link</button>':'')+
+    '</div></div>';
+  }
+  const id=f.id, d=FDETAIL[id];
+  return '<div class="group"><h4>Licence</h4><div class="acts">'+
+      (f.isDemo?'<button class="primary" data-fid="'+id+'" onclick="fsLicense(this)">Make licensed for 1 year</button><span class="why">turns this demo into a paying customer</span>':'')+
+      '<button data-fid="'+id+'" onclick="fsRenew(this)">Renew from today…</button>'+
+      '<button data-fid="'+id+'" data-days="365" onclick="fsRenew(this)">1 year from today</button><span class="why">a new period from today; it replaces the old end date</span>'+
+    '</div></div>'+
+    '<div class="group"><h4>Machines</h4><div class="acts">'+
+      '<button data-fid="'+id+'" data-now="'+(+f.seats||1)+'" onclick="fsSeats(this)">Seats…</button><span class="why">how many people may sign in to Fabric Stock</span>'+
+      '<button data-fid="'+id+'" data-now="'+(+f.graceDays||0)+'" onclick="fsGrace(this)">Offline days…</button>'+
+      '<div id="fsdev-'+id+'" class="users-panel">'+(d&&!d.error?fsDevicesHtml(d.devices||[]):'<p class="help">Reading…</p>')+'</div>'+
+    '</div></div>'+
+    '<div class="group"><h4>People</h4><div class="acts">'+
+      '<button data-fid="'+id+'" data-name="'+esc(f.name)+'" onclick="fsAdmin(this)">Set administrator…</button><span class="why">the administrator adds everyone else and gives their rights inside Fabric Stock, apart from Weight Calc</span>'+
+      '<button data-fid="'+id+'" data-login="'+esc(f.loginId||'')+'" onclick="fsPasscode(this)">New company passcode…</button>'+
+      '<div id="fsppl-'+id+'" class="users-panel">'+(d&&!d.error?fsPeopleHtml(id,d.users||[]):'<p class="help">Reading…</p>')+'</div>'+
+    '</div></div>'+
+    '<div class="group"><h4>Company</h4><div class="acts">'+
+      (c?(f.linkedBy==='gstin'
+          ?'<span class="why">Shown with '+esc(c.name)+' because the GSTIN is the same.</span><button data-fid="'+id+'" data-action="apart" onclick="fsLink(this)">Not the same company</button>'
+          :'<span class="why">Linked to '+esc(c.name)+' by hand.</span><button data-fid="'+id+'" data-action="unlink" onclick="fsLink(this)">Unlink</button>')
+        :linkSelect(f))+
+    '</div></div>'+
+    '<div class="group"><h4>Stop</h4><div class="acts">'+
+      (f.state==='SUSPENDED'
+        ?'<button data-fid="'+id+'" data-action="resume" onclick="fsStop(this)">Restore</button><span class="why">every Fabric Stock computer and phone runs again</span>'
+        :'<button class="danger" data-fid="'+id+'" data-action="suspend" onclick="fsStop(this)">Suspend</button><span class="why">every Fabric Stock computer and phone stops at its next check; nothing is deleted, and Weight Calc is not touched</span>')+
+    '</div></div>';
+}
+function linkSelect(f){
+  const cos=(DATA&&DATA.companies)||[];
+  if(!cos.length)return '<span class="why">No Weight Calc company to link it to.</span>';
+  return '<select id="fswc-'+f.id+'"><option value="">Link to a Weight Calc company…</option>'+cos.map(c=>'<option value="'+c.id+'">'+esc(c.name)+(c.gstin?' · '+esc(c.gstin):'')+'</option>').join('')+'</select>'+
+    '<button data-fid="'+f.id+'" onclick="fsLinkTo(this)">Link</button><span class="why">the same plant using both; each keeps its own licence</span>';
+}
+function fsPeopleHtml(fid,users){
+  if(!users.length)return '<p class="help"><b style="color:var(--bad)">Nobody yet</b> — set an administrator; the administrator adds everyone else from inside Fabric Stock.</p>';
+  return '<table class="users"><thead><tr><th>Name</th><th>Role</th><th>Email</th><th>Last seen</th><th></th></tr></thead><tbody>'+
+    users.map(u=>'<tr'+(u.active===false?' style="opacity:.55"':'')+'><td><b>'+esc(u.name)+'</b>'+(u.active===false?' <small>(switched off)</small>':'')+'</td>'+
+      '<td>'+(u.role==='ADMIN'?'<b>administrator</b>':'user'+(u.scope==='OWN'?' · own work only':''))+'</td>'+
+      '<td>'+(u.email?'<code>'+esc(u.email)+'</code>':'<span class="why">—</span>')+'</td>'+
+      '<td class="why">'+esc(u.lastSeenAt?fmtTime(u.lastSeenAt):'never')+'</td>'+
+      '<td>'+(u.sessionDevice?'<button class="small" data-fid="'+fid+'" data-uid="'+u.id+'" data-name="'+esc(u.name)+'" onclick="fsSignOut(this)">Sign out</button>':'')+'</td></tr>').join('')+
+    '</tbody></table>';
+}
+function fsDevicesHtml(devs){
+  if(!devs.length)return '<p class="help">No Fabric Stock computer or phone has joined yet.</p>';
+  return '<table class="users"><thead><tr><th>Computer / phone</th><th>State</th><th>Signed in</th><th>Last seen</th><th></th></tr></thead><tbody>'+
+    devs.map(d=>{
+      const st=d.state==='REVOKED'?(d.revokedBy==='NEXORA'?'withdrawn by Nexora':'removed by the company'):d.pending?'waiting for the administrator':'in use';
+      return '<tr><td><b>'+esc(d.name||(d.platform==='mobile'?'Phone':'Computer'))+'</b><br><small>'+(d.platform==='mobile'?'phone':'computer'+(d.computerNo?' '+d.computerNo:''))+(d.appVersion?' · '+esc(d.appVersion):'')+'</small></td>'+
+        '<td>'+esc(st)+'</td><td>'+(d.signedIn?esc(d.signedIn.name):'<span class="why">nobody</span>')+'</td>'+
+        '<td class="why">'+esc(d.lastSeen?fmtTime(d.lastSeen):'never')+'</td>'+
+        '<td>'+(d.state==='REVOKED'?(d.revokedBy==='NEXORA'?'<button class="small" data-dev="'+esc(d.id)+'" data-action="restore" onclick="fsDevice(this)">Give back</button>':'')
+          :'<button class="small danger" data-dev="'+esc(d.id)+'" data-action="revoke" onclick="fsDevice(this)">Withdraw</button>')+'</td></tr>';
+    }).join('')+'</tbody></table>';
+}
+function fabricOnlyHtml(term){
+  return fabricOnly().filter(f=>!term||[f.name,f.licenceKey,f.email,f.gstin,f.loginId,f.phone].some(v=>String(v||'').toLowerCase().includes(term))).map(f=>{
+    const open=OPENF===f.id;
+    return '<div class="co fabric-only" id="fco-'+f.id+'">'+
+      '<div class="co-head"><div class="grow" style="flex:1">'+
+        '<span class="co-name">'+esc(f.name)+'</span> '+
+        '<span class="pill s-'+esc(f.shownState)+'">'+esc(fsWord(f))+'</span> '+
+        '<span class="pill sw-fabric" title="Nexora Loom &amp; Fabric Stock">Fabric Stock only</span> '+
+        (f.selfRegistered?'<span class="pill s-SELF">self-registered</span> ':'')+
+        '<div class="co-meta"><span>Key <span class="key">'+esc(f.licenceKey)+'</span> <button class="small" data-key="'+esc(f.licenceKey)+'" onclick="copyKey(this)">Copy</button></span>'+
+          (f.gstin?'<span>GSTIN <code>'+esc(f.gstin)+'</code></span>':'')+(f.email?'<span><code>'+esc(f.email)+'</code></span>':'')+(f.phone?'<span><code>'+esc(f.phone)+'</code></span>':'')+'</div>'+
+      '</div><div><button'+(open?' class="primary"':'')+' data-fid="'+f.id+'" onclick="manageF(this)">'+(open?'Close':'Manage')+'</button></div></div>'+
+      '<div class="sw-cap sw-fabric">Fabric Stock</div>'+fabricFacts(f)+
+      '<div class="manage'+(open?' open':'')+'">'+fabricManage(f,null)+'</div>'+
+    '</div>';
+  }).join('');
+}
+function manageF(btn){
+  const id=+btn.dataset.fid;
+  OPENF=OPENF===id?null:id;
+  renderCompanies();
+  if(OPENF){document.getElementById('fco-'+OPENF).scrollIntoView({block:'nearest'});fabricDetail(OPENF);}
+}
+async function fabricDetail(fid){
+  let d;
+  try{d=await api('/admin/api/fabric',{method:'POST',body:JSON.stringify({action:'detail',id:fid})});}catch(e){d={error:e.message};}
+  FDETAIL[fid]=d;
+  const pp=document.getElementById('fsppl-'+fid), dv=document.getElementById('fsdev-'+fid);
+  if(d.error){const m='<div class="msg err">'+esc(d.message||d.error)+'</div>';if(pp)pp.innerHTML=m;if(dv)dv.innerHTML='';return;}
+  if(pp)pp.innerHTML=fsPeopleHtml(fid,d.users||[]);
+  if(dv)dv.innerHTML=fsDevicesHtml(d.devices||[]);
+}
+/* every change goes to Fabric Stock's own service, then the list is read again */
+async function fsCall(body,done){
+  let r;
+  try{r=await api('/admin/api/fabric',{method:'POST',body:JSON.stringify(body)});}catch(e){r={error:e.message};}
+  if(r.error){say('<div class="msg err">Fabric Stock: '+esc(r.message||r.error)+'</div>');return null;}
+  if(done)say('<div class="msg ok">'+done+'</div>');
+  await loadProducts();
+  return r;
+}
+function fsName(id){const f=fabricAll().find(x=>String(x.id)===String(id));return f?f.name:'this company';}
+async function fsStart(btn){
+  const c=((DATA&&DATA.companies)||[]).find(x=>String(x.id)===String(btn.dataset.wc));if(!c)return;
+  const demo=btn.dataset.state==='DEMO';
+  if(!confirm((demo?'Start a 7-day Fabric Stock demo':'Make a licensed Fabric Stock company for 1 year')+' for '+c.name+'?  It gets a Fabric Stock licence key of its own; Weight Calc is not touched.'))return;
+  const r=await fsCall({action:'create',name:c.name,state:demo?'DEMO':'LICENSED',days:demo?7:365,seats:3,gstin:c.gstin||undefined,email:c.email||undefined,phone:c.phone||undefined,linkTo:c.id});
+  if(r&&r.company)say('<div class="msg ok"><b>'+esc(c.name)+'</b> now has Fabric Stock. Its Fabric Stock licence key is <span class="key">'+esc(r.company.licenceKey)+'</span> — for Fabric Stock only.</div>');
+}
+async function fsLicense(btn){
+  if(!confirm('Make '+fsName(btn.dataset.fid)+' a licensed Fabric Stock customer for 1 year from today?'))return;
+  await fsCall({action:'update',id:+btn.dataset.fid,state:'LICENSED',days:365},'Fabric Stock licensed for 1 year.');
+}
+async function fsRenew(btn){
+  let days=+btn.dataset.days||0;
+  if(!days){
+    const v=prompt('Renew Fabric Stock for how many days from today?  The new end date replaces the old one.','365');
+    if(v===null)return;
+    days=parseInt(v,10);
+    if(!(days>0)){say('<div class="msg err">Enter a number of days.</div>');return;}
+  }else if(!confirm('Renew '+fsName(btn.dataset.fid)+' for '+days+' days from today?'))return;
+  await fsCall({action:'update',id:+btn.dataset.fid,days},'Fabric Stock renewed for '+days+' days from today.');
+}
+async function fsSeats(btn){
+  const v=prompt('How many people may sign in to Fabric Stock at '+fsName(btn.dataset.fid)+'?',btn.dataset.now||'3');
+  if(v===null)return;
+  const n=parseInt(v,10);
+  if(!(n>0)){say('<div class="msg err">Enter a number of seats.</div>');return;}
+  await fsCall({action:'update',id:+btn.dataset.fid,seats:n},'Fabric Stock seats set to '+n+'.');
+}
+async function fsGrace(btn){
+  const v=prompt('How many days may Fabric Stock work without reaching the service (0 to 30)?',btn.dataset.now||'0');
+  if(v===null)return;
+  const n=parseInt(v,10);
+  if(!(n>=0)){say('<div class="msg err">Enter a number of days.</div>');return;}
+  await fsCall({action:'update',id:+btn.dataset.fid,graceDays:n},'Fabric Stock offline days set.');
+}
+async function fsAdmin(btn){
+  const name=prompt('Fabric Stock administrator for '+btn.dataset.name+' — the person’s name:','');
+  if(!name)return;
+  const pin=prompt('A PIN for '+name+' (they change it themselves later):','');
+  if(!pin)return;
+  await fsCall({action:'adminuser',id:+btn.dataset.fid,name,pin},'Fabric Stock administrator set: '+esc(name)+'.');
+}
+async function fsPasscode(btn){
+  const login=prompt('Fabric Stock company id (the name the plant signs a new computer in with):',btn.dataset.login||'');
+  if(login===null)return;
+  const passcode=prompt('A new company passcode (at least 6 characters):','');
+  if(!passcode)return;
+  await fsCall({action:'passcode',id:+btn.dataset.fid,loginId:login||undefined,passcode},'A new Fabric Stock company passcode is set.');
+}
+async function fsSignOut(btn){
+  if(!confirm('Sign '+btn.dataset.name+' out of Fabric Stock everywhere?'))return;
+  await fsCall({action:'usersignout',id:+btn.dataset.fid,userId:+btn.dataset.uid},esc(btn.dataset.name)+' is signed out of Fabric Stock.');
+}
+async function fsDevice(btn){
+  const give=btn.dataset.action==='restore';
+  if(!give&&!confirm('Withdraw this Fabric Stock computer or phone?  It stops at once; the person on it is signed out.'))return;
+  await fsCall({action:btn.dataset.action,deviceId:btn.dataset.dev},give?'Given back.':'Withdrawn.');
+}
+async function fsStop(btn){
+  const stop=btn.dataset.action==='suspend';
+  if(stop&&!confirm('Suspend Fabric Stock for '+fsName(btn.dataset.fid)+'?  EVERY Fabric Stock computer and phone stops at its next check. Nothing is deleted, and Weight Calc is not touched; Restore puts it back.'))return;
+  await fsCall({action:btn.dataset.action,id:+btn.dataset.fid},stop?'Fabric Stock suspended.':'Fabric Stock restored.');
+}
+async function fsLink(btn){
+  const apart=btn.dataset.action==='apart';
+  if(!confirm(apart?'These are two different companies, although the GSTIN is the same?  Fabric Stock is then listed on its own.':'Unlink?  It is then shown with whichever company has the same GSTIN, or on its own.'))return;
+  await fsCall({action:btn.dataset.action,id:+btn.dataset.fid},apart?'Kept apart.':'Unlinked.');
+}
+async function fsLinkTo(btn){
+  const sel=document.getElementById('fswc-'+btn.dataset.fid);const to=sel&&sel.value;
+  if(!to){say('<div class="msg err">Choose the Weight Calc company first.</div>');return;}
+  await fsCall({action:'link',id:+btn.dataset.fid,companyId:+to},'Linked.');
+  OPENF=null;OPEN=+to;renderCompanies();
+}
+async function fsLinkPick(btn){
+  const sel=document.getElementById('fslink-'+btn.dataset.wc);const fid=sel&&sel.value;
+  if(!fid){say('<div class="msg err">Choose the Fabric Stock company first.</div>');return;}
+  await fsCall({action:'link',id:+fid,companyId:+btn.dataset.wc},'Linked.');
+  const f=fabricOf(btn.dataset.wc);if(f)fabricDetail(f.id);
 }
 /* ---------- the phone app's releases (4.44.0) -------------------------- */
 let RELEASES=[];

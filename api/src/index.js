@@ -34,6 +34,7 @@ import { listFeedback, feedbackShot, feedbackAction, publicFeedback, MAX_SHOT } 
 import { latestRelease, listReleases, releaseAction } from './appupdate.js';
 import { logoResponse } from './brand.js';
 import { customerCheck, sourcesOf } from './marketing.js';
+import { listProducts, fabricAction } from './products.js';
 
 /* exported for server.js, whose early answers (a body over its limit) carry the same headers */
 export const CORS = {
@@ -897,6 +898,10 @@ export default {
           if (path === '/admin/api/gst' && method === 'POST') { const out = await gstAction(await readBody()); return adminJson(out.body, out.httpStatus); }
           if (path === '/admin/api/company' && method === 'POST') return adminJson(await companyAction(await readBody()));
           if (path === '/admin/api/settings' && method === 'POST') return adminJson(await saveSettings(await readBody()));
+          /* 2026-10-07 (console) — every Nexora software in the one console (owner: "nexora console page single rahese badhi service
+             tya thij update chalu bandh thase"): each keeps its own service and licence, products.js asks it */
+          if (path === '/admin/api/products' && method === 'GET') return adminJson(await listProducts());
+          if (path === '/admin/api/fabric' && method === 'POST') { const out = await fabricAction(await readBody()); return adminJson(out.body, out.httpStatus); }
           /* 4.72.0 (audit 39) — ?admin=1: only what was done from the console (the Activity list); ?limit= up to 500 */
           if (path === '/admin/api/events' && method === 'GET') {
             const adminOnly = /^(1|true|yes)$/i.test(url.searchParams.get('admin') || '');

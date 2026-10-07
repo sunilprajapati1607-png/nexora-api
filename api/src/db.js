@@ -567,10 +567,21 @@ export function ensureSchema() {
         set_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
         set_by     BIGINT
       )`);
+    /* 2026-10-07 (console) — every Nexora software in the one console (products.js): which weight-calculation company another
+       software's company belongs to, when the owner links them by hand. company_id NULL = kept apart on purpose.
+       Nothing else of the other software is kept here — its licence lives in its own service and database. */
+    await q(`
+      CREATE TABLE IF NOT EXISTS product_links (
+        product    TEXT NOT NULL,
+        remote_id  TEXT NOT NULL,
+        company_id BIGINT,
+        linked_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (product, remote_id)
+      )`);
     /* 4.72.0 — ink_model_history (inkstore.js, made with the ink tables) has row level security like
        sync_history; on a database where it does not exist yet it is skipped and done on a later start */
     /* 4.73.0 — and the recycle bin and the backup passwords */
-    for (const t of ['chat_messages', 'feedback', 'inquiries', 'app_releases', 'ai_usage', 'sync_history', 'ink_model_history', 'recycle_bin', 'backup_secrets']) {
+    for (const t of ['chat_messages', 'feedback', 'inquiries', 'app_releases', 'ai_usage', 'sync_history', 'ink_model_history', 'recycle_bin', 'backup_secrets', 'product_links']) {
       try {
         await q(`DO $rls$ BEGIN
                    IF EXISTS (SELECT 1 FROM pg_tables WHERE schemaname = current_schema() AND tablename = '${t}' AND tableowner = current_user)
