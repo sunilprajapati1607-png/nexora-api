@@ -3204,7 +3204,7 @@ const SEC_TOOLS={
   'sec-plans':[['New plan','+',C_.green,'newPlan'],['Open','▭',C_.blue,'openSel'],'|',['Print','⎙',C_.slate,'print'],'|',['Refresh','↻',C_.green,'refresh']],
   def:[['Refresh','↻',C_.green,'refresh'],['Print','⎙',C_.slate,'print']]
 };
-function tbHtml(items,attr){return items.map(x=>x==='|'?'<span class="tsep"></span>':'<button class="tbi" '+(attr||'data-tool')+'="'+x[3]+'"'+(x[4]?' disabled':'')+' title="'+esc(x[0])+'"><span class="sq" style="background:'+x[2]+'">'+x[1]+'</span>'+esc(x[0])+'</button>').join('');}
+function tbHtml(items,attr){return items.filter(Boolean).map(x=>x==='|'?'<span class="tsep"></span>':'<button class="tbi" '+(attr||'data-tool')+'="'+x[3]+'"'+(x[4]?' disabled':'')+' title="'+esc(x[0])+'"><span class="sq" style="background:'+x[2]+'">'+x[1]+'</span>'+esc(x[0])+'</button>').join('');}
 function shellFor(id){
   const i=SEC_INFO[id]||[id,'','','',''];
   const t=document.getElementById('ptitle');if(!t)return;
@@ -3285,7 +3285,11 @@ function fState(f){return f.shownState||'LICENSED';}
 function stCls(s){return s==='LICENSED'?'c-ok':s==='DEMO'?'c-demo':s==='EXPIRED'?'c-warn':'c-bad';}
 function stWord(s){return s==='LICENSED'?'licensed':s==='DEMO'?'demo':s==='EXPIRED'?'ended':'suspended';}
 function daysText(state,left,at){return state==='SUSPENDED'?'suspended':state==='EXPIRED'?'ended '+fmt(at):(state==='DEMO'?'demo · ':'')+(left===0?'ends today':left+' day'+(left===1?'':'s'));}
-function ovCount(c){const o=c&&c.feature_overrides&&typeof c.feature_overrides==='object'?c.feature_overrides:{};return Object.keys(o).length;}
+function ownOf(l){const o=l&&(l.feature_overrides||l.featureOverrides);return o&&typeof o==='object'?o:{};}
+function ovCount(c){return Object.keys(ownOf(c)).length;}
+/* each software's own features: Sales & Costing's from this service, Fabric Stock's from its own (0.8.1 on) */
+function featsOf(sw){if(sw==='weight')return wFeatures();const b=softBlock('fabric');return b&&b.supported?(b.features||[]):[];}
+function fabricPlans(){const b=softBlock('fabric');return !!(b&&b.supported);}
 function customers(){
   const out=[];
   (DATA.companies||[]).forEach(c=>{const f=fabricOf(c.id);out.push({key:'w'+c.id,name:c.name,gstin:c.gstin||'',email:c.email||'',phone:c.phone||'',w:c,f:f||null,self:!!c.self_registered,since:c.created_at});});
@@ -3307,7 +3311,7 @@ function swCell(sw,x){
     return '<b>'+esc(planNameOf('weight',c.plan))+(n?' <span style="color:var(--accent)">± '+n+'</span>':'')+'</b><small class="'+stCls(s)+'">'+esc(daysText(s,c.days_left,c.expires_at))+'</small>';}
   const f=x.f;
   if(!f){const p=fabricProduct();return '<span class="c-none">'+(p&&!p.ok?'not connected':'— not taken')+'</span>';}
-  const s=fState(f);return '<b>'+esc(planNameOf('fabric',f.plan))+'</b><small class="'+stCls(s)+'">'+esc(daysText(s,f.daysLeft,f.expiresAt))+'</small>';
+  const s=fState(f),n=ovCount(f);return '<b>'+esc(planNameOf('fabric',f.plan))+(n?' <span style="color:var(--accent)">± '+n+'</span>':'')+'</b><small class="'+stCls(s)+'">'+esc(daysText(s,f.daysLeft,f.expiresAt))+'</small>';
 }
 function coView(v){CQUICK=v==='deleted'?'deleted':v==='ending'?'soon':'all';renderCompanies();}
 function plQuick(sw){document.getElementById('plSoft').value=sw;renderPlanList();}
@@ -3400,11 +3404,11 @@ function renderWin(){
     ['Add days','+',C_.orange,'w-days'],c.is_demo?['Make licensed','✓',C_.green,'w-licence']:['+1 year','+1',C_.amber,'w-year'],['Plan','◫',C_.violet,'w-plan'],['Seats','☺',C_.teal,'w-seats'],
     s==='SUSPENDED'?['Restore','▶',C_.green,'w-restore']:['Suspend','⏸',C_.red,'w-suspend'],['New key','⚿',C_.violet,'w-rekey'],'|',['Record payment','₹',C_.teal,'pay']]);}
   if(!W&&f){const s=fState(f);tools=tools.concat([
-    ['Add days','+',C_.orange,'f-days'],f.isDemo?['Make licensed','✓',C_.green,'f-licence']:['+1 year','+1',C_.amber,'f-year'],['Seats','☺',C_.teal,'f-seats'],
+    ['Add days','+',C_.orange,'f-days'],f.isDemo?['Make licensed','✓',C_.green,'f-licence']:['+1 year','+1',C_.amber,'f-year'],fabricPlans()?['Plan','◫',C_.violet,'f-plan']:null,['Seats','☺',C_.teal,'f-seats'],
     s==='SUSPENDED'?['Restore','▶',C_.green,'f-restore']:['Suspend','⏸',C_.red,'f-suspend'],'|',['Record payment','₹',C_.teal,'pay']]);}
   tools=tools.concat(['|',['Close','✕',C_.back,'close']]);
   const subs=W?[['licence','Licence'],['features','Features'],['people','People'],['computers','Computers & phones'],['payments','Payments'],['more','More'],['history','History']]
-             :[['licence','Licence'],['people','People'],['computers','Computers & phones'],['payments','Payments'],['company','Company'],['history','History']];
+             :[['licence','Licence']].concat(fabricPlans()?[['features','Features']]:[]).concat([['people','People'],['computers','Computers & phones'],['payments','Payments'],['company','Company'],['history','History']]);
   if(!subs.some(s=>s[0]===WIN.sub))WIN.sub='licence';
   const payN=custPayments(x).length;
   const head='<div class="wtitle"><span class="av">'+esc(initials(x.name))+'</span><div><h2>'+esc(x.name)+'<span class="mode'+(E?' edit':'')+'">'+(E?'EDIT':'DISPLAY')+'</span></h2>'+
@@ -3417,10 +3421,10 @@ function renderWin(){
   const tabs='<div class="swtabs">'+
     (c?'<button class="swt w'+(W?' on':'')+'" data-wtool="sw-weight"><span class="b">⚖</span><span><b>Sales & Costing</b><small>'+esc(planNameOf('weight',c.plan))+(ovCount(c)?' ± '+ovCount(c):'')+' · '+esc(daysText(wState(c),c.days_left,c.expires_at))+'</small></span></button>'
        :'<button class="swt add" data-wtool="add-weight">+ Add Sales & Costing</button>')+
-    (f?'<button class="swt f'+(!W?' on':'')+'" data-wtool="sw-fabric"><span class="b">▤</span><span><b>Fabric Stock</b><small>'+esc(planNameOf('fabric',f.plan))+' · '+esc(daysText(fState(f),f.daysLeft,f.expiresAt))+'</small></span></button>'
+    (f?'<button class="swt f'+(!W?' on':'')+'" data-wtool="sw-fabric"><span class="b">▤</span><span><b>Fabric Stock</b><small>'+esc(planNameOf('fabric',f.plan))+(ovCount(f)?' ± '+ovCount(f):'')+' · '+esc(daysText(fState(f),f.daysLeft,f.expiresAt))+'</small></span></button>'
        :'<button class="swt add'+(!W?' on':'')+'" data-wtool="sw-fabric">+ Add Fabric Stock</button>')+
     '<span class="swt j soon"><span class="b">⚙</span><span><b>Jobwork</b><small>coming — no licence yet</small></span></span></div>';
-  const subt=(W?c:f)?'<div class="subt">'+subs.map(s=>'<button class="'+(WIN.sub===s[0]?'on':'')+'" data-wtool="sub-'+s[0]+'">'+s[1]+(s[0]==='payments'&&payN?'<small>'+payN+'</small>':'')+(s[0]==='features'&&c&&ovCount(c)?'<small>± '+ovCount(c)+'</small>':'')+'</button>').join('')+'</div>':'';
+  const subt=(W?c:f)?'<div class="subt">'+subs.map(s=>'<button class="'+(WIN.sub===s[0]?'on':'')+'" data-wtool="sub-'+s[0]+'">'+s[1]+(s[0]==='payments'&&payN?'<small>'+payN+'</small>':'')+(s[0]==='features'&&ovCount(W?c:f)?'<small>± '+ovCount(W?c:f)+'</small>':'')+'</button>').join('')+'</div>':'';
   let body='';
   if(W&&!c)body='<div class="card"><h3>'+esc(x.name)+' does not use Sales & Costing yet</h3><p class="help">It gets a licence of its own; Fabric Stock is not touched.</p><div class="acts"><button class="primary" data-wtool="start-weight">Make licensed for 1 year</button></div></div>';
   else if(!W&&!f)body='<div class="card">'+(c?fabricManage(null,c):'')+'</div>';
@@ -3455,26 +3459,7 @@ function wBody(x,c){
       '<div class="fig f3"><span>Transactions</span><b>'+(+c.txn_used||0)+'</b><small>'+(c.txn_limit?'of '+c.txn_limit:'no limit')+'</small></div>'+
       '<div class="fig f4"><span>Hours in use</span><b>'+hoursText(c.usage_minutes)+'</b><small>summed over its machines</small></div></div>';
   }
-  if(sub==='features'){
-    const plan=planOf('weight',c.plan)||{features:{}};
-    const own=Object.assign({},c.feature_overrides||{});
-    if(E)Object.keys(WIN.draft).forEach(k=>{if(WIN.draft[k]===null)delete own[k];else own[k]=WIN.draft[k];});
-    const feats=wFeatures(), groups=[];
-    feats.forEach(fe=>{if(groups.indexOf(fe.group)<0)groups.push(fe.group);});
-    groups.sort((a,b)=>GROUP_ORDER.indexOf(a)-GROUP_ORDER.indexOf(b));
-    let fromPlan=0,added=0,off=0,onN=0;
-    const cell=fe=>{
-      const p=plan.features[fe.id]===true, o=own[fe.id], eff=typeof o==='boolean'?o:p;
-      const cls=o===true&&!p?'add':o===false&&p?'off':p?'plan':'no';
-      if(p)fromPlan++;if(cls==='add')added++;if(cls==='off')off++;if(eff)onN++;
-      return '<button class="fx '+cls+(eff?' on':'')+'" data-wtool="feat-'+fe.id+'"'+(E?'':' disabled')+'><span class="cb">'+(eff?'✓':'')+'</span><span class="nm">'+esc(fe.label)+'</span><span class="tg">'+({plan:'from plan',add:'+ added',off:'− off',no:'not in plan'})[cls]+'</span></button>';
-    };
-    const grid=groups.map(g=>'<div class="fgh">'+esc(g)+'</div><div class="feat">'+feats.filter(fe=>fe.group===g).map(cell).join('')+'</div>').join('');
-    return '<div class="card" style="padding:10px 14px"><div class="sumline"><span><b>'+esc(plan.name||planNameOf('weight',c.plan))+'</b> gives '+fromPlan+' of '+feats.length+'</span>'+
-      '<span style="color:var(--accent);font-weight:700">+'+added+' added for '+esc(c.name)+'</span><span class="c-bad">−'+off+' turned off</span><span>→ <b>'+onN+' on</b></span><span style="flex:1"></span>'+
-      (c.is_demo?'<span class="sub">A demo has every feature; these apply once it is licensed.</span>':'<span class="sub">'+(E?'Click a feature to add it or take it off for this customer only.':'Grey until Edit (Ctrl+E). The plan itself stays as it is.')+'</span>')+
-      (E?'<button class="small" data-wtool="feat-reset">Back to the plan only</button>':'')+'</div></div><div class="card">'+grid+'</div>';
-  }
+  if(sub==='features')return featBody('weight',c);
   if(sub==='people')return '<div class="card"><div class="acts" style="margin-bottom:10px">'+
       '<button data-id="'+c.id+'" data-name="'+esc(c.name)+'" onclick="coAdmin(this)">Set administrator…</button>'+
       '<button data-id="'+c.id+'" data-name="'+esc(c.name)+'" data-login="'+esc(c.login_id||'')+'" onclick="coPasscode(this)">New company passcode…</button>'+
@@ -3490,13 +3475,35 @@ function wBody(x,c){
       '<button class="danger" data-id="'+c.id+'" data-name="'+esc(c.name)+'" onclick="coDelete(this)">Delete…</button><span class="why">stops it now and keeps it 30 days (Restore under Deleted); then it and everything that belongs to it are erased</span></div></div></div>';
   return '<div class="card"><div id="whist"><p class="help">Reading…</p></div></div>';
 }
+function featBody(sw,l){
+  const E=WIN.edit, demo=sw==='weight'?l.is_demo:l.isDemo;
+  const plan=planOf(sw,l.plan)||{features:{},name:planNameOf(sw,l.plan)};
+  const own=Object.assign({},ownOf(l));
+  if(E)Object.keys(WIN.draft).forEach(k=>{if(WIN.draft[k]===null)delete own[k];else own[k]=WIN.draft[k];});
+  const feats=featsOf(sw), groups=[];
+  feats.forEach(fe=>{const g=fe.group||'Features';if(groups.indexOf(g)<0)groups.push(g);});
+  if(sw==='weight')groups.sort((a,b)=>GROUP_ORDER.indexOf(a)-GROUP_ORDER.indexOf(b));
+  let fromPlan=0,added=0,off=0,onN=0;
+  const cell=fe=>{
+    const p=plan.features[fe.id]===true, o=own[fe.id], eff=typeof o==='boolean'?o:p;
+    const cls=o===true&&!p?'add':o===false&&p?'off':p?'plan':'no';
+    if(p)fromPlan++;if(cls==='add')added++;if(cls==='off')off++;if(eff)onN++;
+    return '<button class="fx '+cls+(eff?' on':'')+'" data-wtool="feat-'+fe.id+'"'+(E?'':' disabled')+'><span class="cb">'+(eff?'✓':'')+'</span><span class="nm">'+esc(fe.label)+'</span><span class="tg">'+({plan:'from plan',add:'+ added',off:'− off',no:'not in plan'})[cls]+'</span></button>';
+  };
+  const grid=groups.map(g=>'<div class="fgh">'+esc(g)+'</div><div class="feat">'+feats.filter(fe=>(fe.group||'Features')===g).map(cell).join('')+'</div>').join('');
+  return '<div class="card" style="padding:10px 14px"><div class="sumline"><span><b>'+esc(plan.name||planNameOf(sw,l.plan))+'</b> gives '+fromPlan+' of '+feats.length+'</span>'+
+    '<span style="color:var(--accent);font-weight:700">+'+added+' added for '+esc(l.name)+'</span><span class="c-bad">−'+off+' turned off</span><span>→ <b>'+onN+' on</b></span><span style="flex:1"></span>'+
+    (demo?'<span class="sub">A demo has every feature; these apply once it is licensed.</span>':'<span class="sub">'+(E?'Click a feature to add it or take it off for this customer only.':'Grey until Edit (Ctrl+E). The plan itself stays as it is.')+'</span>')+
+    (E?'<button class="small" data-wtool="feat-reset">Back to the plan only</button>':'')+'</div></div><div class="card">'+grid+'</div>';
+}
 function fBody(x,f){
   const E=WIN.edit, s=fState(f), sub=WIN.sub, p=fabricProduct();
   if(p&&!p.ok)return '<div class="card">'+fabricNote()+'</div>';
   const d=FDETAIL[f.id];
   if(sub==='licence'){
     const g=[
-      fv('Plan',planNameOf('fabric',f.plan)+(f.isDemo?' — a demo has everything':'')),
+      E&&fabricPlans()?'<div class="fl"><span>Plan</span><select id="e-plan">'+fPlans().filter(p=>p.active!==false||p.code===String(f.plan||'STANDARD').toUpperCase()).map(p=>'<option value="'+esc(p.code)+'"'+(p.code===String(f.plan||'STANDARD').toUpperCase()?' selected':'')+'>'+esc(p.name)+(p.note?' — '+esc(p.note):'')+(p.active===false?' (retired)':'')+'</option>').join('')+'</select></div>'
+        :fv('Plan',planNameOf('fabric',f.plan)+(ovCount(f)?' ± '+ovCount(f):'')+(f.isDemo?' — a demo has everything':'')),
       fv('State','<b class="'+stCls(s)+'">'+stWord(s)+'</b>',true),
       fv('Licence key','<code>'+esc(f.licenceKey)+'</code> <button class="small" data-key="'+esc(f.licenceKey)+'" onclick="copyKey(this)">Copy</button>',true),
       fv('Company id (sign-in)',f.loginId||'—'),
@@ -3517,6 +3524,7 @@ function fBody(x,f){
       '<div id="fsppl-'+f.id+'" class="users-panel">'+(d&&!d.error?fsPeopleHtml(f.id,d.users||[]):'<p class="help">Reading…</p>')+'</div></div>';
   if(sub==='computers')return '<div class="card"><div id="fsdev-'+f.id+'" class="users-panel">'+(d&&!d.error?fsDevicesHtml(d.devices||[]):'<p class="help">Reading…</p>')+'</div></div>';
   if(sub==='payments')return payTab(x,'fabric');
+  if(sub==='features')return featBody('fabric',f);
   if(sub==='company')return '<div class="card"><div class="group"><h4>Which customer</h4><div class="acts">'+
       (x.w?(f.linkedBy==='gstin'?'<span class="why">Shown with '+esc(x.w.name)+' because the GSTIN is the same.</span><button data-fid="'+f.id+'" data-action="apart" onclick="fsLink(this)">Not the same company</button>'
                                 :'<span class="why">Linked to '+esc(x.w.name)+' by hand.</span><button data-fid="'+f.id+'" data-action="unlink" onclick="fsLink(this)">Unlink</button>')
@@ -3565,9 +3573,10 @@ async function winTool(k){
   if(k==='save')return saveCustomer(x);
   if(k.indexOf('feat-')===0&&WIN.edit){
     const id=k.slice(5);
-    if(id==='reset'){wFeatures().forEach(fe=>{WIN.draft[fe.id]=null;});return renderWin();}
-    const plan=planOf('weight',c.plan)||{features:{}};const p=plan.features[id]===true;
-    const own=Object.assign({},c.feature_overrides||{});Object.keys(WIN.draft).forEach(z=>{if(WIN.draft[z]===null)delete own[z];else own[z]=WIN.draft[z];});
+    const sw=WIN.sw, l=sw==='weight'?c:f;if(!l)return;
+    if(id==='reset'){featsOf(sw).forEach(fe=>{WIN.draft[fe.id]=null;});return renderWin();}
+    const plan=planOf(sw,l.plan)||{features:{}};const p=plan.features[id]===true;
+    const own=Object.assign({},ownOf(l));Object.keys(WIN.draft).forEach(z=>{if(WIN.draft[z]===null)delete own[z];else own[z]=WIN.draft[z];});
     const eff=typeof own[id]==='boolean'?own[id]:p;const next=!eff;
     WIN.draft[id]=next===p?null:next;return renderWin();
   }
@@ -3586,6 +3595,7 @@ async function winTool(k){
   if(f&&k==='f-licence')return fsLicense({dataset:{fid:String(f.id)}});
   if(f&&k==='f-suspend')return fsStop({dataset:{fid:String(f.id),action:'suspend'}});
   if(f&&k==='f-restore')return fsStop({dataset:{fid:String(f.id),action:'resume'}});
+  if(f&&k==='f-plan'){WIN.sub='licence';WIN.edit=true;WIN.draft={};renderWin();const el=document.getElementById('e-plan');if(el)el.focus();return;}
   if(f&&k==='f-seats'){WIN.sub='licence';WIN.edit=true;WIN.draft={};renderWin();const el=document.getElementById('e-seats');if(el)el.focus();return;}
 }
 function val(id){const n=document.getElementById(id);return n?n.value:undefined;}
@@ -3618,6 +3628,8 @@ async function saveCustomer(x){
       if(nt!==undefined&&nt!==String(f.notes||''))body.notes=nt;
       if(se!==undefined&&+se!==+f.seats)body.seats=+se;
       if(gr!==undefined&&+gr!==+f.graceDays)body.graceDays=+gr;
+      const fpl=val('e-plan');if(fpl!==undefined&&fpl!==String(f.plan||'STANDARD').toUpperCase())body.plan=fpl;
+      if(Object.keys(WIN.draft).length)body.featureOverrides=Object.assign({},WIN.draft);
       if(Object.keys(body).length>2){const r=await api('/admin/api/fabric',{method:'POST',body:JSON.stringify(body)});if(r.error)errs.push('Fabric Stock: '+(r.message||r.error));}
     }
   }catch(e){errs.push(e.message);}
@@ -4008,7 +4020,7 @@ function renderSoftware(sw){
   host.innerHTML=rows.length?'<table class="rec"><thead><tr><th>Customer</th><th>Plan</th><th>State</th><th>Started</th><th>Ends</th><th class="num">Days left</th><th class="num">Seats</th><th class="num">Computers</th><th>Last payment</th><th>Also on</th></tr></thead><tbody>'+
     rows.map(x=>{const l=swLic(x,sw), s=S(x), lp=lastPay(sw,x);
       return '<tr data-open="c:'+x.key+':'+sw+':licence"><td><b>'+esc(x.name)+'</b><small>'+esc(x.gstin||'')+'</small></td>'+
-        '<td>'+esc(planNameOf(sw,l.plan))+(sw==='weight'&&ovCount(l)?' <span style="color:var(--accent)">± '+ovCount(l)+'</span>':'')+'</td><td class="'+stCls(s)+'">'+stWord(s)+'</td>'+
+        '<td>'+esc(planNameOf(sw,l.plan))+(ovCount(l)?' <span style="color:var(--accent)">± '+ovCount(l)+'</span>':'')+'</td><td class="'+stCls(s)+'">'+stWord(s)+'</td>'+
         '<td>'+fmt(swStart(sw,l))+'</td><td><b>'+fmt(swEnds(sw,l))+'</b></td><td class="num '+(live(x)&&L(x)<=30?'c-warn':'')+'">'+(live(x)?L(x):'—')+'</td>'+
         '<td class="num">'+(sw==='weight'?(+l.users_total||0):(+l.people||0))+' of '+l.seats+'</td><td class="num">'+(sw==='weight'?(l.machines_used||0):(+l.devices||0))+'</td>'+
         '<td>'+(lp?'<b>'+rupees(lp.amount)+'</b><small>'+fmt(lp.paidOn)+'</small>':'<span class="c-none">none recorded</span>')+'</td>'+
