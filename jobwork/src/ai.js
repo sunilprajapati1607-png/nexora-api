@@ -135,7 +135,8 @@ export async function resolveModel(force, fetchImpl) {
 /** For /health — cached, never waits on Google. */
 export function aiStatus() {
   if (aiConfigured() && (!model.at || Date.now() - model.at > MODEL_TTL_MS)) resolveModel(false).catch(() => {});
-  return { configured: aiConfigured(), keyFrom: keySource(), model: model.name, strong: strongModel(), ear: earModel(), voice: voiceModel(), note: model.error || null, lastAudio: lastAudio, recent: recentCalls.slice(-12) };
+  return { configured: aiConfigured(), keyFrom: keySource(), model: model.name, strong: strongModel(), ear: earModel(), voice: voiceModel(), note: model.error || null, lastAudio: lastAudio, recent: recentCalls.slice(-12),
+    lastContext: lastContext, googleDailyUntil: googleDayUntil > Date.now() ? new Date(googleDayUntil).toISOString() : null };
 }
 
 /* ---- the ear and the voice (2.0.3) ------------------------------------------
@@ -212,7 +213,38 @@ function take(device) {
   recent.push(now);
   return { left: daily() - used - 1 };
 }
-export function _resetLimits() { perDevice.clear(); recent = []; }
+export function _resetLimits() { perDevice.clear(); recent = []; googleDayUntil = 0; }
+
+/* 2.2.0 — GOOGLE'S FREE DAY (as the weight calculator's 4.72.0, AI_GOOGLE_DAILY). A 429 that says the
+   key's allowance for the DAY is used up is not "busy": asking again, on this model or the next, burns
+   the calls for nothing. The question stops at once, and every question after it is answered at once
+   with the same words until Google's day turns (the earlier of India's and Los Angeles' midnight). */
+let googleDayUntil = 0;
+const GOOGLE_DAILY_MESSAGE = 'Google\u2019s free Nexora AI allowance for today is used up \u2014 it comes back after midnight. Everything else in Nexora Jobwork works as usual.';
+export function _setGoogleDay(ms) { googleDayUntil = ms; }
+function nextMidnight(tz) {
+  const now = new Date();
+  const parts = new Intl.DateTimeFormat('en-US', { timeZone: tz, hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' }).formatToParts(now);
+  const g = (t) => Number((parts.find((p) => p.type === t) || {}).value || 0);
+  const secs = (g('hour') % 24) * 3600 + g('minute') * 60 + g('second');
+  return now.getTime() + (86400 - secs) * 1000;
+}
+export function googleDayTurns() { return Math.min(nextMidnight('Asia/Kolkata'), nextMidnight('America/Los_Angeles')); }
+export function isDailyQuota(body) {
+  const e = (body && body.error) || {};
+  const details = Array.isArray(e.details) ? e.details : [];
+  const ids = details.filter((d) => d && /QuotaFailure/.test(String(d['@type'] || ''))).map((d) => d.violations || []).reduce((a, b) => a.concat(b), [])
+    .map((v) => String((v && (v.quotaId || v.quotaMetric)) || ''));
+  if (ids.some((q) => /PerDay|per_day|daily/i.test(q))) return true;
+  return /per day|daily limit|quota.*day/i.test(String(e.message || ''));
+}
+/** Google's own "retry in 37s", when it says so */
+export function retryDelayOf(body) {
+  const details = (body && body.error && Array.isArray(body.error.details)) ? body.error.details : [];
+  const ri = details.filter((d) => d && /RetryInfo/.test(String(d['@type'] || '')))[0];
+  const s = ri && /^(\d+(?:\.\d+)?)s$/.exec(String(ri.retryDelay || ''));
+  return s ? Math.max(1, Math.ceil(Number(s[1]))) : null;
+}
 
 /* ---- the answer language ------------------------------------------------ */
 export function langLine(lang, what) {
@@ -563,13 +595,14 @@ export function _setDeadline(ms) { deadlineMs = ms; }
 let hedgeMs = 15000;
 export function _setHedge(ms) { hedgeMs = ms; }
 const recentCalls = [];
+let lastContext = null;
 export function aiRecent() { return recentCalls.slice(); }
 function noteCall(rec) {
   recentCalls.push(rec);
   while (recentCalls.length > 25) recentCalls.shift();
   if (process.env.RENDER) {
     try { console.log('ai ' + rec.kind + ' ' + rec.model + ' ' + rec.outcome + (rec.status ? ' ' + rec.status : '') + ' ' + rec.ms + ' ms' +
-      (rec.inTok ? ' in=' + rec.inTok : '') + (rec.outTok ? ' out=' + rec.outTok : '') + (rec.thinkTok ? ' think=' + rec.thinkTok : '') + (rec.code ? ' ' + rec.code : '')); } catch (e) { /* no log */ }
+      (rec.inTok ? ' in=' + rec.inTok : '') + (rec.outTok ? ' out=' + rec.outTok : '') + (rec.thinkTok ? ' think=' + rec.thinkTok : '') + (rec.cacheTok ? ' cached=' + rec.cacheTok : '') + (rec.code ? ' ' + rec.code : '')); } catch (e) { /* no log */ }
   }
 }
 function errCode(e) {
@@ -599,7 +632,7 @@ export function payloadFor(base, name) {
   return JSON.stringify(Object.assign({}, base, { generationConfig: g }));
 }
 /** One model, asked once (twice when it refuses the thinking setting). → {ok:true, json, name} or {ok:false, why, status, r, name, named} */
-async function tryModel(name, base, fetchImpl, ms, kind, cancel) {
+async function tryModel(name, base, fetchImpl, ms, kind, cancel, plain) {
   const t0 = Date.now();
   let r = null;
   for (let pass = 0; pass < 2; pass++) {
@@ -619,18 +652,28 @@ async function tryModel(name, base, fetchImpl, ms, kind, cancel) {
     if (use.promptTokenCount) rec.inTok = use.promptTokenCount;
     if (use.candidatesTokenCount) rec.outTok = use.candidatesTokenCount;
     if (use.thoughtsTokenCount) rec.thinkTok = use.thoughtsTokenCount;
+    /* 2.2.0 — what Google read from its cache (the steady beginning of the question): a tenth of the price */
+    if (use.cachedContentTokenCount) rec.cacheTok = use.cachedContentTokenCount;
     const msg = String((r.body && r.body.error && r.body.error.message) || '');
     /* a model that does not take the thinking setting: asked again without it, and remembered */
     if (r.status === 400 && /think/i.test(msg) && thinkingFor(name) && pass === 0) { rec.outcome = 'no-thinking'; noteCall(rec); noThinking.add(name); continue; }
     if (!r.ok) {
       /* only a 404 or "no longer available" retires a model — a 400 about a file type is not its fault */
       const gone = r.status === 404 || /no longer available|deprecated/i.test(msg);
-      rec.outcome = gone ? 'retired' : r.status === 429 ? 'busy' : 'http';
+      rec.outcome = gone ? 'retired' : r.status === 429 ? (isDailyQuota(r.body) ? 'daily' : 'busy') : 'http';
       rec.code = scrub(msg).slice(0, 80);
       noteCall(rec);
+      /* 2.2.0 — "Request contains an invalid argument." names nothing; asked again on the same model,
+         plainer each time (as the weight calculator's 4.72.1): without the thinking setting, then
+         without the earlier conversation. The CONTEXT and the question always stay. */
+      if (r.status === 400 && !plain && /request contains an invalid argument/i.test(msg)) {
+        try { console.log('[ai] 400 shape ' + JSON.stringify(shapeOf(base))); } catch (e) { /* no log */ }
+        const p = await plainer(name, base, fetchImpl, Math.max(1000, ms - (Date.now() - t0)), kind, cancel);
+        if (p) return p;
+      }
       if (gone) blocked.add(name);
       const named = gone ? ((msg.match(/models\/(gemini-[\w.\-]+)/g) || []).map((x) => x.replace(/^models\//, '')).filter((n) => n !== name && !blocked.has(n))[0] || null) : null;
-      return { ok: false, why: rec.outcome, status: r.status, r: r, name: name, named: named };
+      return { ok: false, why: rec.outcome, status: r.status, r: r, name: name, named: named, retryAfter: retryDelayOf(r.body) };
     }
     const json = readJsonAnswer(r.body);
     const refused = (r.body && r.body.promptFeedback && r.body.promptFeedback.blockReason) ||
@@ -643,6 +686,33 @@ async function tryModel(name, base, fetchImpl, ms, kind, cancel) {
     return { ok: true, json: json, name: name };
   }
   return { ok: false, why: 'http', status: r ? r.status : 0, r: r, name: name };
+}
+/** 2.2.0 — the same question, plainer: without thinking, then without the earlier conversation */
+async function plainer(name, base, fetchImpl, ms, kind, cancel) {
+  const t0 = Date.now();
+  const steps = [];
+  if (thinkingFor(name)) steps.push('thinking');
+  if ((base.contents || []).length > 3) steps.push('conversation');
+  let b = base, setThinking = false;
+  for (const s of steps) {
+    if (s === 'thinking') { noThinking.add(name); setThinking = true; }
+    if (s === 'conversation') b = Object.assign({}, b, { contents: shortTalk(b.contents) });
+    const res = await tryModel(name, b, fetchImpl, Math.max(1000, ms - (Date.now() - t0)), kind + '/plain-' + s, cancel, true);
+    if (res.ok) return res;
+    if (res.status !== 400) break;
+  }
+  if (setThinking) noThinking.delete(name);
+  return null;
+}
+/** the CONTEXT turn, its "Ready." and the last question */
+export function shortTalk(contents) {
+  const c = contents || [];
+  return c.length > 3 ? [c[0], c[1], c[c.length - 1]] : c;
+}
+/** what a refused question looked like — part sizes and roles, never a word of it */
+export function shapeOf(base) {
+  return (base.contents || []).map((c) => ({ role: c.role, parts: (c.parts || []).map((p) => p.text != null ? 't' + String(p.text).length + (String(p.text).trim() ? '' : '-empty')
+    : p.inlineData ? 'd:' + String(p.inlineData.mimeType || '') + ':' + String(p.inlineData.data || '').length : '?') }));
 }
 /** Every model a question may go to, in order: the usual one, the other Flash-Lites (newest first), then the
     Flashes (newest first). 4.67.17 — measured live 22:05: every model said 503 "high demand" except
@@ -721,7 +791,8 @@ function race(first, payload, fetchImpl, kind, deadline, skip) {
         if (res.ok) { finish(res); return; }
         /* what is said when nothing answers: the usual model's failure, unless it was only retired */
         if (!last || (name === first && res.why !== 'retired') || last.why === 'retired') last = res;
-        if (!running) { if (handsOver(res)) again(res.named); else finish(last); }
+        if (res.why === 'daily') { if (name === first) { last = res; finish(res); return; } resting.set(name, googleDayTurns()); }
+        if (!running) { if (handsOver(res) || res.why === 'daily') again(res.named); else finish(last); }
       });
     };
     /* slow, not failed: the next model is asked beside it */
@@ -739,6 +810,7 @@ async function ask(device, system, prompt, fetchImpl, opts) {
   const t0 = Date.now();
   const done = (out, what) => { console.log('ai ' + what + ' ' + (Date.now() - t0) + ' ms' + (out && out.model ? ' ' + out.model : '')); return out; };
   if (!aiConfigured()) return { fail: { httpStatus: 503, body: { error: 'AI_OFF', message: 'Nexora AI is not switched on at the service yet.' } } };
+  if (googleDayUntil > Date.now()) return { fail: { httpStatus: 429, body: { error: 'AI_GOOGLE_DAILY', message: GOOGLE_DAILY_MESSAGE, retryAfter: Math.ceil((googleDayUntil - Date.now()) / 1000) } } };
   const t = take(device);
   if (t.busy) return { fail: { httpStatus: 429, body: { error: 'AI_BUSY', retryAfter: t.busy, message: 'Nexora AI is busy — try again in ' + t.busy + ' seconds.' } } };
   if (t.spent) return { fail: { httpStatus: 429, body: { error: 'AI_DAILY', message: 'This computer has used today’s ' + daily() + ' Nexora AI questions. They come back tomorrow.' } } };
@@ -753,7 +825,8 @@ async function ask(device, system, prompt, fetchImpl, opts) {
     const rs = await tryModel(strong, base, fetchImpl, Math.min(STRONG_MS, deadline - Date.now() - 20000), kind + '/strong');
     if (rs.ok) return done({ json: rs.json, model: strong, left: t.left }, 'ok');
     /* busy, out of allowance or out of time: it rests, so the next question does not wait on it again */
-    if (rs.why !== 'http' || rs.status >= 500) resting.set(strong, Date.now() + 15 * 60 * 1000);
+    if (rs.why === 'daily') resting.set(strong, googleDayTurns());
+    else if (rs.why !== 'http' || rs.status >= 500) resting.set(strong, Date.now() + 15 * 60 * 1000);
   }
   const res = await race(name, base, fetchImpl, kind, deadline, strong ? [strong] : []);
   if (res.ok) {
@@ -767,7 +840,11 @@ async function ask(device, system, prompt, fetchImpl, opts) {
   if (res.why === 'network') return fail(502, 'AI_UNREACHABLE', 'Nexora AI could not reach Google just now. Try again in a moment.');
   if (res.why === 'http' && res.status >= 500) return fail(503, 'AI_OVERLOADED', 'Google’s AI is overloaded just now (it says “high demand”) — Nexora AI asked it several times. Try again in a minute.', { retryAfter: 60 });
   if (res.why === 'unreadable') return fail(502, 'AI_UNREADABLE', res.finish === 'MAX_TOKENS' ? 'Nexora AI’s answer ran too long and was cut off. Ask a narrower question.' : 'Nexora AI answered in a form Nexora could not read. Try again.');
-  if (res.why === 'busy') return fail(429, 'AI_BUSY', 'Nexora AI is busy (Google’s limit) — try again in a minute.', { retryAfter: 60 });
+  if (res.why === 'daily') { googleDayUntil = googleDayTurns(); return fail(429, 'AI_GOOGLE_DAILY', GOOGLE_DAILY_MESSAGE, { retryAfter: Math.ceil((googleDayUntil - Date.now()) / 1000) }); }
+  if (res.why === 'busy') return fail(429, 'AI_BUSY', 'Nexora AI is busy (Google’s limit) — try again in a minute.', { retryAfter: res.retryAfter || 60 });
+  if (res.why === 'http' && res.status === 400 && /request contains an invalid argument/i.test(String(res.r && res.r.body && res.r.body.error && res.r.body.error.message))) {
+    return fail(502, 'AI_FAILED', 'Nexora AI could not get this question through to Google. Ask it in other words \u2014 or press Clear and ask again.');
+  }
   return fail(502, 'AI_FAILED', 'Nexora AI could not answer (' + res.status + '): ' + scrub(res.r && res.r.body && res.r.body.error && res.r.body.error.message));
 }
 
@@ -880,8 +957,14 @@ export async function assist(device, payload, lang, fetchImpl) {
   if (m.error) return m.error;
   if (!p.text && !m.parts.length) return { httpStatus: 400, body: { error: 'NOTHING', message: 'Say or type something first.' } };
   if (m.audio && noteAudio(m, 'assist') && !p.text) return nothingHeard('silent', lang);
-  const ctx = { SCREEN: p.screen, ROLE: p.role, ALLOWED: p.allowed, RULES: p.rules, SCREEN_TEXT: p.screenText, ATTENTION: p.attention, TODAY: p.today, VOICE: !!(payload && payload.voice), NOW: p.now, PARTIES: p.parties, ITEMS: p.items, GROUPS: p.groups, WAREHOUSES: p.warehouses,
-    PROCESSES: p.processes, ROUTES: p.routes, PLANS: p.plans, ORDERS: p.orders, STOCK: p.stock, PENDING: p.pending, HELP_TOPICS: p.topics };
+  /* 2.2.0 — the steady parts first, the screen last (as the weight calculator's 4.67.18): Google charges a
+     tenth for the beginning of a question it saw a few minutes before. Nothing is left out. */
+  const ctx = { HELP_TOPICS: p.topics, GROUPS: p.groups, WAREHOUSES: p.warehouses, PROCESSES: p.processes, ROUTES: p.routes,
+    PARTIES: p.parties, ITEMS: p.items, ROLE: p.role, ALLOWED: p.allowed, RULES: p.rules,
+    PLANS: p.plans, ORDERS: p.orders, STOCK: p.stock, PENDING: p.pending, ATTENTION: p.attention,
+    TODAY: p.today, SCREEN: p.screen, SCREEN_TEXT: p.screenText, NOW: p.now, VOICE: !!(payload && payload.voice) };
+  lastContext = { at: new Date().toISOString(), chars: JSON.stringify(ctx).length,
+    parts: Object.keys(ctx).reduce((o, k) => { o[k] = JSON.stringify(ctx[k] == null ? null : ctx[k]).length; return o; }, {}) };
   const contents = [{ role: 'user', parts: [{ text: 'CONTEXT:\n' + JSON.stringify(ctx) }] },
     { role: 'model', parts: [{ text: '{"transcript":"","lang":"en","answer":"Ready.","steps":[]}' }] }];
   p.history.forEach((h) => contents.push({ role: h.role, parts: [{ text: h.text }] }));

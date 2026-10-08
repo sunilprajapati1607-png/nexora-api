@@ -479,4 +479,71 @@ await t('a body of null is not a crash', async () => {
   await resolveModel(true, fakeGoogle({}));
 });
 
+/* ---- 2.2.0 — as the weight calculator's 4.67.18, 4.72.0 and 4.72.1 ---------------------------- */
+function scripted(steps) {
+  /* each generateContent call takes the next answer: {status, body} */
+  let i = 0;
+  const base = fakeGoogle({ lang: 'en', answer: 'unused', steps: [] });
+  return async (url, init) => {
+    if (/\/models\?/.test(String(url))) return base(url, init);
+    sent.push({ url: String(url), body: init && init.body ? String(init.body) : '' });
+    const s = steps[Math.min(i++, steps.length - 1)];
+    return new Response(JSON.stringify(s.body), { status: s.status });
+  };
+}
+const OK_ANSWER = { status: 200, body: { candidates: [{ content: { parts: [{ text: JSON.stringify({ lang: 'en', answer: 'Fine.', steps: [] }) }] } }] } };
+const DAY_USED = { status: 429, body: { error: { code: 429, message: 'You exceeded your current quota.', details: [
+  { '@type': 'type.googleapis.com/google.rpc.QuotaFailure', violations: [{ quotaId: 'GenerateRequestsPerDayPerProjectPerModel-FreeTier' }] }] } } };
+const NAMES_NOTHING = { status: 400, body: { error: { code: 400, message: 'Request contains an invalid argument.', status: 'INVALID_ARGUMENT' } } };
+
+await t('Google’s free day used up: the question stops at once, and the next is answered without asking Google', async () => {
+  _resetLimits(); sent.length = 0;
+  process.env.GEMINI_MODEL_STRONG = 'off';
+  const g = scripted([DAY_USED, OK_ANSWER]);
+  const a = await call('POST', '/v1/ai/assist', { device: 'dev-day00001', assist: { text: 'how much stock?' } }, g);
+  assert.equal(a.status, 429); assert.equal(a.json.error, 'AI_GOOGLE_DAILY');
+  assert.ok(/free Nexora AI allowance for today is used up/.test(a.json.message), a.json.message);
+  assert.ok(a.json.retryAfter > 0);
+  const asked = sent.filter((s) => /generateContent/.test(s.url)).length;
+  assert.equal(asked, 1, 'one call only, not ten');
+  const b = await call('POST', '/v1/ai/assist', { device: 'dev-day00001', assist: { text: 'and now?' } }, g);
+  assert.equal(b.json.error, 'AI_GOOGLE_DAILY');
+  assert.equal(sent.filter((s) => /generateContent/.test(s.url)).length, asked, 'Google was not asked again');
+  const h = await call('GET', '/health');
+  assert.ok(h.json.ai.googleDailyUntil);
+  _resetLimits(); delete process.env.GEMINI_MODEL_STRONG;
+});
+
+await t('"Request contains an invalid argument": asked again on the same model, plainer, and answered', async () => {
+  _resetLimits(); sent.length = 0; _noThinking().clear();
+  process.env.GEMINI_MODEL_STRONG = 'off';
+  const history = [{ role: 'user', text: 'first' }, { role: 'model', text: '{"answer":"one"}' }, { role: 'user', text: 'second' }, { role: 'model', text: '{"answer":"two"}' }];
+  const g = scripted([NAMES_NOTHING, NAMES_NOTHING, OK_ANSWER]);
+  const r = await call('POST', '/v1/ai/assist', { device: 'dev-plain0001', assist: { text: 'third', history } }, g);
+  assert.equal(r.status, 200, JSON.stringify(r.json)); assert.equal(r.json.answer, 'Fine.');
+  const calls = sent.filter((s) => /generateContent/.test(s.url));
+  assert.equal(calls.length, 3);
+  assert.ok(/thinkingConfig/.test(calls[0].body) && !/thinkingConfig/.test(calls[1].body), 'the second ask has no thinking setting');
+  const last = JSON.parse(calls[2].body);
+  assert.equal(last.contents.length, 3, 'the third ask: CONTEXT, Ready. and the question only');
+  assert.ok(/CONTEXT/.test(last.contents[0].parts[0].text) && /third/.test(JSON.stringify(last.contents[2])));
+  /* as the weight calculator: what was set aside stays aside for that model until the service restarts */
+  _noThinking().clear();
+  _resetLimits(); delete process.env.GEMINI_MODEL_STRONG;
+});
+
+await t('the CONTEXT: the steady parts first, the screen last; /health shows each part’s size', async () => {
+  _resetLimits(); sent.length = 0;
+  process.env.GEMINI_MODEL_STRONG = 'off';
+  await call('POST', '/v1/ai/assist', { device: 'dev-ctx00001', assist: PAYLOAD }, fakeGoogle({ lang: 'en', answer: 'ok', steps: [] }));
+  const body = JSON.parse(sent.filter((s) => /generateContent/.test(s.url)).pop().body);
+  const ctxText = body.contents[0].parts[0].text.replace(/^CONTEXT:\n/, '');
+  const keys = Object.keys(JSON.parse(ctxText));
+  assert.ok(keys.indexOf('HELP_TOPICS') < keys.indexOf('PLANS') && keys.indexOf('PARTIES') < keys.indexOf('SCREEN'), keys.join(','));
+  assert.equal(keys[keys.length - 1], 'VOICE');
+  const h = await call('GET', '/health');
+  assert.ok(h.json.ai.lastContext && h.json.ai.lastContext.parts.PARTIES > 0);
+  _resetLimits(); delete process.env.GEMINI_MODEL_STRONG;
+});
+
 console.log(pass + ' passed');
