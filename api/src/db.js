@@ -14,7 +14,7 @@
  */
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createClient } from './pgmini.js';
-import { parsePlanFeatures } from './plans.js';
+import { parsePlanFeatures, parsePlans, matrixOf } from './plans.js';
 
 /* 2026-10-01 — up to 4 connections (PG_POOL to change it; 1 = the old single one) */
 export const pool = createClient(process.env.DATABASE_URL, process.env.PG_POOL || 4);
@@ -578,10 +578,37 @@ export function ensureSchema() {
         linked_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
         PRIMARY KEY (product, remote_id)
       )`);
+    /* 2026-10-08 (console) — the owner's changes for this one company over its plan (plans.js featuresFor):
+       { featureId: true | false }; a feature not named follows the plan */
+    await q(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS feature_overrides JSONB`);
+    /* 2026-10-08 (console) — the owner's ledger: what each customer paid, for which software and plan, and the
+       validity it bought (payments.js). Kept when a company is erased: money received stays on the books. */
+    await q(`
+      CREATE TABLE IF NOT EXISTS customer_payments (
+        id            BIGSERIAL PRIMARY KEY,
+        software      TEXT NOT NULL,
+        company_id    BIGINT,
+        fabric_id     TEXT,
+        customer_name TEXT NOT NULL,
+        plan          TEXT,
+        plan_name     TEXT,
+        kind          TEXT NOT NULL DEFAULT 'RENEWAL',
+        amount        NUMERIC(14,2) NOT NULL,
+        paid_on       DATE NOT NULL,
+        mode          TEXT,
+        reference     TEXT,
+        valid_from    DATE,
+        valid_to      DATE,
+        note          TEXT,
+        via           TEXT,
+        created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+        deleted_at    TIMESTAMPTZ
+      )`);
+    await q(`CREATE INDEX IF NOT EXISTS customer_payments_company ON customer_payments (company_id)`);
     /* 4.72.0 — ink_model_history (inkstore.js, made with the ink tables) has row level security like
        sync_history; on a database where it does not exist yet it is skipped and done on a later start */
     /* 4.73.0 — and the recycle bin and the backup passwords */
-    for (const t of ['chat_messages', 'feedback', 'inquiries', 'app_releases', 'ai_usage', 'sync_history', 'ink_model_history', 'recycle_bin', 'backup_secrets', 'product_links']) {
+    for (const t of ['chat_messages', 'feedback', 'inquiries', 'app_releases', 'ai_usage', 'sync_history', 'ink_model_history', 'recycle_bin', 'backup_secrets', 'product_links', 'customer_payments']) {
       try {
         await q(`DO $rls$ BEGIN
                    IF EXISTS (SELECT 1 FROM pg_tables WHERE schemaname = current_schema() AND tablename = '${t}' AND tableowner = current_user)
@@ -635,6 +662,7 @@ export async function getSettings() {
   }
   const s = {};
   rows.forEach((r) => { s[r.key] = r.value; });
+  const plans = parsePlans(s.plans_weight, parsePlanFeatures(s.plan_features));
   return {
     trialDays: Math.max(1, parseInt(s.trial_days, 10) || 7),
     expiredMode: s.expired_mode === 'HARDSTOP' ? 'HARDSTOP' : 'READONLY',
@@ -651,7 +679,10 @@ export async function getSettings() {
        usable for — caching, not grace. The app re-checks well inside it. */
     sessionMinutes: Math.min(720, Math.max(5, parseInt(s.session_minutes, 10) || 30)),
     /* 4.48.0 — which features each plan carries; the console edits it. */
-    planFeatures: parsePlanFeatures(s.plan_features)
+    /* 2026-10-08 — every plan the owner has made (plans.js parsePlans): the matrix for each, and the plans with
+       their prices. Standard and Pro read from the older plan_features until the owner saves plans. */
+    planFeatures: matrixOf(plans),
+    plans
   };
 }
 

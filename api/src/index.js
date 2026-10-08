@@ -35,6 +35,8 @@ import { latestRelease, listReleases, releaseAction } from './appupdate.js';
 import { logoResponse } from './brand.js';
 import { customerCheck, sourcesOf } from './marketing.js';
 import { listProducts, fabricAction, consoleLinks } from './products.js';
+import { listPlans, planAction } from './softwareplans.js';
+import { listPayments, paymentAction } from './payments.js';
 
 /* exported for server.js, whose early answers (a body over its limit) carry the same headers */
 export const CORS = {
@@ -904,6 +906,12 @@ export default {
              tya thij update chalu bandh thase"): each keeps its own service and licence, products.js asks it */
           if (path === '/admin/api/products' && method === 'GET') return adminJson(await listProducts());
           if (path === '/admin/api/fabric' && method === 'POST') { const out = await fabricAction(await readBody()); return adminJson(out.body, out.httpStatus); }
+          /* 2026-10-08 — every software's plans, made by the owner (softwareplans.js) */
+          if (path === '/admin/api/plans' && method === 'GET') return adminJson(await listPlans());
+          if (path === '/admin/api/plans' && method === 'POST') { const out = await planAction(await readBody()); return adminJson(out.body, out.httpStatus); }
+          /* 2026-10-08 — what each customer paid, and the validity it bought (payments.js) */
+          if (path === '/admin/api/payments' && method === 'GET') return adminJson(await listPayments(Object.fromEntries(url.searchParams)));
+          if (path === '/admin/api/payments' && method === 'POST') { const out = await paymentAction(Object.assign(await readBody(), { via: consoleCaller(request, ip).app })); return adminJson(out.body, out.httpStatus); }
           /* 4.72.0 (audit 39) — ?admin=1: only what was done from the console (the Activity list); ?limit= up to 500 */
           if (path === '/admin/api/events' && method === 'GET') {
             const adminOnly = /^(1|true|yes)$/i.test(url.searchParams.get('admin') || '');

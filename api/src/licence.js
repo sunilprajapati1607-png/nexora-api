@@ -24,6 +24,12 @@
 import { createHmac, createHash, timingSafeEqual, randomInt, hkdfSync } from 'node:crypto';
 import { q, getSettings, logEvent } from './db.js';
 import { cleanPlan, featuresFor } from './plans.js';
+/* 2026-10-08 — a plan's name as the owner gave it (STANDARD → Standard, GOLD_PLUS → its own name) */
+function planNameOf(plan, settings) {
+  const code = cleanPlan(plan, settings);
+  const p = settings && Array.isArray(settings.plans) ? settings.plans.find((x) => x.code === code) : null;
+  return p ? p.name : (code === 'STANDARD' ? 'Standard' : 'Pro');
+}
 
 const SECRET = process.env.NEXORA_TOKEN_SECRET || '';
 const TOKEN_TTL_SEC = 24 * 60 * 60;
@@ -443,8 +449,11 @@ function describeState(row, company, settings) {
     /* 4.48.0 — the plan, and the features it resolves to. A demo is
        always PRO with everything on. Seats are set per company by Nexora
        and have nothing to do with the plan (4.48.1). */
-    plan: co.is_demo === true ? 'PRO' : cleanPlan(co.plan),
-    features: featuresFor(co.plan, settings, co.is_demo === true)
+    plan: co.is_demo === true ? 'PRO' : cleanPlan(co.plan, settings),
+    /* 2026-10-08 — the plans are the owner's to make: its name as the console shows it */
+    planName: co.is_demo === true ? 'Demo' : planNameOf(co.plan, settings),
+    /* and the owner's changes for this one company ("+ added" / "− off") over its plan */
+    features: featuresFor(co.plan, settings, co.is_demo === true, co.feature_overrides)
   } : null;
 
   /* 4.57.0 — WHEN IT STARTED, not only when it ends.
@@ -816,10 +825,10 @@ export async function activate({ deviceId, deviceName, company, email, appVersio
       return { httpStatus: 400, body: { error: 'MOBILE_NEEDS_COMPANY',
         message: 'Enter your company\u2019s licence key, or its company id and passcode \u2014 ask your Nexora administrator.' } };
     }
-    const feats = featuresFor(keyed.plan, settings, keyed.is_demo === true);
+    const feats = featuresFor(keyed.plan, settings, keyed.is_demo === true, keyed.feature_overrides);
     if (!feats.mobile) {
       return { httpStatus: 403, body: { error: 'MOBILE_NOT_IN_PLAN',
-        message: 'Nexora Mobile is part of the PRO plan. Ask Nexora to move ' + keyed.name + ' to PRO.' } };
+        message: 'Nexora Mobile is not part of ' + keyed.name + '’s plan (' + planNameOf(keyed.plan, settings) + '). Ask Nexora to add it.' } };
     }
   }
 

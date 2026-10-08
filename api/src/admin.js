@@ -14,7 +14,7 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { endSessionOn, wakeCompany } from './waiters.js';
 import { q, getSettings, forgetSettings, logEvent } from './db.js';
-import { cleanPlan, cleanPlanFeatures, PLAN_FEATURES } from './plans.js';
+import { cleanPlan, cleanPlanFeatures, cleanOverrides, PLAN_FEATURES } from './plans.js';
 import { hashPasscode, validPasscode, PASSCODE_MIN } from './passcode.js';
 import { newLicenceKey, maskKey, keylessRefused, forgetCompanies, DELETED_KEEP_DAYS, istDate, purgeDayOf } from './licence.js';
 import { aiUsedTodayAll, aiDefaultDaily } from './ai.js';
@@ -230,6 +230,7 @@ export async function listCompanies() {
   const rows = await q(`
     SELECT c.id, c.name, c.licence_key, c.email, c.phone, c.state, c.seats, c.gstin,
            c.grace_days, c.is_demo, c.expires_at, c.created_at, c.notes, c.txn_limit, c.plan, c.ai_daily_limit,
+           c.feature_overrides,
            /* 4.57.0 - when THIS stretch began, and how long it is. Both
               in SQL, in IST like days_left, so the console and the
               Android app cannot disagree with each other by a day. */
@@ -288,6 +289,14 @@ export async function listCompanies() {
    (companyAction 'create' and 'licence', and licenceAction 'licence', which licenses the machine's company) */
 export const LICENSED_GRACE_DAYS = 3;
 
+/* 2026-10-08 — a plan the owner made that is not retired, by its code; null if there is none */
+async function livePlan(v) {
+  const s = await getSettings();
+  const code = String(v || '').toUpperCase().trim();
+  const p = (s.plans || []).find((x) => x.code === code);
+  return p && p.active !== false ? p.code : null;
+}
+
 export async function companyAction(body) {
   const action = String(body.action || '');
   const days = Math.max(1, Math.min(3650, parseInt(body.days, 10) || 365));
@@ -296,8 +305,9 @@ export async function companyAction(body) {
   if (action === 'create') {
     const name = String(body.name || '').trim();
     if (!name) return { error: 'A company name is required.' };
-    /* 4.48.0 — the plan. Seats are the owner's to set on either plan (4.48.1). */
-    const plan = cleanPlan(body.plan);
+    /* 4.48.0 — the plan. Seats are the owner's to set on either plan (4.48.1). 2026-10-08 — any plan the
+       owner made and has not retired; anything else is Pro, as always. */
+    const plan = await livePlan(body.plan) || 'PRO';
     const seats = Math.max(1, Math.min(500, parseInt(body.seats, 10) || 1));
     /* 4.71.0 (C6, owner 2026-10-01) — a licensed customer may work three days without the line (a demo or a
        plant that registered itself stays at none). A company made here IS licensed, so none becomes three;
@@ -385,9 +395,30 @@ export async function companyAction(body) {
   } else if (action === 'plan') {
     /* 4.48.0 — STANDARD or PRO. Seats are untouched: they are the owner's
        to set on either plan (4.48.1). */
-    const plan = cleanPlan(body.plan);
+    const plan = await livePlan(body.plan);
+    if (!plan) return { error: 'There is no plan ' + String(body.plan || '') + ', or it has been retired. Choose one under Software & plans.' };
     await q(`UPDATE companies SET plan = $2 WHERE id = $1`, [id, plan]);
     await logEvent(null, 'ADMIN_COMPANY_PLAN', { id, plan });
+  } else if (action === 'features') {
+    /* 2026-10-08 (owner: per customer "+ added / − off": "ha") — this company's own changes over its plan:
+       { featureId: true (added) | false (off) | null (back to the plan) }. Its machines hear it at their next
+       check, like a plan change; a demo keeps everything regardless. */
+    const co = (await q(`SELECT feature_overrides FROM companies WHERE id = $1`, [id]))[0];
+    if (!co) return { error: 'No such company.' };
+    const was = cleanOverrides(co.feature_overrides);
+    const now = Object.assign({}, was);
+    const asked = body.overrides && typeof body.overrides === 'object' ? body.overrides : {};
+    if (body.reset === true) Object.keys(now).forEach((k) => { delete now[k]; });
+    PLAN_FEATURES.forEach((f) => {
+      if (!(f.id in asked)) return;
+      if (asked[f.id] === true || asked[f.id] === false) now[f.id] = asked[f.id];
+      else delete now[f.id];
+    });
+    const changed = PLAN_FEATURES.filter((f) => was[f.id] !== now[f.id]).map((f) => f.id + ': ' +
+      (was[f.id] === undefined ? 'plan' : was[f.id] ? 'added' : 'off') + ' → ' + (now[f.id] === undefined ? 'plan' : now[f.id] ? 'added' : 'off'));
+    await q(`UPDATE companies SET feature_overrides = $2 WHERE id = $1`, [id, Object.keys(now).length ? JSON.stringify(now) : null]);
+    if (changed.length) await logEvent(null, 'ADMIN_COMPANY_FEATURES', { id, changed });
+    return { ok: true, overrides: now };
   } else if (action === 'grace') {
     const grace = Math.max(0, Math.min(365, parseInt(body.graceDays, 10) || 0));
     await q(`UPDATE companies SET grace_days = $2 WHERE id = $1`, [id, grace]);
@@ -907,9 +938,15 @@ export async function saveSettings(body) {
   if (body.demoGraceDays !== undefined) pairs.push(['demo_grace_days', String(Math.max(0, Math.min(365, parseInt(body.demoGraceDays, 10) || 0)))]);
   if (body.sessionMinutes !== undefined) pairs.push(['session_minutes', String(Math.min(720, Math.max(5, parseInt(body.sessionMinutes, 10) || 30)))]);
   /* 4.48.0 — which features each plan carries. */
-  if (body.planFeatures !== undefined) pairs.push(['plan_features', JSON.stringify(cleanPlanFeatures(body.planFeatures))]);
   /* 4.72.0 (audit 39) — what the settings were, so the log can say what changed */
   const before = await getSettings();
+  if (body.planFeatures !== undefined) {
+    const m = cleanPlanFeatures(body.planFeatures);
+    pairs.push(['plan_features', JSON.stringify(m)]);
+    /* 2026-10-08 — and Standard and Pro among the owner's plans say the same (the phone console 1.9.0 and
+       older still save this matrix) */
+    pairs.push(['plans_weight', JSON.stringify((before.plans || []).map((p) => (m[p.code] ? Object.assign({}, p, { features: m[p.code] }) : p)))]);
+  }
   for (const [k, v] of pairs) {
     await q(`INSERT INTO settings (key, value) VALUES ($1,$2)
              ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`, [k, v]);
@@ -1299,6 +1336,139 @@ button.primary{background:linear-gradient(120deg,#0A66E0,#1EA0FF);border-color:t
 .fact b{display:block;margin-top:2px}
 #app>.top h1 .sub{text-transform:capitalize}
 #app>.top h1{white-space:nowrap}
+/* ==== 2026-10-08 — THE CONSOLE AS SOFTWARE ====================================================
+   Owner: "console ne software jevu banavanu che row type details click and open window". The
+   application's own frame: a menu bar, the modules down the left, a title and a hint, a toolbar of
+   coloured buttons, a filter card with Quick buttons, figure cards, one table of rows — and a click on
+   a row opens that record in a window of its own (Display first; Edit, Ctrl+W, to change it). */
+body{margin:0}
+#app{position:fixed;inset:0;display:flex;flex-direction:column;background:var(--bg)}
+.pcontent>.sec{display:none}.pcontent>.sec.on{display:block}
+.menubar{flex:0 0 34px;display:flex;align-items:center;gap:20px;padding:0 14px;background:var(--surface);border-bottom:1px solid var(--border);font-size:14px;position:relative;z-index:3}
+.menubar .mt{position:absolute;left:0;right:0;text-align:center;font-weight:700;pointer-events:none}
+.menubar .mi{cursor:pointer;color:var(--text)}
+.menubar .mi:hover{color:var(--accent)}
+.ak{color:var(--accent);font-weight:800}
+.menubar .mode-switch{margin-left:auto}
+.shell{flex:1;display:flex;min-height:0}
+.side{flex:0 0 236px;background:var(--surface);border-right:1px solid var(--border);display:flex;flex-direction:column;padding:12px 10px;overflow-y:auto}
+.side .sbrand{display:flex;align-items:center;gap:10px;padding:2px 8px 12px}
+.side .sbrand img{width:36px;height:36px}
+.side .sbrand b{display:block;font-size:15.5px;letter-spacing:.03em}.side .sbrand small{display:block;color:var(--muted);font-size:11.5px;line-height:1.3}
+#jump.snav{display:flex;flex-direction:column;gap:2px;margin:0;padding:0;background:none;border:0;position:static;box-shadow:none}
+#jump.snav .tab{display:flex;align-items:center;gap:11px;width:100%;text-align:left;border:1px solid transparent;border-radius:12px;padding:8px 10px;background:none;color:var(--text);font-weight:650;font-size:13.5px;box-shadow:none;cursor:pointer}
+#jump.snav .tab:hover{background:var(--surface-hover)}
+#jump.snav .tab.active{background:var(--k-orange-bg);border-color:color-mix(in srgb,var(--k-orange) 30%,transparent);color:var(--text);box-shadow:none}
+#jump.snav .tab .ic{flex:0 0 28px;height:28px;border-radius:9px;display:grid;place-items:center;color:#fff;font-size:13px;font-weight:800}
+#jump.snav .tab.sub{padding-left:22px;font-weight:600}#jump.snav .tab.sub .ic{flex-basis:24px;height:24px;border-radius:8px;font-size:11px}
+#jump.snav .tab b{margin-left:auto;font-size:11.5px;background:var(--bg-sunken);color:var(--muted);border-radius:999px;padding:1px 8px}
+#jump.snav .tab b.zero{opacity:.55}
+#jump.snav .sgap{height:8px}
+.side .sfoot{margin-top:auto;border-top:1px solid var(--border);padding-top:8px}
+.side .sclock{padding:8px 10px 2px}.side .sclock small{display:block;color:var(--muted);font-size:11.5px}.side .sclock b{font-size:15px}
+.side .sver{display:flex;justify-content:space-between;align-items:center;color:var(--muted);font-size:11px;padding:6px 10px}
+.side .sver span:last-child{background:var(--bg-sunken);padding:2px 9px;border-radius:999px;font-weight:700;color:var(--text)}
+.main{flex:1;display:flex;flex-direction:column;min-width:0}
+.phead{display:flex;align-items:center;gap:14px;padding:9px 20px;background:var(--surface);border-bottom:2px solid color-mix(in srgb,var(--accent) 30%,var(--border))}
+.phead .mn{width:28px;height:22px;border:1px solid var(--border);border-radius:6px;display:grid;place-items:center;font-size:12px;color:var(--muted)}
+.phead h1{margin:0;font-size:17px;line-height:1.2}.phead small{display:block;color:var(--muted);font-size:11.5px}
+.phead .hint{display:flex;gap:8px;align-items:center;border:1px solid color-mix(in srgb,var(--accent) 35%,var(--border));border-radius:999px;padding:4px 13px;font-size:12px;color:var(--muted);white-space:nowrap}
+.phead .hint i{font-style:normal;color:var(--accent);font-weight:800;font-size:10.5px;letter-spacing:.04em}.phead .hint b{color:var(--text)}
+.tbar{display:flex;align-items:flex-end;gap:2px;padding:7px 16px 5px;background:var(--bg-elevated);border-bottom:1px solid var(--border);flex-wrap:wrap;min-height:58px}
+.tbi{display:flex;flex-direction:column;align-items:center;gap:3px;min-width:56px;padding:2px 4px;font-size:10.5px;font-weight:650;color:var(--text);background:none;border:0;cursor:pointer;border-radius:8px;box-shadow:none}
+.tbi:hover{background:var(--surface-hover)}
+.tbi .sq{width:26px;height:26px;border-radius:8px;display:grid;place-items:center;color:#fff;font-size:13px;font-weight:800;box-shadow:0 2px 4px rgba(20,33,61,.15)}
+.tbi[disabled]{color:var(--faint);cursor:default}.tbi[disabled] .sq{background:var(--bg-sunken)!important;color:var(--faint);box-shadow:none}
+.tbi[disabled]:hover{background:none}
+.tsep{width:1px;height:34px;background:var(--border);margin:0 6px 3px}
+.pcontent{flex:1;overflow-y:auto;padding:16px 20px 30px}
+.pcontent>.card{margin-bottom:14px}
+.pcontent>.sec>.card,.pcontent .card{border-radius:16px}
+/* filter card, quick row, figures, record table — the Records window's */
+.fcard{display:flex;gap:14px;align-items:flex-end;flex-wrap:wrap}
+.fcard label{display:flex;flex-direction:column;gap:5px;font-size:12px;font-weight:700;color:var(--muted)}
+.fcard input,.fcard select{min-width:150px}
+.quick{display:flex;gap:7px;align-items:center;margin-top:10px;font-size:12px;color:var(--muted);flex-wrap:wrap}
+.qb{border:1px solid var(--border);border-radius:8px;padding:4px 10px;font-weight:650;color:var(--text);background:var(--surface);cursor:pointer;font-size:12.5px}
+.qb.on{border-color:var(--accent);color:var(--accent);background:var(--accentbg)}
+.qb i{font-style:normal;color:var(--muted);margin-left:4px;font-weight:600}
+.figs{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+.fig{border-radius:13px;border:1px solid var(--border);border-top:3px solid var(--accent);padding:10px 16px;background:var(--surface)}
+.fig span{font-weight:700;font-size:12.5px}.fig b{display:block;font-size:24px;margin-top:3px;line-height:1.15}.fig small{color:var(--muted);font-size:12px}
+.fig.f1{border-top-color:var(--k-blue)}.fig.f1 span{color:var(--k-blue)}
+.fig.f2{border-top-color:var(--k-green)}.fig.f2 span{color:var(--k-green)}
+.fig.f3{border-top-color:var(--k-amber)}.fig.f3 span{color:var(--k-amber)}
+.fig.f4{border-top-color:var(--k-violet)}.fig.f4 span{color:var(--k-violet)}
+.ctitle{display:flex;align-items:baseline;justify-content:space-between;gap:10px;margin-bottom:10px}
+.ctitle h3{margin:0;font-size:14px}
+table.rec{width:100%;border-collapse:collapse}
+table.rec th{font-size:12px;color:var(--muted);font-weight:700;text-align:left;padding:8px 10px;border-bottom:1px solid var(--border);white-space:nowrap;text-transform:none}
+table.rec td{padding:9px 10px;border-bottom:1px solid var(--bg-sunken);vertical-align:middle}
+table.rec tbody tr{cursor:pointer}
+table.rec tbody tr:hover td{background:var(--surface-hover)}
+table.rec tbody tr.on td{background:var(--accentbg)}
+table.rec td small{display:block;color:var(--muted);font-size:11.5px}
+table.rec .num{text-align:right;white-space:nowrap}
+table.rec tfoot td{font-weight:800;border-top:1px solid var(--border);border-bottom:0}
+.c-ok{color:var(--k-green);font-weight:700}.c-demo{color:var(--k-teal);font-weight:700}.c-warn{color:var(--k-amber);font-weight:700}.c-bad{color:var(--k-red);font-weight:700}.c-none{color:var(--faint)}
+.swd{display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:6px;vertical-align:1px}
+.swd.w{background:var(--k-blue)}.swd.f{background:var(--k-green)}.swd.j{background:var(--k-orange)}
+/* the toast every message comes in */
+#coMsg.toast{position:fixed;top:44px;left:50%;transform:translateX(-50%);z-index:60;min-width:320px;max-width:760px}
+#coMsg.toast:empty{display:none}
+#coMsg.toast .msg{box-shadow:var(--shadow-lg);margin:0}
+/* windows */
+#winLayer:empty{display:none}
+#winLayer{position:fixed;inset:34px 0 0 0;z-index:40;background:rgba(15,22,40,.36);display:flex;align-items:flex-start;justify-content:center;padding:22px 20px;overflow:auto}
+.win{width:min(1240px,100%);background:var(--bg);border:1px solid var(--border-strong);border-radius:14px;box-shadow:0 24px 60px rgba(10,20,45,.35);display:flex;flex-direction:column;min-height:min(820px,calc(100vh - 80px))}
+.win.small{width:min(900px,100%);min-height:0}
+.wtitle{display:flex;align-items:center;gap:12px;padding:10px 16px;background:var(--surface);border-bottom:2px solid color-mix(in srgb,var(--accent) 30%,var(--border));border-radius:14px 14px 0 0}
+.wtitle .av{width:32px;height:32px;border-radius:10px;display:grid;place-items:center;color:#fff;font-weight:800;font-size:13px;background:linear-gradient(135deg,#5b7cfa,#7c5cf6)}
+.wtitle h2{margin:0;font-size:16px}.wtitle small{display:block;color:var(--muted);font-size:11.5px}
+.mode{border-radius:999px;padding:2px 10px;font-size:11px;font-weight:800;background:var(--bg-sunken);color:var(--muted);margin-left:8px;vertical-align:2px}
+.mode.edit{background:var(--warnbg);color:var(--warn)}.mode.new{background:var(--accentbg);color:var(--accent)}
+.wx{margin-left:auto;display:flex;gap:4px}
+.wx button{width:32px;height:28px;border-radius:8px;border:0;background:none;color:var(--muted);font-size:16px;cursor:pointer;box-shadow:none;padding:0}
+.wx button:hover{background:var(--badbg);color:var(--bad)}
+.wbody{padding:14px 18px 18px;display:flex;flex-direction:column;gap:12px}
+.fgrid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+.fgrid.five{grid-template-columns:2fr 1.3fr 1.6fr 1.2fr 1fr}
+.fl{display:flex;flex-direction:column;gap:5px;min-width:0}
+.fl>span{font-size:12px;font-weight:700;color:var(--muted)}
+.ro{background:var(--bg-sunken);border:1px solid var(--border);border-radius:9px;padding:7px 11px;min-height:35px;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fl input,.fl select,.fl textarea{width:100%}
+.swtabs{display:flex;gap:10px}
+.swt{flex:1;display:flex;gap:11px;align-items:center;padding:10px 14px;border-radius:13px;border:1px solid var(--border);background:var(--surface);cursor:pointer;text-align:left;box-shadow:none;color:var(--text);font-weight:400}
+.swt .b{flex:0 0 34px;height:34px;border-radius:10px;display:grid;place-items:center;color:#fff;font-size:15px;font-weight:800}
+.swt b{display:block;font-size:14px}.swt small{color:var(--muted);font-size:12px}
+.swt.w .b{background:linear-gradient(135deg,#3366ff,#6a8cff)}.swt.f .b{background:linear-gradient(135deg,#10a37f,#2cc6b0)}.swt.j .b{background:linear-gradient(135deg,#f08a0c,#f7b538)}
+.swt.on.w{background:linear-gradient(120deg,#3366ff,#6a8cff);color:#fff;border-color:transparent}
+.swt.on.f{background:linear-gradient(120deg,#10a37f,#2cc6b0);color:#fff;border-color:transparent}
+.swt.on small{color:rgba(255,255,255,.9)}.swt.on .b{background:rgba(255,255,255,.22)}
+.swt.add{flex:0 0 190px;justify-content:center;border-style:dashed;color:var(--muted);font-weight:700}
+.swt.soon{opacity:.55;cursor:default}
+.subt{display:flex;gap:2px;border-bottom:1px solid var(--border);flex-wrap:wrap}
+.subt button{padding:8px 14px;font-weight:700;color:var(--muted);border:0;border-bottom:2.5px solid transparent;margin-bottom:-1px;background:none;border-radius:0;box-shadow:none;cursor:pointer}
+.subt button.on{color:var(--text);border-bottom-color:var(--accent)}
+.subt button small{color:var(--accent);margin-left:3px}
+.feat{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:10px}
+.fx{display:flex;align-items:center;gap:9px;border:1px solid var(--border);background:var(--surface);border-radius:10px;padding:7px 10px;text-align:left;color:var(--text);font-weight:500;box-shadow:none;font-size:13px}
+button.fx{cursor:pointer}
+button.fx:disabled{cursor:default;opacity:1}
+.fx .cb{flex:0 0 17px;height:17px;border-radius:5px;border:1.5px solid var(--border-strong);display:grid;place-items:center;font-size:11px;color:#fff;font-weight:900}
+.fx.on .cb{background:var(--accent);border-color:var(--accent)}
+.fx .tg{margin-left:auto;font-size:11px;font-weight:800;white-space:nowrap}
+.fx.plan .tg{color:var(--faint)}.fx.add{background:var(--accentbg);border-color:color-mix(in srgb,var(--accent) 45%,var(--border))}.fx.add .tg{color:var(--accent)}
+.fx.off{background:var(--badbg);border-color:color-mix(in srgb,var(--bad) 35%,var(--border))}.fx.off .tg{color:var(--bad)}.fx.off .nm{text-decoration:line-through;color:var(--muted)}
+.fx.no .nm{color:var(--muted)}
+.fgh{font-size:11.5px;font-weight:800;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin:4px 0 6px}
+.sumline{display:flex;gap:16px;align-items:center;flex-wrap:wrap;font-size:13px}
+.wfoot{display:flex;gap:10px;justify-content:flex-end;align-items:center}
+.empty{padding:22px;text-align:center;color:var(--muted)}
+.mini-tbl{width:100%;border-collapse:collapse}.mini-tbl th{font-size:12px;color:var(--muted);text-align:left;padding:6px 8px;border-bottom:1px solid var(--border)}.mini-tbl td{padding:7px 8px;border-bottom:1px solid var(--bg-sunken)}
+@media (max-width:900px){.side{display:none}.figs{grid-template-columns:repeat(2,1fr)}.fgrid,.fgrid.five{grid-template-columns:1fr 1fr}.feat{grid-template-columns:1fr}.swtabs{flex-wrap:wrap}}
+#jump.snav .sgroup{font-size:11px;font-weight:800;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;padding:4px 10px 2px}
+#jump.snav .tab.soon{opacity:.55;cursor:default}#jump.snav .tab.soon:hover{background:none}
 </style></head><body>
 <div class="wrap">
   <div id="gate" class="card">
@@ -1310,34 +1480,54 @@ button.primary{background:linear-gradient(120deg,#0A66E0,#1EA0FF);border-color:t
   </div>
 
   <div id="app" style="display:none">
-    <div class="top">
-      <div class="grow brand"><img class="brand-mark" src="/logo.png" alt="Nexora" width="38" height="38">
-        <div><h1 style="margin:0">NEXORA <span class="sub" style="font-weight:600">Licence console</span></h1>
-        <p class="sub" id="sub"></p></div></div>
-      <div class="kpis" id="kpi"></div>
-      <button class="mode-switch" id="mode-switch" role="switch" aria-checked="false" onclick="flipMode()" title="Light \u2014 click for dark">
-        <span class="mode-mark mode-sun">\u2600</span><span class="mode-mark mode-moon">\u263e</span>
-        <span class="mode-knob">\u2600</span></button>
-      <button id="refreshBtn" onclick="refreshNow()">Refresh</button><span class="sub" id="refreshed" style="align-self:center"></span>
-      <button data-sec="settings" onclick="showSec(this.dataset.sec)">Service settings</button>
-      <button onclick="signOut()" title="Forget the key in this browser tab">Sign out</button>
+    <!-- 2026-10-08 — THE CONSOLE AS SOFTWARE (owner: "console ne software jevu banavanu che row type details
+         click and open window"): the menu bar, the modules down the left, a title and a hint, the toolbar. -->
+    <div class="menubar">
+      <span class="mi" data-sec="sec-dashboard" onclick="showSec(this.dataset.sec)"><b class="ak">F</b>ile</span>
+      <span class="mi" onclick="refreshNow()"><b class="ak">V</b>iew</span>
+      <span class="mi" data-sec="sec-companies" onclick="showSec(this.dataset.sec)"><b class="ak">C</b>ustomers</span>
+      <span class="mi" data-sec="sec-plans" onclick="showSec(this.dataset.sec)"><b class="ak">S</b>oftware</span>
+      <span class="mi" data-sec="settings" onclick="showSec(this.dataset.sec)"><b class="ak">T</b>ools</span>
+      <span class="mi" data-sec="sec-activity" onclick="showSec(this.dataset.sec)"><b class="ak">H</b>elp</span>
+      <span class="mt">Nexora Console</span>
+      <button class="mode-switch" id="mode-switch" role="switch" aria-checked="false" onclick="flipMode()" title="Light — click for dark">
+        <span class="mode-mark mode-sun">☀</span><span class="mode-mark mode-moon">☾</span>
+        <span class="mode-knob">☀</span></button>
     </div>
-    <!-- 4.48.1 — TABS. "make tab in console its look still tricky": one
-         section on screen at a time, the counts on the tabs, the last tab
-         remembered in this browser. -->
-    <nav class="jump tabs" id="jump">
-      <!-- 4.72.0 — each tab hands its section over in data-sec (no onclick carries a quoted string) -->
-      <button class="tab" data-sec="sec-companies" onclick="showSec(this.dataset.sec)">Companies <b id="jump-co">–</b></button>
-      <button class="tab" data-sec="sec-plans" onclick="showSec(this.dataset.sec)">Plans</button>
-      <button class="tab" data-sec="sec-inquiries" onclick="showSec(this.dataset.sec)">Enquiries <b id="jump-q">–</b></button>
-      <button class="tab" data-sec="sec-feedback" onclick="showSec(this.dataset.sec)">Feedback &amp; problems <b id="jump-fb">–</b></button>
-      <button class="tab" data-sec="sec-broadcast" onclick="showSec(this.dataset.sec)">Message plants</button>
-      <button class="tab" data-sec="sec-installations" onclick="showSec(this.dataset.sec)">Installations <b id="jump-inst">–</b></button>
-      <button class="tab" data-sec="appcard" onclick="showSec(this.dataset.sec)">Phone app</button>
-      <button class="tab" data-sec="sec-activity" onclick="showSec(this.dataset.sec)">Activity</button>
-      <button class="tab" data-sec="settings" onclick="showSec(this.dataset.sec)">Service settings</button>
-    </nav>
-
+    <div class="shell">
+      <aside class="side">
+        <div class="sbrand"><img src="/logo.png" alt="Nexora" width="36" height="36"><div><b>NEXORA</b><small id="sub">Licence console</small></div></div>
+        <nav id="jump" class="snav">
+          <button class="tab" data-sec="sec-dashboard" onclick="showSec(this.dataset.sec)"><span class="ic" style="background:linear-gradient(135deg,#4f7cff,#7aa2ff)">▦</span>Dashboard</button>
+          <button class="tab" data-sec="sec-companies" onclick="showSec(this.dataset.sec)"><span class="ic" style="background:linear-gradient(135deg,#f08a0c,#f7b538)">C</span>Customers <b id="jump-co">–</b></button>
+          <button class="tab sub" data-sec="sec-validity" onclick="showSec(this.dataset.sec)"><span class="ic" style="background:linear-gradient(135deg,#e2457a,#f47aa0)">⟳</span>Validity <b id="jump-val">–</b></button>
+          <button class="tab sub" data-sec="sec-payments" onclick="showSec(this.dataset.sec)"><span class="ic" style="background:linear-gradient(135deg,#15803d,#34d399)">₹</span>Payments <b id="jump-pay">–</b></button>
+          <div class="sgroup">By software</div>
+          <button class="tab sub" data-sec="sec-sw-weight" onclick="showSec(this.dataset.sec)"><span class="ic" style="background:linear-gradient(135deg,#3366ff,#6a8cff)">⚖</span>Sales &amp; Costing <b id="jump-sw-weight">–</b></button>
+          <button class="tab sub" data-sec="sec-sw-fabric" onclick="showSec(this.dataset.sec)"><span class="ic" style="background:linear-gradient(135deg,#10a37f,#2cc6b0)">▤</span>Fabric Stock <b id="jump-sw-fabric">–</b></button>
+          <div class="tab sub soon" title="Jobwork joins when it has a licence of its own"><span class="ic" style="background:linear-gradient(135deg,#f08a0c,#f7b538)">⚙</span>Jobwork <b>soon</b></div>
+          <div class="sgap"></div>
+          <button class="tab" data-sec="sec-plans" onclick="showSec(this.dataset.sec)"><span class="ic" style="background:linear-gradient(135deg,#6d3ff5,#a78bfa)">◫</span>Software &amp; plans <b id="jump-plans">–</b></button>
+          <div class="sgap"></div>
+          <button class="tab" data-sec="sec-inquiries" onclick="showSec(this.dataset.sec)"><span class="ic" style="background:linear-gradient(135deg,#db2777,#f472b6)">✉</span>Enquiries <b id="jump-q">–</b></button>
+          <button class="tab" data-sec="sec-feedback" onclick="showSec(this.dataset.sec)"><span class="ic" style="background:linear-gradient(135deg,#eab308,#f6cf4a)">!</span>Feedback <b id="jump-fb">–</b></button>
+          <button class="tab" data-sec="sec-broadcast" onclick="showSec(this.dataset.sec)"><span class="ic" style="background:linear-gradient(135deg,#0ea5e9,#5cc8f5)">✎</span>Message plants</button>
+          <button class="tab" data-sec="sec-installations" onclick="showSec(this.dataset.sec)"><span class="ic" style="background:linear-gradient(135deg,#d9730d,#fb923c)">▭</span>Installations <b id="jump-inst">–</b></button>
+          <button class="tab" data-sec="appcard" onclick="showSec(this.dataset.sec)"><span class="ic" style="background:linear-gradient(135deg,#0d9488,#2dd4bf)">▯</span>Phone app</button>
+          <button class="tab" data-sec="sec-activity" onclick="showSec(this.dataset.sec)"><span class="ic" style="background:linear-gradient(135deg,#475569,#94a3b8)">◷</span>Activity</button>
+          <div class="sfoot">
+            <button class="tab" data-sec="settings" onclick="showSec(this.dataset.sec)"><span class="ic" style="background:linear-gradient(135deg,#475569,#94a3b8)">⚙</span>Service settings</button>
+            <button class="tab" onclick="signOut()" title="Forget the key in this browser tab"><span class="ic" style="background:linear-gradient(135deg,#dc2626,#f87171)">⏻</span>Sign out</button>
+            <div class="sclock"><small id="sDate"></small><b id="sTime"></b></div>
+            <div class="sver"><span>CONSOLE</span><span>v2.0</span></div>
+          </div>
+        </nav>
+      </aside>
+      <main class="main">
+        <div class="phead"><span class="mn">–</span><div><h1 id="ptitle">Customers</h1><small id="psub"></small></div><span style="flex:1"></span>
+          <span class="sub" id="refreshed" style="font-size:12px"></span><span class="hint" id="phint"></span></div>
+        <div class="tbar" id="tbar"></div>
+        <div class="pcontent">
     <div class="card" id="settings" style="display:none">
       <h2>Service settings <span class="sub" style="font-weight:400">— apply to every installation from its next check</span></h2>
       <div class="row" style="margin-top:10px">
@@ -1370,53 +1560,114 @@ button.primary{background:linear-gradient(120deg,#0A66E0,#1EA0FF);border-color:t
       <p class="help">Read-only: nothing here can be changed or removed. <b>From</b> is the console (web or phone) and the address it called from; a wrong key is listed with the address it came from, never with what was typed. PINs, passcodes and licence keys are never written here — a new licence key appears only as its first part.</p>
     </div>
 
-    <!-- 4.48.0 — "give this plan wise access things in console so i can
-         control app feature from console as per plan". What each plan
-         carries; a demo always gets everything. -->
-    <div class="card" id="sec-plans">
-      <div class="top" style="margin-bottom:6px">
-        <h2 class="grow">Plans <span class="sub" style="font-weight:400">— what Standard and Pro carry; every installation reads this at its next check</span></h2>
-        <button class="primary" onclick="savePlans()">Save plans</button>
-      </div>
-      <div style="overflow-x:auto"><table id="plantbl">
-        <thead><tr><th>Feature</th><th>Standard</th><th>Pro</th><th>Demo</th></tr></thead><tbody></tbody></table></div>
-      <div id="plMsg"></div>
-      <p class="help">Calculation and costing are the product and are always on. A feature unticked for a plan disappears from every installation on that plan &mdash; its window, button and shortcut &mdash; and the application says it belongs to the other plan when somebody asks for it. Seats are separate from the plan: you decide how many people each company may have, on either plan. A <b>demo</b> always has everything, whatever its plan, so a prospect sees the whole application. Each company&rsquo;s plan is set on its card.</p>
+    <!-- 2026-10-08 — DASHBOARD: the figures, the renewals coming, the money in -->
+    <div id="sec-dashboard">
+      <div class="card"><div class="kpis" id="kpi"></div></div>
+      <div class="card"><div class="ctitle"><h3>By software</h3><span class="sub" id="dashNote"></span></div><div class="figs" id="dashSoft"></div></div>
+      <div class="card"><div class="ctitle"><h3>Ending within 30 days</h3><button class="small" data-sec="sec-validity" onclick="showSec(this.dataset.sec)">All validity</button></div><div id="dashEnding"></div></div>
+      <div class="card"><div class="ctitle"><h3>Latest payments</h3><button class="small" data-sec="sec-payments" onclick="showSec(this.dataset.sec)">All payments</button></div><div id="dashPay"></div></div>
     </div>
 
-    <div class="card" id="sec-companies">
-      <div class="top" style="margin-bottom:6px">
-        <h2 class="grow">Companies</h2>
-        <input id="cq" placeholder="Find a company, key, email, GSTIN…" oninput="renderCompanies()" style="min-width:240px">
-        <button class="primary" data-target="newco" onclick="toggle(this)">New company</button>
-      </div>
-      <div id="newco" style="display:none;border:1px solid var(--border);border-radius:10px;padding:12px;margin:8px 0 12px">
-        <div class="row">
-          <label>Software<select id="nSoft"><option value="weight">Weight Calc</option><option value="fabric">Fabric Stock</option><option value="both">Both — each its own licence</option></select></label>
-          <label>Company name<input id="nName" placeholder="Company name" style="min-width:220px"></label>
-          <label>Plan (Weight Calc)<select id="nPlan"><option value="PRO">Pro — everything</option><option value="STANDARD">Standard — calculation &amp; costing</option></select></label>
-          <label>Seats<input id="nSeats" type="number" min="1" max="500" value="1" style="width:80px"></label>
-          <label>Licence days<input id="nDays" type="number" min="1" max="3650" value="365" style="width:90px"></label>
-          <label>Offline days<input id="nGrace" type="number" min="0" max="365" value="3" style="width:90px"></label>
-          <label>GSTIN<input id="nGst" placeholder="15 characters" maxlength="15" style="min-width:170px;text-transform:uppercase"></label>
-          <label>Email<input id="nEmail" placeholder="address" style="min-width:170px"></label>
-          <button class="primary" onclick="createCo()">Create licensed company</button>
-          <button data-target="newco" onclick="toggle(this)">Cancel</button>
+    <!-- 2026-10-08 — CUSTOMERS: one row per customer, each software in its own column; a click opens the customer -->
+    <div id="sec-companies">
+      <div class="card">
+        <div class="fcard">
+          <label>Search<input id="cq" placeholder="Customer, GSTIN, key, phone, email…" oninput="renderCompanies()" style="min-width:260px"></label>
+          <label>Software<select id="cSoft" onchange="renderCompanies()"><option value="">Any software</option><option value="weight">Sales & Costing</option><option value="fabric">Fabric Stock</option><option value="both">Both</option></select></label>
+          <label>Plan<select id="cPlan" onchange="renderCompanies()"><option value="">Any plan</option></select></label>
+          <label>State<select id="cState" onchange="renderCompanies()"><option value="">Any state</option><option value="LICENSED">Licensed</option><option value="DEMO">Demo</option><option value="EXPIRED">Ended</option><option value="SUSPENDED">Suspended</option></select></label>
+          <label>Renews from<input id="cFrom" type="date" onchange="renderCompanies()"></label>
+          <label>To<input id="cTo" type="date" onchange="renderCompanies()"></label>
+          <button onclick="clearCustomerFilter()">Clear</button>
         </div>
-        <p class="help">For a customer you set up yourself. A licence key is generated; every computer they install types the same key (the first is let in at once, each one after it waits for the company&rsquo;s administrator). Seats are the people who sign in. A plant that registers itself from the application appears here on its own, as a demo.</p>
+        <div class="quick" id="cQuick"></div>
       </div>
-      <!-- 4.72.0 (audit 90, 40) — all, the paying licences that end within 30 days, and the deleted ones (restorable for 30 days) -->
-      <div id="cofilters" class="acts" style="margin:8px 0"></div>
-      <div id="coMsg"></div>
-      <div id="colist"></div>
-      <div class="legend">
-        <div><b>Software</b>each Nexora software has its own licence: its own key, period, seats, people and rights. Weight Calc and Fabric Stock are shown together when they are the same company (the same GSTIN, or linked by hand); renewing, suspending or restoring one never touches the other.</div>
-        <div><b>Plan</b>is Standard (calculation and costing) or Pro (everything ticked under Plans); seats are set separately. A demo has everything until it is made licensed.</div>
-        <div><b>Suspend</b>stops every machine of the company at its next check. Nothing is deleted; Restore puts it all back. Use it when a customer has not paid.</div>
-        <div><b>Revoke</b>(on one installation) stops that one machine. It frees no seat — seats are people, and a machine never held one. The company keeps running.</div>
-        <div><b>Delete</b>stops the company at once and keeps it for 30 days with everything it had — <b>Restore</b> under <i>Deleted</i> puts it back exactly as it was. After 30 days it is erased for good: its machines, its people, everything they synced, its chat and its problem reports. The name must be typed to confirm.</div>
-        <div><b>Transactions and hours</b>are what the company has used — saved records, and time in the application — summed over its machines. A limit of 0 means none.</div>
+      <div class="card"><div class="ctitle"><h3 id="cCount">Customers</h3><span class="sub" id="cNote"></span></div><div class="figs" id="cFigs"></div></div>
+      <div class="card"><div class="ctitle"><h3 id="cListTitle">Every customer</h3><span class="sub">Click a row to open it</span></div><div id="colist" style="overflow-x:auto"></div>
+        <div class="legend" style="margin-top:12px"><div><b>Suspend</b>stops every computer and phone of that software at its next check. Nothing is deleted; Restore puts it all back.</div><div><b>Revoke</b>(one computer or phone, under Computers &amp; phones) stops that one machine. It frees no seat — seats are people — and the company keeps running.</div><div><b>Delete</b>(Sales &amp; Costing, under More) stops the company at once and keeps it for 30 days with everything it had — Restore under Deleted puts it back exactly as it was. After 30 days it is erased for good. The name must be typed to confirm.</div><div><b>Each software</b>has its own licence: its own key, plan, period, seats, people and rights; renewing, suspending or restoring one never touches the other.</div></div></div>
+    </div>
+
+    <!-- 2026-10-08 — VALIDITY & RENEWALS (owner: "kayo plan expire thay che"): one row per software per customer -->
+    <div id="sec-validity">
+      <div class="card">
+        <div class="fcard">
+          <label>Search<input id="vq" placeholder="Customer, GSTIN…" oninput="renderValidity()" style="min-width:240px"></label>
+          <label>Software<select id="vSoft" onchange="renderValidity()"><option value="">Any software</option><option value="weight">Sales & Costing</option><option value="fabric">Fabric Stock</option></select></label>
+          <label>Ends from<input id="vFrom" type="date" onchange="renderValidity()"></label>
+          <label>To<input id="vTo" type="date" onchange="renderValidity()"></label>
+          <button onclick="clearValidityFilter()">Clear</button>
+        </div>
+        <div class="quick" id="vQuick"></div>
       </div>
+      <div class="card"><div class="ctitle"><h3 id="vCount">Validity</h3><span class="sub">Ending first</span></div><div class="figs" id="vFigs"></div></div>
+      <div class="card"><div class="ctitle"><h3>Every licence</h3><span class="sub">Click a row to open the customer</span></div><div id="vlist" style="overflow-x:auto"></div></div>
+    </div>
+
+    <!-- 2026-10-08 — PAYMENTS (owner: "payment kyare aavyu kya plan nu"): the owner's ledger -->
+    <div id="sec-payments">
+      <div class="card">
+        <div class="fcard">
+          <label>Search<input id="pq" placeholder="Customer, reference, note…" oninput="renderPayments()" style="min-width:240px"></label>
+          <label>Software<select id="pSoft" onchange="renderPayments()"><option value="">Any software</option><option value="weight">Sales & Costing</option><option value="fabric">Fabric Stock</option></select></label>
+          <label>Kind<select id="pKind" onchange="renderPayments()"><option value="">Any</option><option value="NEW">New customer</option><option value="RENEWAL">Renewal</option><option value="EXTRA_USERS">Extra users</option><option value="UPGRADE">Plan upgrade</option><option value="OTHER">Other</option></select></label>
+          <label>From<input id="pFrom" type="date" onchange="renderPayments()"></label>
+          <label>To<input id="pTo" type="date" onchange="renderPayments()"></label>
+          <button onclick="clearPaymentFilter()">Clear</button>
+        </div>
+        <div class="quick" id="pQuick"></div>
+      </div>
+      <div class="card"><div class="ctitle"><h3 id="pCount">Payments</h3><span class="sub" id="pNote"></span></div><div class="figs" id="pFigs"></div></div>
+      <div class="card"><div class="ctitle"><h3>Every payment</h3><span class="sub">Click a row to open it</span></div><div id="plist" style="overflow-x:auto"></div></div>
+    </div>
+
+    <!-- 2026-10-08 — BY SOFTWARE (owner: "by customer pan joi sakay ane by software wise pan joi sakay"): Sales &amp; Costing alone -->
+    <div id="sec-sw-weight">
+      <div class="card">
+        <div class="fcard">
+          <label>Search<input id="sw-q-weight" placeholder="Customer, GSTIN, key…" data-sw="weight" oninput="renderSoftware(this.dataset.sw)" style="min-width:240px"></label>
+          <label>Plan<select id="sw-plan-weight" data-sw="weight" onchange="renderSoftware(this.dataset.sw)"><option value="">Any plan</option></select></label>
+          <label>State<select id="sw-state-weight" data-sw="weight" onchange="renderSoftware(this.dataset.sw)"><option value="">Any state</option><option value="LICENSED">Licensed</option><option value="DEMO">Demo</option><option value="EXPIRED">Ended</option><option value="SUSPENDED">Suspended</option></select></label>
+          <label>Ends from<input id="sw-from-weight" type="date" data-sw="weight" onchange="renderSoftware(this.dataset.sw)"></label>
+          <label>To<input id="sw-to-weight" type="date" data-sw="weight" onchange="renderSoftware(this.dataset.sw)"></label>
+          <button data-sw="weight" onclick="clearSoftwareFilter(this.dataset.sw)">Clear</button>
+        </div>
+        <div class="quick" id="sw-quick-weight"></div>
+      </div>
+      <div class="card"><div class="ctitle"><h3 id="sw-count-weight">Sales &amp; Costing</h3><span class="sub" id="sw-note-weight"></span></div><div class="figs" id="sw-figs-weight"></div></div>
+      <div class="card"><div class="subt" id="sw-tabs-weight" style="margin-bottom:12px"></div><div id="sw-list-weight" style="overflow-x:auto"></div></div>
+    </div>
+
+    <!-- 2026-10-08 — BY SOFTWARE (owner: "by customer pan joi sakay ane by software wise pan joi sakay"): Fabric Stock alone -->
+    <div id="sec-sw-fabric">
+      <div class="card">
+        <div class="fcard">
+          <label>Search<input id="sw-q-fabric" placeholder="Customer, GSTIN, key…" data-sw="fabric" oninput="renderSoftware(this.dataset.sw)" style="min-width:240px"></label>
+          <label>Plan<select id="sw-plan-fabric" data-sw="fabric" onchange="renderSoftware(this.dataset.sw)"><option value="">Any plan</option></select></label>
+          <label>State<select id="sw-state-fabric" data-sw="fabric" onchange="renderSoftware(this.dataset.sw)"><option value="">Any state</option><option value="LICENSED">Licensed</option><option value="DEMO">Demo</option><option value="EXPIRED">Ended</option><option value="SUSPENDED">Suspended</option></select></label>
+          <label>Ends from<input id="sw-from-fabric" type="date" data-sw="fabric" onchange="renderSoftware(this.dataset.sw)"></label>
+          <label>To<input id="sw-to-fabric" type="date" data-sw="fabric" onchange="renderSoftware(this.dataset.sw)"></label>
+          <button data-sw="fabric" onclick="clearSoftwareFilter(this.dataset.sw)">Clear</button>
+        </div>
+        <div class="quick" id="sw-quick-fabric"></div>
+      </div>
+      <div class="card"><div class="ctitle"><h3 id="sw-count-fabric">Fabric Stock</h3><span class="sub" id="sw-note-fabric"></span></div><div class="figs" id="sw-figs-fabric"></div></div>
+      <div class="card"><div class="subt" id="sw-tabs-fabric" style="margin-bottom:12px"></div><div id="sw-list-fabric" style="overflow-x:auto"></div></div>
+    </div>
+
+    <!-- 2026-10-08 — SOFTWARE & PLANS (owner: "plan pan hu create kri saku darek software wise", "price open rakho") -->
+    <div id="sec-plans">
+      <div class="card">
+        <div class="fcard">
+          <label>Software<select id="plSoft" onchange="renderPlanList()"><option value="">Every software</option><option value="weight">Sales & Costing</option><option value="fabric">Fabric Stock</option></select></label>
+          <label>Search<input id="plq" placeholder="Plan or feature…" oninput="renderPlanList()" style="min-width:240px"></label>
+          <button onclick="clearPlanFilter()">Clear</button>
+        </div>
+        <div class="quick"><span>Quick:</span><span class="qb" data-sw="weight" onclick="plQuick(this.dataset.sw)">Sales &amp; Costing</span><span class="qb" data-sw="fabric" onclick="plQuick(this.dataset.sw)">Fabric Stock</span><span class="qb" data-sw="weight" onclick="openPlan(this.dataset.sw,null)">+ New Sales &amp; Costing plan</span><span class="qb" data-sw="fabric" onclick="openPlan(this.dataset.sw,null)">+ New Fabric Stock plan</span></div>
+      </div>
+      <div class="card"><div class="ctitle"><h3 id="plCount">Plans</h3><span class="sub">Each software has its own plans and its own features — never mixed</span></div><div class="figs" id="plFigs"></div></div>
+      <div class="card"><div class="ctitle"><h3>Every plan</h3><span class="sub">Click a row to open it — its price, users and features</span></div><div id="pllist" style="overflow-x:auto"></div>
+        <p class="help" style="margin-top:10px">A price left empty is not set yet. Prices are for this console and the renewals; a plan’s ticks decide what the application lets the plant do, at its next check. A demo has every feature, whatever its plan. A customer’s own changes (on the customer, Features) lie over the plan.</p></div>
+      <table id="plantbl" style="display:none"><tbody></tbody></table>
     </div>
 
     <!-- 4.44.0 — THE PHONE CONSOLE'S RELEASES.
@@ -1548,6 +1799,11 @@ button.primary{background:linear-gradient(120deg,#0A66E0,#1EA0FF);border-color:t
         <thead><tr><th>Company · machine</th><th>State</th><th>Email</th><th>Days left</th><th>Started</th><th>Last seen</th><th>Version</th><th>Transactions</th><th>Hours</th><th></th></tr></thead><tbody></tbody></table></div>
       <p class="help">The clock belongs to the company, not the machine. Machines take no seat — revoke one to stop that computer, suspend the company to stop all of them. Seats are the people, under Manage &rarr; People. <b>no device key yet</b> marks a computer or phone that has not handed its own key over (it does at its next heartbeat on 4.71.0 / Nexora Mobile 1.0.0 or later); the count is under Service settings.</p>
     </div>
+        </div>
+      </main>
+    </div>
+    <div id="coMsg" class="toast"></div>
+    <div id="winLayer"></div>
   </div>
 </div>
 <script>
@@ -1643,6 +1899,9 @@ async function load(){
     render();
     /* 4.42.0 — the leads come with everything else, and never hold up the
        rest of the page if the service has not been deployed with them. */
+    /* 2026-10-08 — every software’s plans, and the payments, before the slower calls */
+    loadPlans();
+    loadPayments();
     loadInquiries();
     loadReleases();
     loadFeedback();
@@ -1690,140 +1949,6 @@ function txnCell(used,limit){
     (used>=limit?'<small style="color:var(--bad)">limit reached — read-only</small>':'');
 }
 function hoursText(mins){mins=+mins||0;const h=Math.floor(mins/60),m=mins%60;return h?h+' h '+m+' m':m+' m';}
-function renderCompanies(){
-  /* 4.58.1 — THE PEOPLE SURVIVE A REDRAW. Every redraw of the list wrote
-     "Reading…" into the open company's People panel, and only OPENING a
-     company ever asked for the people — so after Refresh (or a search) the
-     panel said Reading… for ever. What was on screen is kept here, and
-     load() reads the people again. */
-  const keptPeople=OPEN&&document.getElementById('users-'+OPEN)?document.getElementById('users-'+OPEN).innerHTML:null;
-  renderCompanyList();
-  if(keptPeople&&!/Reading/.test(keptPeople)){const h=document.getElementById('users-'+OPEN);if(h)h.innerHTML=keptPeople;}
-}
-/* 4.72.0 (audit 90, 40) — WHICH COMPANIES: all of them, the paying licences
-   that end within 30 days (the plants to ring about renewing), or the ones
-   Delete has archived, which can be restored for 30 days. */
-let COVIEW='all';
-function coView(v){COVIEW=['ending','deleted','weight','fabric'].indexOf(v)>=0?v:'all';renderCompanies();}
-function renderCompanyList(){
-  const term=(document.getElementById('cq').value||'').toLowerCase();
-  const allCos=DATA.companies||[], arch=DATA.archived||[];
-  const nEnd=allCos.filter(c=>c.ending_soon).length;
-  const fl=document.getElementById('cofilters');
-  if(fl)fl.innerHTML=
-    '<button class="small'+(COVIEW==='all'?' primary':'')+'" data-view="all" onclick="coView(this.dataset.view)">All '+(allCos.length+fabricOnly().length)+'</button>'+
-    '<button class="small'+(COVIEW==='weight'?' primary':'')+'" data-view="weight" onclick="coView(this.dataset.view)" title="Nexora Bag Weight Calculation">Weight Calc '+allCos.length+'</button>'+
-    '<button class="small'+(COVIEW==='fabric'?' primary':'')+'" data-view="fabric" onclick="coView(this.dataset.view)" title="Nexora Loom &amp; Fabric Stock — its own licences">Fabric Stock '+(fabricProduct()&&fabricProduct().ok?fabricAll().length:'…')+'</button>'+
-    '<button class="small'+(COVIEW==='ending'?' primary':'')+'" data-view="ending" onclick="coView(this.dataset.view)" title="Paying licences that end within 30 days — ring them to renew">Ending in 30 days '+nEnd+'</button>'+
-    '<button class="small'+(COVIEW==='deleted'?' primary':'')+'" data-view="deleted" onclick="coView(this.dataset.view)" title="Deleted companies are kept for 30 days and can be restored until then">Deleted '+arch.length+'</button>';
-  if(COVIEW==='deleted'){document.getElementById('colist').innerHTML=archivedHtml(arch,term);return;}
-  const cos=allCos.filter(c=>(COVIEW!=='ending'||c.ending_soon)&&(COVIEW!=='fabric'||fabricOf(c.id))&&(!term||[c.name,c.licence_key,c.email,c.gstin,c.login_id,c.phone].some(v=>String(v||'').toLowerCase().includes(term))));
-  if(COVIEW==='ending'&&!cos.length){document.getElementById('colist').innerHTML='<p class="help">No paying licence ends within the next 30 days.</p>';return;}
-  const wcHtml=cos.map(c=>{
-    const state=(c.expired&&c.state!=='SUSPENDED')?'EXPIRED':c.state;
-    const used=c.seats_used, seats=c.seats, pct=Math.min(100,Math.round(used/Math.max(1,seats)*100));
-    const open=OPEN===c.id;
-    return '<div class="co'+(c.state==='SUSPENDED'?' suspended':'')+'" id="co-'+c.id+'">'+
-      '<div class="co-head">'+
-        '<div class="grow" style="flex:1">'+
-          '<span class="co-name">'+esc(c.name)+'</span> '+
-          '<span class="pill s-'+state+'">'+(state==='DEMO'?'demo':state.toLowerCase())+'</span> '+
-          (c.is_demo?'':'<span class="pill s-'+(c.plan==='STANDARD'?'SELF':'LICENSED')+'" title="'+(c.plan==='STANDARD'?'Standard: calculation and costing':'Pro: everything')+'">'+(c.plan==='STANDARD'?'standard':'pro')+'</span> ')+
-          swPills(c)+
-          (c.self_registered?'<span class="pill s-SELF" title="Registered by the plant itself on '+esc(fmt(c.registered_at))+(c.registered_ip?' from '+esc(c.registered_ip):'')+'">self-registered</span> ':'')+
-          (c.gstin?gstPill(c):'')+
-          '<div class="co-meta">'+
-            '<span>Key <span class="key">'+esc(c.licence_key)+'</span> <button class="small" data-key="'+esc(c.licence_key)+'" onclick="copyKey(this)">Copy</button></span>'+
-            (c.gstin?'<span>GSTIN <code>'+esc(c.gstin)+'</code></span>':'')+
-            (c.email?'<span><code>'+esc(c.email)+'</code></span>':'')+
-            (c.phone?'<span><code>'+esc(c.phone)+'</code></span>':'')+
-            (c.login_id?'<span>Login id <code>'+esc(c.login_id)+'</code></span>':'')+
-            (c.registered_ip?'<span title="The address this company registered from">IP <code>'+esc(c.registered_ip)+'</code></span>':'')+
-          '</div>'+
-        '</div>'+
-        '<div><button'+(open?' class="primary"':'')+' data-id="'+c.id+'" onclick="manage(this)">'+(open?'Close':'Manage')+'</button></div>'+
-      '</div>'+
-      '<div class="sw-cap sw-weight">Weight Calc</div>'+
-      '<div class="co-facts">'+
-        /* 4.42.0 — A SEAT IS A PERSON, and a plant asking for another one
-           wants to know how many are LEFT, which 'seat 3 of 5' never said.
-           Machines are counted underneath, and are not rationed: since a
-           computer with nobody signed in can only read, charging for it
-           would be charging for a locked door. */
-        '<div class="fact"><span>Plan</span><b>'+(c.is_demo?'demo':(c.plan==='STANDARD'?'Standard':'Pro'))+'</b>'+
-          '<small>'+(c.is_demo?'everything, while it is a demo':(c.plan==='STANDARD'?'calculation and costing':'every feature'))+'</small></div>'+
-        '<div class="fact"><span>Seats (people)</span><b>'+used+' of '+seats+'</b>'+
-          '<small>'+(seats-used>0?(seats-used)+' available':'none available')+'</small>'+
-          '<span class="bar'+(used>=seats?' full':'')+'"><i style="width:'+pct+'%"></i></span></div>'+
-        '<div class="fact"><span>Computers</span><b>'+(c.machines_used||0)+'</b>'+
-          '<small>not counted against seats</small></div>'+
-        /* 4.57.0 - WHEN IT STARTED, beside when it ends. "Days left 3"
-           is a number with no scale: three of seven is a demo about to
-           lapse, three of 365 is next year's conversation. */
-        '<div class="fact"><span>'+(c.is_demo?'Demo started':'Licence started')+'</span><b>'+fmt(c.period_started_at)+'</b>'+
-          '<small>'+(c.period_days?c.period_days+'-day '+(c.is_demo?'demo':'licence'):'\u2014')+'</small></div>'+
-        /* 4.72.0 (audit 90) — a paying licence ending within 30 days says so, in the warning colour */
-        '<div class="fact"'+(c.ending_soon?' style="border-color:var(--warn)" title="Ends within 30 days — ring them to renew"':'')+'><span>'+(state==='EXPIRED'?'Ended':state==='SUSPENDED'?'Suspended · ends':'Days left')+'</span><b'+(c.ending_soon?' style="color:var(--warn)"':'')+'>'+(state==='EXPIRED'||state==='SUSPENDED'?fmt(c.expires_at):(c.days_left===0?'today':c.days_left))+'</b>'+(state==='EXPIRED'||state==='SUSPENDED'?'':'<small>'+fmt(c.expires_at)+(c.ending_soon?' · <b style="color:var(--warn);display:inline;font-size:inherit">renew soon</b>':'')+'</small>')+'</div>'+
-        '<div class="fact"><span>Offline allowed</span><b>'+(c.grace_days>0?c.grace_days+' days':'none')+'</b>'+(c.grace_days>0?'':'<small>stops when it cannot reach the service</small>')+'</div>'+
-        '<div class="fact"><span>Transactions</span>'+txnCell(c.txn_used,c.txn_limit)+'</div>'+
-        '<div class="fact"><span>Nexora AI today</span><b>'+(c.ai_used_today||0)+(c.ai_daily_limit?' of '+c.ai_daily_limit:(DATA.aiDefaultDaily&&DATA.aiDefaultDaily<100000?' of '+DATA.aiDefaultDaily:''))+'</b><small>'+(c.ai_daily_limit?'a day, set for this company':(DATA.aiDefaultDaily&&DATA.aiDefaultDaily<100000?'a day, the service\u2019s own number':'no daily limit'))+'</small></div>'+
-        '<div class="fact"><span>Hours in use</span><b>'+hoursText(c.usage_minutes)+'</b></div>'+
-        '<div class="fact"><span>People</span>'+usersCell(c)+'</div>'+
-      '</div>'+
-      (fabricOf(c.id)?'<div class="sw-cap sw-fabric">Fabric Stock</div>'+fabricFacts(fabricOf(c.id)):'')+
-      '<div class="manage'+(open?' open':'')+'" id="mg-'+c.id+'">'+
-        '<div class="sw-cap sw-weight">Weight Calc</div>'+
-        '<div class="group"><h4>Licence</h4><div class="acts">'+
-          (c.is_demo?'<button class="primary" data-id="'+c.id+'" data-action="licence" data-days="365" onclick="coAct(this)">Make licensed for 1 year</button><span class="why">turns this demo into a paying customer</span>':'')+
-          '<button data-id="'+c.id+'" data-plan="'+esc(c.plan||'PRO')+'" onclick="coPlan(this)">Plan: '+(c.plan==='STANDARD'?'Standard':'Pro')+'…</button><span class="why">Standard = calculation and costing; Pro = everything ticked under Plans. Seats are set separately.</span>'+
-          '<button data-id="'+c.id+'" onclick="coDays(this)">Add days…</button>'+
-          '<button data-id="'+c.id+'" data-action="extend" data-days="365" onclick="coAct(this)">+1 year</button>'+
-          /* 4.72.0 (audit 96) — a key somebody who left still knows */
-          '<button data-id="'+c.id+'" data-name="'+esc(c.name)+'" onclick="coRekey(this)">New licence key…</button><span class="why">the old key stops adding computers and phones; those already on keep working</span>'+
-        '</div></div>'+
-        '<div class="group"><h4>Machines</h4><div class="acts">'+
-          '<button data-id="'+c.id+'" data-now="'+seats+'" onclick="coSeats(this)">Seats…</button><span class="why">how many people may sign in, one per seat &mdash; computers and phones are not counted</span>'+
-          '<button data-id="'+c.id+'" data-now="'+c.grace_days+'" onclick="coGrace(this)">Offline days…</button>'+
-          '<button data-id="'+c.id+'" onclick="showInstallations(this)">Show its installations</button>'+
-          /* 4.72.0 (audit 96) — the company's computers and phones, right here */
-          '<div class="users-panel">'+machinesHtml(c)+'</div>'+
-        '</div></div>'+
-        /* 4.72.0 (audit 3, C12) — the copies its masters had before they were changed or deleted */
-        '<div class="group"><h4>Masters</h4><div class="acts">'+
-          '<button data-id="'+c.id+'" onclick="coHistory(this)">Earlier copies…</button><span class="why">materials, routes, processes, recipes and the rest as they were before a change or a delete — any one can be put back</span>'+
-          '<div id="hist-'+c.id+'" class="users-panel" style="display:none"></div>'+
-        '</div></div>'+
-        '<div class="group"><h4>People</h4><div class="acts">'+
-          '<button data-id="'+c.id+'" data-name="'+esc(c.name)+'" onclick="coAdmin(this)">Set administrator…</button><span class="why">the person who adds everyone else from inside the application</span>'+
-          '<button data-id="'+c.id+'" data-name="'+esc(c.name)+'" data-login="'+esc(c.login_id||'')+'" onclick="coPasscode(this)">New company passcode…</button><span class="why">for a plant that has forgotten the one it chose; it cannot be read back</span>'+
-          '<button data-id="'+c.id+'" data-name="'+esc(c.name)+'" onclick="coUsers(this)">Refresh the list</button><span class="why">the plant adds and removes people too, from inside the application</span>'+
-          /* 4.39.0 — the people are shown WITH the company, not behind
-             another click. Opening a company to see who is on it is the
-             commonest reason for opening one at all. */
-          '<div id="users-'+c.id+'" class="users-panel"><p class="help">Reading…</p></div>'+
-        '</div></div>'+
-        (c.gstin?'<div class="group"><h4>GST</h4><div class="acts">'+
-          '<button data-id="'+c.id+'" onclick="gstVerify(this)">Verify online</button><span class="why">asks the verification service, if one is configured</span>'+
-          (c.gst_status!=='VERIFIED'?'<button data-id="'+c.id+'" data-status="VERIFIED" onclick="gstMark(this)">Mark checked by hand</button>':'<button data-id="'+c.id+'" data-status="UNVERIFIED" onclick="gstMark(this)">Take the verified mark off</button>')+
-        '</div></div>':'')+
-        '<div class="group"><h4>Usage</h4><div class="acts">'+
-          '<button data-id="'+c.id+'" data-now="'+(c.txn_limit||0)+'" onclick="coLimit(this)">Transaction limit…</button>'+
-          '<button data-id="'+c.id+'" data-now="'+(c.ai_daily_limit||0)+'" onclick="coAiLimit(this)">Nexora AI a day…</button>'+
-          '<button data-id="'+c.id+'" data-name="'+esc(c.name)+'" onclick="coReset(this)">Reset usage</button><span class="why">count and hours from zero; nothing saved is touched</span>'+
-        '</div></div>'+
-        '<div class="group"><h4>Stop</h4><div class="acts">'+
-          (c.state==='SUSPENDED'
-            ?'<button data-id="'+c.id+'" data-action="restore" data-days="0" onclick="coAct(this)">Restore</button><span class="why">every machine runs again</span>'
-            :'<button class="danger" data-id="'+c.id+'" data-action="suspend" data-days="0" onclick="coAct(this)">Suspend</button><span class="why">every machine stops at its next check; nothing is deleted</span>')+
-          '<button class="danger" data-id="'+c.id+'" data-name="'+esc(c.name)+'" onclick="coDelete(this)">Delete…</button><span class="why">stops it now and keeps it 30 days (Restore under Deleted); then it and everything that belongs to it are erased</span>'+
-        '</div></div>'+
-        '<div class="sw-cap sw-fabric">Fabric Stock</div>'+fabricManage(fabricOf(c.id),c)+
-      '</div>'+
-    '</div>';
-  }).join('');
-  const fsHtml=(COVIEW==='all'||COVIEW==='fabric')?fabricOnlyHtml(term):'';
-  document.getElementById('colist').innerHTML=(fabricNote()+wcHtml+fsHtml)||'<p class="help">No companies yet. A plant that registers itself from the application appears here as a demo; a customer you set up yourself is created with New company.</p>';
-}
 function manage(btn){
   const id=+btn.dataset.id;
   OPEN=OPEN===id?null:id;
@@ -1938,11 +2063,14 @@ async function coDays(btn){
   btn.dataset.action='extend';btn.dataset.days=String(days);await coAct(btn);
 }
 /* ---------- the tabs (4.48.1) ---------- */
-const SECS=['sec-companies','sec-plans','sec-inquiries','sec-feedback','sec-broadcast','sec-installations','appcard','sec-activity','settings'];
+const SECS=['sec-dashboard','sec-companies','sec-validity','sec-payments','sec-sw-weight','sec-sw-fabric','sec-plans','sec-inquiries','sec-feedback','sec-broadcast','sec-installations','appcard','sec-activity','settings'];
 function showSec(id){
   if(SECS.indexOf(id)<0)id='sec-companies';
   SECS.forEach(s=>{const n=document.getElementById(s);if(!n)return;n.classList.add('sec');n.classList.toggle('on',s===id);if(s===id)n.style.display='';});
   document.querySelectorAll('#jump .tab').forEach(t=>t.classList.toggle('active',t.dataset.sec===id));
+  /* 2026-10-08 — the title, the hint and the toolbar of this screen */
+  shellFor(id);
+  const pc=document.querySelector('.pcontent');if(pc)pc.scrollTop=0;
   try{sessionStorage.setItem('nexora_admin_tab',id);}catch(e){}
   window.scrollTo({top:0});
   /* 4.72.0 — these two are read when they are opened, never in the background */
@@ -1981,7 +2109,9 @@ async function loadDb(){
     '</tbody></table></div>';
 }
 /* 4.72.0 (audit 39) — what was done from the consoles, read-only */
-const ACT_WORDS={ADMIN_FABRIC_CREATE:'Fabric Stock: company made',ADMIN_FABRIC_UPDATE:'Fabric Stock: licence changed',ADMIN_FABRIC_SUSPEND:'Fabric Stock: suspended',
+const ACT_WORDS={ADMIN_PLAN_CREATE:'Plan made',ADMIN_PLAN_UPDATE:'Plan changed',ADMIN_PLAN_RETIRE:'Plan retired',ADMIN_PLAN_RESTORE:'Plan in use again',ADMIN_PLAN_DELETE:'Plan deleted',
+  ADMIN_COMPANY_FEATURES:'Features changed for one customer',ADMIN_PAYMENT_ADD:'Payment recorded',ADMIN_PAYMENT_UPDATE:'Payment corrected',ADMIN_PAYMENT_DELETE:'Payment deleted',
+  ADMIN_FABRIC_CREATE:'Fabric Stock: company made',ADMIN_FABRIC_UPDATE:'Fabric Stock: licence changed',ADMIN_FABRIC_SUSPEND:'Fabric Stock: suspended',
   ADMIN_FABRIC_RESUME:'Fabric Stock: suspension lifted',ADMIN_FABRIC_ADMINUSER:'Fabric Stock: administrator set',ADMIN_FABRIC_USERSIGNOUT:'Fabric Stock: signed out',
   ADMIN_FABRIC_PASSCODE:'Fabric Stock: new company passcode',ADMIN_FABRIC_LINK:'Fabric Stock: linked to a company',ADMIN_FABRIC_APART:'Fabric Stock: kept apart',
   ADMIN_FABRIC_UNLINK:'Fabric Stock: link removed',ADMIN_FABRIC_DEVICE_REVOKE:'Fabric Stock: computer withdrawn',ADMIN_FABRIC_DEVICE_RESTORE:'Fabric Stock: computer given back',
@@ -2293,39 +2423,6 @@ async function gstMark(btn){
   if(r.error){say('<div class="msg err">'+esc(r.message||r.error)+'</div>');return;}
   await load();
 }
-async function createCo(){
-  const name=document.getElementById('nName').value.trim();
-  if(!name){say('<div class="msg err">A company name is required.</div>');return;}
-  /* 2026-10-07 (console) — which software: each one made in its own service, with its own licence key */
-  const soft=(document.getElementById('nSoft')||{}).value||'weight';
-  const seats=+document.getElementById('nSeats').value, days=+document.getElementById('nDays').value, grace=+document.getElementById('nGrace').value;
-  const gstin=document.getElementById('nGst').value.trim(), email=document.getElementById('nEmail').value.trim();
-  let made=null, fsMade=null;
-  if(soft!=='fabric'){
-    const r=await api('/admin/api/company',{method:'POST',body:JSON.stringify({
-      action:'create',name,plan:document.getElementById('nPlan').value,seats,days,graceDays:grace,gstin,email})});
-    if(r.error){say('<div class="msg err">'+esc(r.error)+'</div>');return;}
-    made=r.company;
-  }
-  if(soft!=='weight'){
-    let f;
-    try{f=await api('/admin/api/fabric',{method:'POST',body:JSON.stringify({action:'create',name,state:'LICENSED',seats,days,graceDays:Math.min(30,grace),
-      gstin:gstin||undefined,email:email||undefined,linkTo:made?made.id:undefined})});}catch(e){f={error:e.message};}
-    if(f.error){
-      if(made)await load();
-      say('<div class="msg err">'+(made?'<b>'+esc(made.name)+'</b> was made in Weight Calc, but Fabric Stock said: ':'Fabric Stock: ')+esc(f.message||f.error)+'</div>');
-      return;
-    }
-    fsMade=f.company;
-  }
-  document.getElementById('newco').style.display='none';
-  document.getElementById('nName').value='';document.getElementById('nEmail').value='';document.getElementById('nGst').value='';
-  await load();
-  say('<div class="msg ok"><b>'+esc(name)+'</b> created.'+
-    (made?' Weight Calc licence key <span class="key">'+esc(made.licence_key)+'</span>.':'')+
-    (fsMade?' Fabric Stock licence key <span class="key">'+esc(fsMade.licenceKey)+'</span>.':'')+
-    ' Give each key to the customer for its own software; every machine types it at activation.</div>');
-}
 /* ---------- every Nexora software in the one console (2026-10-07) ----------
    Owner 2026-10-07: "nexora console page single rahese badhi service tya thij update chalu bandh thase",
    and "દરેક software અલગ": each software keeps its own licence, key, period, seats, people and rights in
@@ -2343,7 +2440,7 @@ async function loadProducts(){
 function fabricProduct(){return PRODUCTS&&(PRODUCTS.products||[]).find(p=>p.id==='fabric')||null;}
 function fabricAll(){const p=fabricProduct();return p&&p.ok?(p.companies||[]):[];}
 function fabricOf(id){return fabricAll().find(f=>f.companyId!=null&&String(f.companyId)===String(id))||null;}
-/* Fabric Stock's companies with no Weight Calc company of their own (a second one on the same company is listed too) */
+/* Fabric Stock's companies with no Sales & Costing company of their own (a second one on the same company is listed too) */
 function fabricOnly(){
   const ids=new Set(((DATA&&DATA.companies)||[]).map(c=>String(c.id)));
   return fabricAll().filter(f=>f.companyId==null||!ids.has(String(f.companyId))||fabricOf(f.companyId)!==f);
@@ -2353,10 +2450,10 @@ function fsColour(f){return f.shownState==='LICENSED'?'var(--k-green)':f.shownSt
 function fsDays(f){return f.shownState==='EXPIRED'||f.shownState==='SUSPENDED'?'since '+fmt(f.expiresAt):(f.daysLeft===0?'ends today':f.daysLeft+' day'+(f.daysLeft===1?'':'s'));}
 function swPills(c){
   const f=fabricOf(c.id);
-  return '<span class="pill sw-weight" title="Nexora Bag Weight Calculation">Weight Calc</span> '+
+  return '<span class="pill sw-weight" title="Nexora Bag Weight Calculation">Sales & Costing</span> '+
     (f?'<span class="pill sw-fabric" title="Nexora Loom &amp; Fabric Stock — its own licence">Fabric Stock · '+esc(fsWord(f))+' · '+esc(fsDays(f))+'</span> ':'');
 }
-/* when Fabric Stock cannot be reached, the Weight Calc list is shown all the same, with this above it */
+/* when Fabric Stock cannot be reached, the Sales & Costing list is shown all the same, with this above it */
 function fabricNote(){
   const p=fabricProduct();
   if(!p)return COVIEW==='fabric'?'<p class="help">Reading Fabric Stock…</p>':'';
@@ -2384,7 +2481,7 @@ function fabricManage(f,c){
   if(!f){
     const loose=fabricOnly().filter(x=>x.companyId==null);
     return '<div class="group"><h4>Not used yet</h4><div class="acts">'+
-      '<span class="why" style="flex-basis:100%">'+esc(c.name)+' does not use Fabric Stock yet. It gets a licence of its own: starting it changes nothing in Weight Calc.</span>'+
+      '<span class="why" style="flex-basis:100%">'+esc(c.name)+' does not use Fabric Stock yet. It gets a licence of its own: starting it changes nothing in Sales & Costing.</span>'+
       '<button class="primary" data-wc="'+c.id+'" data-state="DEMO" onclick="fsStart(this)">Start a 7-day demo</button>'+
       '<button data-wc="'+c.id+'" data-state="LICENSED" onclick="fsStart(this)">Make licensed for 1 year</button>'+
       (loose.length?'<select id="fslink-'+c.id+'"><option value="">Link an existing Fabric Stock company…</option>'+loose.map(x=>'<option value="'+x.id+'">'+esc(x.name)+(x.gstin?' · '+esc(x.gstin):'')+'</option>').join('')+'</select><button data-wc="'+c.id+'" onclick="fsLinkPick(this)">Link</button>':'')+
@@ -2402,7 +2499,7 @@ function fabricManage(f,c){
       '<div id="fsdev-'+id+'" class="users-panel">'+(d&&!d.error?fsDevicesHtml(d.devices||[]):'<p class="help">Reading…</p>')+'</div>'+
     '</div></div>'+
     '<div class="group"><h4>People</h4><div class="acts">'+
-      '<button data-fid="'+id+'" data-name="'+esc(f.name)+'" onclick="fsAdmin(this)">Set administrator…</button><span class="why">the administrator adds everyone else and gives their rights inside Fabric Stock, apart from Weight Calc</span>'+
+      '<button data-fid="'+id+'" data-name="'+esc(f.name)+'" onclick="fsAdmin(this)">Set administrator…</button><span class="why">the administrator adds everyone else and gives their rights inside Fabric Stock, apart from Sales & Costing</span>'+
       '<button data-fid="'+id+'" data-login="'+esc(f.loginId||'')+'" onclick="fsPasscode(this)">New company passcode…</button>'+
       '<div id="fsppl-'+id+'" class="users-panel">'+(d&&!d.error?fsPeopleHtml(id,d.users||[]):'<p class="help">Reading…</p>')+'</div>'+
     '</div></div>'+
@@ -2415,13 +2512,13 @@ function fabricManage(f,c){
     '<div class="group"><h4>Stop</h4><div class="acts">'+
       (f.state==='SUSPENDED'
         ?'<button data-fid="'+id+'" data-action="resume" onclick="fsStop(this)">Restore</button><span class="why">every Fabric Stock computer and phone runs again</span>'
-        :'<button class="danger" data-fid="'+id+'" data-action="suspend" onclick="fsStop(this)">Suspend</button><span class="why">every Fabric Stock computer and phone stops at its next check; nothing is deleted, and Weight Calc is not touched</span>')+
+        :'<button class="danger" data-fid="'+id+'" data-action="suspend" onclick="fsStop(this)">Suspend</button><span class="why">every Fabric Stock computer and phone stops at its next check; nothing is deleted, and Sales & Costing is not touched</span>')+
     '</div></div>';
 }
 function linkSelect(f){
   const cos=(DATA&&DATA.companies)||[];
-  if(!cos.length)return '<span class="why">No Weight Calc company to link it to.</span>';
-  return '<select id="fswc-'+f.id+'"><option value="">Link to a Weight Calc company…</option>'+cos.map(c=>'<option value="'+c.id+'">'+esc(c.name)+(c.gstin?' · '+esc(c.gstin):'')+'</option>').join('')+'</select>'+
+  if(!cos.length)return '<span class="why">No Sales & Costing company to link it to.</span>';
+  return '<select id="fswc-'+f.id+'"><option value="">Link to a Sales & Costing company…</option>'+cos.map(c=>'<option value="'+c.id+'">'+esc(c.name)+(c.gstin?' · '+esc(c.gstin):'')+'</option>').join('')+'</select>'+
     '<button data-fid="'+f.id+'" onclick="fsLinkTo(this)">Link</button><span class="why">the same plant using both; each keeps its own licence</span>';
 }
 function fsPeopleHtml(fid,users){
@@ -2491,7 +2588,7 @@ function fsName(id){const f=fabricAll().find(x=>String(x.id)===String(id));retur
 async function fsStart(btn){
   const c=((DATA&&DATA.companies)||[]).find(x=>String(x.id)===String(btn.dataset.wc));if(!c)return;
   const demo=btn.dataset.state==='DEMO';
-  if(!confirm((demo?'Start a 7-day Fabric Stock demo':'Make a licensed Fabric Stock company for 1 year')+' for '+c.name+'?  It gets a Fabric Stock licence key of its own; Weight Calc is not touched.'))return;
+  if(!confirm((demo?'Start a 7-day Fabric Stock demo':'Make a licensed Fabric Stock company for 1 year')+' for '+c.name+'?  It gets a Fabric Stock licence key of its own; Sales & Costing is not touched.'))return;
   const r=await fsCall({action:'create',name:c.name,state:demo?'DEMO':'LICENSED',days:demo?7:365,seats:3,gstin:c.gstin||undefined,email:c.email||undefined,phone:c.phone||undefined,linkTo:c.id});
   if(r&&r.company)say('<div class="msg ok"><b>'+esc(c.name)+'</b> now has Fabric Stock. Its Fabric Stock licence key is <span class="key">'+esc(r.company.licenceKey)+'</span> — for Fabric Stock only.</div>');
 }
@@ -2499,7 +2596,7 @@ async function fsLicense(btn){
   if(!confirm('Make '+fsName(btn.dataset.fid)+' a licensed Fabric Stock customer for 1 year from today?'))return;
   await fsCall({action:'update',id:+btn.dataset.fid,state:'LICENSED',days:365},'Fabric Stock licensed for 1 year.');
 }
-/* Fabric Stock sets a new period FROM TODAY; to ADD days, as Weight Calc's buttons do, the days still left go
+/* Fabric Stock sets a new period FROM TODAY; to ADD days, as Sales & Costing's buttons do, the days still left go
    with them (an ended licence starts again from today) — the same as the phone console 1.9.0 */
 async function fsRenew(btn){
   const f=fabricAll().find(x=>String(x.id)===String(btn.dataset.fid));if(!f)return;
@@ -2552,7 +2649,7 @@ async function fsDevice(btn){
 }
 async function fsStop(btn){
   const stop=btn.dataset.action==='suspend';
-  if(stop&&!confirm('Suspend Fabric Stock for '+fsName(btn.dataset.fid)+'?  EVERY Fabric Stock computer and phone stops at its next check. Nothing is deleted, and Weight Calc is not touched; Restore puts it back.'))return;
+  if(stop&&!confirm('Suspend Fabric Stock for '+fsName(btn.dataset.fid)+'?  EVERY Fabric Stock computer and phone stops at its next check. Nothing is deleted, and Sales & Costing is not touched; Restore puts it back.'))return;
   await fsCall({action:btn.dataset.action,id:+btn.dataset.fid},stop?'Fabric Stock suspended.':'Fabric Stock restored.');
 }
 async function fsLink(btn){
@@ -2562,7 +2659,7 @@ async function fsLink(btn){
 }
 async function fsLinkTo(btn){
   const sel=document.getElementById('fswc-'+btn.dataset.fid);const to=sel&&sel.value;
-  if(!to){say('<div class="msg err">Choose the Weight Calc company first.</div>');return;}
+  if(!to){say('<div class="msg err">Choose the Sales & Costing company first.</div>');return;}
   await fsCall({action:'link',id:+btn.dataset.fid,companyId:+to},'Linked.');
   OPENF=null;OPEN=+to;renderCompanies();
 }
@@ -3064,4 +3161,862 @@ async function saveSettings(){
   await load();
 }
 try{const k=sessionStorage.getItem('nexora_admin_key');if(k){KEY=k;load();}}catch(e){}
+/* ==================================================================================================
+   2026-10-08 — THE CONSOLE AS SOFTWARE. Owner: "console ne software jevu banavanu che row type details
+   click and open window", one console for every software ("darek na plan pan alag … aena software wise
+   features"), plans the owner makes ("plan pan hu create kri saku darek software wise", "price open rakho"),
+   a customer's own changes over a plan ("ha"), and the record of payments and validity ("customer ni
+   validity payment kyare aavyu kya plan nu kayo plan expire thay che aena record").
+   Every list is a filter card, figures and one table of rows; a row opens its record in a window, read-only
+   until Edit (Ctrl+E here — Ctrl+W closes a browser tab). The older company actions (coAct, coDays,
+   coUsers, fsRenew, …) are used as they were, from the window's toolbar.
+   ================================================================================================== */
+let COVIEW='all';  /* read by fabricNote(), from the older card list */
+let PLANDATA=null, PAYDATA=null, WIN=null, CQUICK='all', VQUICK='all', PQUICK='all', CLIST=[], VLIST=[], PLIST=[], PLLIST=[], SELKEY={};
+const NL=String.fromCharCode(13,10);
+const C_={back:'linear-gradient(135deg,#475569,#64748b)',green:'linear-gradient(135deg,#10b981,#34d399)',blue:'linear-gradient(135deg,#2563eb,#60a5fa)',
+  orange:'linear-gradient(135deg,#f97316,#fb923c)',amber:'linear-gradient(135deg,#f59e0b,#fbbf24)',lime:'linear-gradient(135deg,#65a30d,#84cc16)',
+  violet:'linear-gradient(135deg,#6d28d9,#8b5cf6)',pink:'linear-gradient(135deg,#db2777,#f472b6)',red:'linear-gradient(135deg,#dc2626,#f87171)',
+  slate:'linear-gradient(135deg,#475569,#94a3b8)',teal:'linear-gradient(135deg,#0d9488,#2dd4bf)'};
+const SEC_INFO={
+  'sec-dashboard':['Dashboard','Every Nexora software at a glance','Dashboard','Click a figure or a row','to open it.'],
+  'sec-companies':['Customers','Every plant, with each Nexora software it uses — each software its own licence','Customers','Click a row to open it','Esc closes, Ctrl+E edits.'],
+  'sec-validity':['Validity & renewals','Every licence of every software — the one ending first at the top','Validity','Which plan ends when','click a row for its customer.'],
+  'sec-payments':['Payments','What each customer paid, for which software and plan, and the validity it bought','Payments','Record payment','can renew the licence in the same step.'],
+  'sec-sw-weight':['Sales & Costing','Nexora Bag Weight Calculation — its customers, its plans and its payments','Sales & Costing','Click a row','for the customer, on this software.'],
+  'sec-sw-fabric':['Fabric Stock','Nexora Loom & Fabric Stock — its customers, its plans and its payments','Fabric Stock','Click a row','for the customer, on this software.'],
+  'sec-plans':['Software & plans','Each software has its own plans and its own features — never mixed','Software & plans','New plan','is one click; a price can stay open.'],
+  'sec-inquiries':['Enquiries','The leads, before they are customers','Enquiries','',''],
+  'sec-feedback':['Feedback & problems','Reports and screenshots sent from the application','Feedback','',''],
+  'sec-broadcast':['Message plants','A message in every plant’s company chat','Message plants','',''],
+  'sec-installations':['Installations','Every computer and phone of every Sales & Costing company','Installations','',''],
+  'appcard':['Phone app','The phone console’s own releases','Phone app','',''],
+  'sec-activity':['Activity','What was done from this console and the phone console, newest first','Activity','Read-only',''],
+  'settings':['Service settings','They apply to every installation from its next check','Settings','','']
+};
+const SEC_TOOLS={
+  'sec-dashboard':[['Refresh','↻',C_.green,'refresh'],'|',['New customer','+',C_.green,'newCustomer'],['Record payment','₹',C_.teal,'newPayment'],['New plan','◫',C_.violet,'newPlan']],
+  'sec-companies':[['New','+',C_.green,'newCustomer'],['Open','▭',C_.blue,'openSel'],'|',['Record payment','₹',C_.teal,'newPayment'],'|',['Excel','▦',C_.lime,'csvCustomers'],['Print','⎙',C_.slate,'print'],'|',['Refresh','↻',C_.green,'refresh']],
+  'sec-validity':[['Open','▭',C_.blue,'openSel'],['Record payment','₹',C_.teal,'newPayment'],'|',['Excel','▦',C_.lime,'csvValidity'],['Print','⎙',C_.slate,'print'],'|',['Refresh','↻',C_.green,'refresh']],
+  'sec-payments':[['Record payment','₹',C_.green,'newPayment'],['Open','▭',C_.blue,'openSel'],'|',['Excel','▦',C_.lime,'csvPayments'],['Print','⎙',C_.slate,'print'],'|',['Refresh','↻',C_.green,'refresh']],
+  'sec-sw-weight':[['New customer','+',C_.green,'swNew'],['Open','▭',C_.blue,'openSel'],'|',['Record payment','₹',C_.teal,'swPay'],['New plan','◫',C_.violet,'swPlan'],'|',['Excel','▦',C_.lime,'swCsv'],['Print','⎙',C_.slate,'print'],'|',['Refresh','↻',C_.green,'refresh']],
+  'sec-sw-fabric':[['New customer','+',C_.green,'swNew'],['Open','▭',C_.blue,'openSel'],'|',['Record payment','₹',C_.teal,'swPay'],['New plan','◫',C_.violet,'swPlan'],'|',['Excel','▦',C_.lime,'swCsv'],['Print','⎙',C_.slate,'print'],'|',['Refresh','↻',C_.green,'refresh']],
+  'sec-plans':[['New plan','+',C_.green,'newPlan'],['Open','▭',C_.blue,'openSel'],'|',['Print','⎙',C_.slate,'print'],'|',['Refresh','↻',C_.green,'refresh']],
+  def:[['Refresh','↻',C_.green,'refresh'],['Print','⎙',C_.slate,'print']]
+};
+function tbHtml(items,attr){return items.map(x=>x==='|'?'<span class="tsep"></span>':'<button class="tbi" '+(attr||'data-tool')+'="'+x[3]+'"'+(x[4]?' disabled':'')+' title="'+esc(x[0])+'"><span class="sq" style="background:'+x[2]+'">'+x[1]+'</span>'+esc(x[0])+'</button>').join('');}
+function shellFor(id){
+  const i=SEC_INFO[id]||[id,'','','',''];
+  const t=document.getElementById('ptitle');if(!t)return;
+  t.textContent=i[0];document.getElementById('psub').textContent=i[1];
+  document.getElementById('phint').innerHTML=i[2]?'<i>'+esc(i[2])+'</i><b>'+esc(i[3])+'</b>'+esc(i[4]):'';
+  document.getElementById('phint').style.display=i[2]?'':'none';
+  document.getElementById('tbar').innerHTML=tbHtml(SEC_TOOLS[id]||SEC_TOOLS.def);
+  if(id==='sec-dashboard')renderDashboard();
+  if(id==='sec-validity')renderValidity();
+  if(id==='sec-payments')renderPayments();
+  if(id==='sec-plans')renderPlanList();
+  if(id.indexOf('sec-sw-')===0)renderSoftware(id.slice(7));
+}
+function curSw(){const s=curSec();return s==='sec-sw-fabric'?'fabric':'weight';}
+function curSec(){const a=document.querySelector('#jump .tab.active');return a?a.dataset.sec:'sec-companies';}
+document.addEventListener('click',e=>{
+  const t=e.target.closest&&e.target.closest('[data-tool]');
+  if(t&&!t.disabled){runTool(t.dataset.tool);return;}
+  const w=e.target.closest&&e.target.closest('[data-wtool]');
+  if(w&&!w.disabled){winTool(w.dataset.wtool);return;}
+  const r=e.target.closest&&e.target.closest('tr[data-open]');
+  if(r){const k=r.dataset.open;r.parentNode.querySelectorAll('tr.on').forEach(x=>x.classList.remove('on'));r.classList.add('on');SELKEY[curSec()]=k;openRow(k);}
+});
+function openRow(k){
+  const p=k.split(':');
+  if(p[0]==='c')openCustomer(p[1],p[2]||'',p[3]||'');
+  else if(p[0]==='p')openPayment(+p[1]);
+  else if(p[0]==='pl')openPlan(p[1],p[2]);
+}
+function runTool(k){
+  if(k==='refresh')return refreshNow();
+  if(k==='print')return window.print();
+  if(k==='newCustomer')return openNewCustomer();
+  if(k==='newPayment')return openPayment(0,WIN&&WIN.type==='cust'?presetFromWin():null);
+  if(k==='newPlan')return openPlan(document.getElementById('plSoft')&&document.getElementById('plSoft').value||'weight','');
+  if(k==='openSel'){const s=SELKEY[curSec()];if(s)openRow(s);else say('<div class="msg warn">Click a row first.</div>');return;}
+  if(k==='swNew')return openNewCustomer(curSw());
+  if(k==='swPay')return openPayment(0,{software:curSw()});
+  if(k==='swPlan')return openPlan(curSw(),'');
+  if(k==='swCsv')return csvSoftware(curSw());
+  if(k==='csvCustomers')return csvCustomers();
+  if(k==='csvValidity')return csvValidity();
+  if(k==='csvPayments')return csvPayments();
+}
+/* the clock in the corner, as in the application */
+function tick(){const d=new Date();const a=document.getElementById('sDate'),b=document.getElementById('sTime');if(!a)return;
+  a.textContent=d.toLocaleDateString(undefined,{day:'2-digit',month:'short',year:'numeric'});b.textContent=d.toLocaleTimeString(undefined,{hour:'2-digit',minute:'2-digit'});}
+setInterval(tick,20000);setTimeout(tick,50);
+document.addEventListener('keydown',e=>{
+  if(!WIN)return;
+  if(e.key==='Escape'){e.preventDefault();closeWin();}
+  else if((e.ctrlKey||e.metaKey)&&(e.key==='e'||e.key==='E')){e.preventDefault();winTool('edit');}
+  else if((e.ctrlKey||e.metaKey)&&(e.key==='s'||e.key==='S')){e.preventDefault();winTool('save');}
+});
+
+/* ---------- the data the new screens read ---------- */
+async function loadPlans(){try{PLANDATA=await api('/admin/api/plans');}catch(e){PLANDATA=null;}
+  const n=document.getElementById('jump-plans');if(n)n.textContent=allPlans().length;
+  if(curSec()==='sec-plans')renderPlanList();renderCompanies();if(WIN&&WIN.type==='plan')renderPlanWin();}
+async function loadPayments(){try{PAYDATA=await api('/admin/api/payments');}catch(e){PAYDATA={payments:[],totals:{count:0,amount:0,bySoftware:{}}};}
+  const n=document.getElementById('jump-pay');if(n)n.textContent=(PAYDATA.payments||[]).length;
+  const s=curSec();if(s.indexOf('sec-sw-')===0)renderSoftware(curSw());if(s==='sec-payments')renderPayments();if(s==='sec-validity')renderValidity();if(s==='sec-dashboard')renderDashboard();
+  if(WIN&&WIN.type==='cust'&&!WIN.edit)renderWin();}
+function softBlock(id){return PLANDATA&&PLANDATA.software?PLANDATA.software.find(s=>s.id===id):null;}
+function wPlans(){const b=softBlock('weight');return b?b.plans:((DATA.settings&&DATA.settings.plans)||[]);}
+function fPlans(){const b=softBlock('fabric');return b&&b.supported?b.plans:[];}
+function allPlans(){return wPlans().map(p=>Object.assign({sw:'weight'},p)).concat(fPlans().map(p=>Object.assign({sw:'fabric'},p)));}
+function wFeatures(){const b=softBlock('weight');return b?b.features:Object.keys(PLAN_LABELS).map(id=>({id,label:PLAN_LABELS[id],group:'Features'}));}
+function planOf(sw,code){const c=String(code||'').toUpperCase();return (sw==='weight'?wPlans():fPlans()).find(p=>p.code===c)||null;}
+function planNameOf(sw,code){const p=planOf(sw,code);if(p)return p.name;const c=String(code||(sw==='fabric'?'STANDARD':'PRO'));return c.charAt(0)+c.slice(1).toLowerCase().replace(/_/g,' ');}
+function rupees(n){return n==null||n===''?'—':'₹'+Number(n).toLocaleString('en-IN',{maximumFractionDigits:2});}
+function isoToday(){const d=new Date();return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');}
+function dayNum(iso){return iso?Math.floor(new Date(iso).getTime()/86400000):null;}
+
+/* ---------- one customer, every software ---------- */
+function wState(c){return c.state==='SUSPENDED'?'SUSPENDED':c.expired?'EXPIRED':c.is_demo?'DEMO':'LICENSED';}
+function fState(f){return f.shownState||'LICENSED';}
+function stCls(s){return s==='LICENSED'?'c-ok':s==='DEMO'?'c-demo':s==='EXPIRED'?'c-warn':'c-bad';}
+function stWord(s){return s==='LICENSED'?'licensed':s==='DEMO'?'demo':s==='EXPIRED'?'ended':'suspended';}
+function daysText(state,left,at){return state==='SUSPENDED'?'suspended':state==='EXPIRED'?'ended '+fmt(at):(state==='DEMO'?'demo · ':'')+(left===0?'ends today':left+' day'+(left===1?'':'s'));}
+function ovCount(c){const o=c&&c.feature_overrides&&typeof c.feature_overrides==='object'?c.feature_overrides:{};return Object.keys(o).length;}
+function customers(){
+  const out=[];
+  (DATA.companies||[]).forEach(c=>{const f=fabricOf(c.id);out.push({key:'w'+c.id,name:c.name,gstin:c.gstin||'',email:c.email||'',phone:c.phone||'',w:c,f:f||null,self:!!c.self_registered,since:c.created_at});});
+  fabricOnly().forEach(f=>out.push({key:'f'+f.id,name:f.name,gstin:f.gstin||'',email:f.email||'',phone:f.phone||'',w:null,f:f,self:!!f.selfRegistered,since:f.createdAt}));
+  out.forEach(x=>{
+    const subs=[];
+    if(x.w)subs.push({sw:'weight',state:wState(x.w),at:x.w.expires_at,left:x.w.days_left});
+    if(x.f)subs.push({sw:'fabric',state:fState(x.f),at:x.f.expiresAt,left:x.f.daysLeft});
+    x.subs=subs;
+    const live=subs.filter(s=>s.state!=='SUSPENDED').sort((a,b)=>new Date(a.at)-new Date(b.at));
+    x.next=live[0]||null;
+    x.soon=subs.some(s=>s.state!=='SUSPENDED'&&s.state!=='EXPIRED'&&s.left<=30);
+  });
+  return out;
+}
+function custByKey(k){return customers().find(x=>x.key===k)||null;}
+function swCell(sw,x){
+  if(sw==='weight'){const c=x.w;if(!c)return '<span class="c-none">— not taken</span>';const s=wState(c),n=ovCount(c);
+    return '<b>'+esc(planNameOf('weight',c.plan))+(n?' <span style="color:var(--accent)">± '+n+'</span>':'')+'</b><small class="'+stCls(s)+'">'+esc(daysText(s,c.days_left,c.expires_at))+'</small>';}
+  const f=x.f;
+  if(!f){const p=fabricProduct();return '<span class="c-none">'+(p&&!p.ok?'not connected':'— not taken')+'</span>';}
+  const s=fState(f);return '<b>'+esc(planNameOf('fabric',f.plan))+'</b><small class="'+stCls(s)+'">'+esc(daysText(s,f.daysLeft,f.expiresAt))+'</small>';
+}
+function coView(v){CQUICK=v==='deleted'?'deleted':v==='ending'?'soon':'all';renderCompanies();}
+function plQuick(sw){document.getElementById('plSoft').value=sw;renderPlanList();}
+function clearPlanFilter(){document.getElementById('plSoft').value='';document.getElementById('plq').value='';renderPlanList();}
+function clearCustomerFilter(){['cq','cFrom','cTo'].forEach(i=>{document.getElementById(i).value='';});['cSoft','cPlan','cState'].forEach(i=>{document.getElementById(i).value='';});CQUICK='all';renderCompanies();}
+function cQuick(v){CQUICK=v;renderCompanies();}
+/* renderCompanies is what every older action calls after it has changed something (load() → here):
+   the list is drawn again, and the open window with it */
+function renderCompanies(){
+  const host=document.getElementById('colist');if(!host)return;
+  const term=(document.getElementById('cq').value||'').toLowerCase().trim();
+  const soft=document.getElementById('cSoft').value, plan=document.getElementById('cPlan').value, st=document.getElementById('cState').value;
+  const from=document.getElementById('cFrom').value, to=document.getElementById('cTo').value;
+  const ps=document.getElementById('cPlan');const keep=ps.value;
+  ps.innerHTML='<option value="">Any plan</option>'+wPlans().map(p=>'<option value="weight:'+esc(p.code)+'">Sales & Costing · '+esc(p.name)+'</option>').join('')+fPlans().map(p=>'<option value="fabric:'+esc(p.code)+'">Fabric Stock · '+esc(p.name)+'</option>').join('');
+  ps.value=keep;
+  const all=customers(), arch=DATA.archived||[];
+  const count=(fn)=>all.filter(fn).length;
+  const Q=[['all','All',all.length],['soon','Renew in 30 days',count(x=>x.soon)],['demo','On a demo',count(x=>x.subs.some(s=>s.state==='DEMO'))],['both','Both software',count(x=>x.w&&x.f)],
+    ['susp','Suspended',count(x=>x.subs.some(s=>s.state==='SUSPENDED'))],['self','Self-registered',count(x=>x.self)],['deleted','Deleted',arch.length]];
+  document.getElementById('cQuick').innerHTML='<span>Quick:</span>'+Q.map(q=>'<span class="qb'+(CQUICK===q[0]?' on':'')+'" onclick="cQuick(this.dataset.q)" data-q="'+q[0]+'">'+q[1]+'<i>'+q[2]+'</i></span>').join('');
+  const jc=document.getElementById('jump-co');if(jc){jc.textContent=all.length;jc.className=all.length?'':'zero';}
+  const ws=all.filter(x=>x.w).map(x=>wState(x.w)), fs=all.filter(x=>x.f).map(x=>fState(x.f));
+  const n=(arr,s)=>arr.filter(v=>v===s).length;
+  const fp=fabricProduct();
+  document.getElementById('cFigs').innerHTML=
+    '<div class="fig f1"><span>Sales & Costing</span><b>'+ws.length+'</b><small>'+n(ws,'LICENSED')+' licensed · '+n(ws,'DEMO')+' demo · '+n(ws,'SUSPENDED')+' suspended</small></div>'+
+    '<div class="fig f2"><span>Fabric Stock</span><b>'+(fp&&fp.ok?fs.length:'—')+'</b><small>'+(fp&&fp.ok?n(fs,'LICENSED')+' licensed · '+n(fs,'DEMO')+' demo · '+n(fs,'SUSPENDED')+' suspended':(fp?'not connected':'reading…'))+'</small></div>'+
+    '<div class="fig f3"><span>Renew in 30 days</span><b>'+count(x=>x.soon)+'</b><small>a licence of theirs ends within 30 days</small></div>'+
+    '<div class="fig f4"><span>Using both</span><b>'+count(x=>x.w&&x.f)+'</b><small>Sales & Costing + Fabric Stock</small></div>';
+  if(CQUICK==='deleted'){document.getElementById('cCount').textContent=arch.length+' deleted';document.getElementById('cListTitle').textContent='Deleted companies';host.innerHTML=archivedHtml(arch,term);CLIST=[];return;}
+  document.getElementById('cListTitle').textContent='Every customer';
+  const rows=all.filter(x=>{
+    if(term&&![x.name,x.gstin,x.email,x.phone,x.w&&x.w.licence_key,x.w&&x.w.login_id,x.f&&x.f.licenceKey,x.f&&x.f.loginId].some(v=>String(v||'').toLowerCase().includes(term)))return false;
+    if(soft==='weight'&&!x.w)return false;if(soft==='fabric'&&!x.f)return false;if(soft==='both'&&!(x.w&&x.f))return false;
+    if(plan){const p=plan.split(':');if(p[0]==='weight'&&!(x.w&&String(x.w.plan||'PRO').toUpperCase()===p[1]))return false;if(p[0]==='fabric'&&!(x.f&&String(x.f.plan||'STANDARD').toUpperCase()===p[1]))return false;}
+    if(st&&!x.subs.some(s=>s.state===st))return false;
+    if(from&&!(x.next&&String(x.next.at).slice(0,10)>=from))return false;
+    if(to&&!(x.next&&String(x.next.at).slice(0,10)<=to))return false;
+    if(CQUICK==='soon'&&!x.soon)return false;if(CQUICK==='demo'&&!x.subs.some(s=>s.state==='DEMO'))return false;if(CQUICK==='both'&&!(x.w&&x.f))return false;
+    if(CQUICK==='susp'&&!x.subs.some(s=>s.state==='SUSPENDED'))return false;if(CQUICK==='self'&&!x.self)return false;
+    return true;
+  }).sort((a,b)=>(a.next&&b.next?new Date(a.next.at)-new Date(b.next.at):(a.next?-1:b.next?1:0))||a.name.localeCompare(b.name));
+  CLIST=rows.map(x=>x.key);
+  const people=rows.reduce((s,x)=>s+(x.w?(+x.w.users_total||0):0)+(x.f?(+x.f.people||0):0),0);
+  document.getElementById('cCount').textContent=rows.length+' customer'+(rows.length===1?'':'s');
+  document.getElementById('cNote').textContent=people+' people on seats · '+(DATA.licences||[]).length+' Sales & Costing computers and phones';
+  host.innerHTML=fabricNote()+(rows.length?'<table class="rec"><thead><tr><th>Customer</th><th>GSTIN</th><th><span class="swd w"></span>Sales & Costing</th><th><span class="swd f"></span>Fabric Stock</th><th><span class="swd j"></span>Jobwork</th><th class="num">People</th><th>Next renewal</th></tr></thead><tbody>'+
+    rows.map(x=>'<tr data-open="c:'+x.key+'"'+(SELKEY['sec-companies']==='c:'+x.key?' class="on"':'')+'><td><b>'+esc(x.name)+'</b><small>'+(x.self?'self-registered · ':'')+(x.w&&x.f?(x.f.linkedBy==='gstin'?'linked by GSTIN':'linked by hand'):'')+'</small></td>'+
+      '<td>'+esc(x.gstin||'—')+'</td><td>'+swCell('weight',x)+'</td><td>'+swCell('fabric',x)+'</td><td><span class="c-none">coming</span></td>'+
+      '<td class="num">'+(x.w?(+x.w.users_total||0):'—')+' + '+(x.f?(+x.f.people||0):'—')+'</td>'+
+      '<td>'+(x.next?'<b class="'+(x.soon?'c-warn':'')+'">'+fmt(x.next.at)+'</b><small>'+(x.subs.length>1&&x.subs.every(s=>String(s.at).slice(0,10)===String(x.next.at).slice(0,10))?'both software':(x.next.sw==='weight'?'Sales & Costing':'Fabric Stock'))+'</small>':'—')+'</td></tr>').join('')+
+    '</tbody></table>':'<div class="empty">No customer matches. Clear the filter, or make one with New.</div>');
+  if(WIN&&WIN.type==='cust'&&!WIN.edit)renderWin();
+  if(curSec()==='sec-validity')renderValidity();
+  if(curSec()==='sec-dashboard')renderDashboard();
+  if(curSec().indexOf('sec-sw-')===0)renderSoftware(curSw());
+}
+
+/* ---------- the window ---------- */
+function showWin(html){document.getElementById('winLayer').innerHTML=html;}
+function closeWin(){
+  if(WIN&&WIN.edit&&!confirm('Close without saving the changes?'))return;
+  WIN=null;OPEN=null;OPENF=null;document.getElementById('winLayer').innerHTML='';
+}
+function initials(n){return String(n||'?').split(/[ .]+/).filter(Boolean).slice(0,2).map(w=>w.charAt(0).toUpperCase()).join('')||'N';}
+function fv(label,val,raw){return '<div class="fl"><span>'+esc(label)+'</span><div class="ro">'+(raw?val:esc(val==null||val===''?'—':val))+'</div></div>';}
+function fin(label,id,val,type,extra){return '<div class="fl"><span>'+esc(label)+'</span><input id="'+id+'" type="'+(type||'text')+'" value="'+esc(val==null?'':val)+'"'+(extra||'')+'></div>';}
+function openCustomer(key,sw,sub){
+  const x=custByKey(key);if(!x){say('<div class="msg err">That customer is no longer there.</div>');return;}
+  WIN={type:'cust',key,sw:sw||(x.w?'weight':'fabric'),sub:sub||'licence',edit:false,draft:{}};
+  renderWin();
+}
+function presetFromWin(){const x=custByKey(WIN.key);if(!x)return null;return {key:x.key,software:WIN.sw==='fabric'&&x.f?'fabric':(x.w?'weight':'fabric')};}
+let PEOPLE_KEPT={};
+function renderWin(){
+  if(!WIN||WIN.type!=='cust')return;
+  let x=custByKey(WIN.key);
+  if(!x&&WIN.fid){x=customers().find(c=>c.f&&String(c.f.id)===String(WIN.fid))||null;if(x)WIN.key=x.key;}
+  if(!x){WIN=null;document.getElementById('winLayer').innerHTML='';return;}
+  if(WIN.sw==='weight'&&!x.w&&!WIN.adding)WIN.sw='fabric';
+  if(WIN.sw==='fabric'&&!x.f&&!x.w)WIN.sw='weight';
+  WIN.fid=x.f?x.f.id:null;
+  OPEN=x.w?x.w.id:null;OPENF=x.f?x.f.id:null;
+  const ph=x.w?document.getElementById('users-'+x.w.id):null;if(ph&&!/Reading/.test(ph.innerHTML))PEOPLE_KEPT[x.w.id]=ph.innerHTML;
+  const W=WIN.sw==='weight', c=x.w, f=x.f, E=WIN.edit;
+  const i=CLIST.indexOf(x.key);
+  let tools=[['Edit','✎',C_.blue,'edit',E||(W?!c:!f)],['Save','💾',C_.green,'save',!E],['Cancel','✕',C_.back,'cancel',!E],'|',['Previous','‹',C_.back,'prev',i<=0],['Next','›',C_.back,'next',i<0||i>=CLIST.length-1],'|'];
+  if(W&&c){const s=wState(c);tools=tools.concat([
+    s==='DEMO'?['Make licensed','✓',C_.green,'w-licence']:['Add days','+',C_.orange,'w-days'],['+1 year','+1',C_.amber,'w-year'],['Plan','◫',C_.violet,'w-plan'],['Seats','☺',C_.teal,'w-seats'],
+    s==='SUSPENDED'?['Restore','▶',C_.green,'w-restore']:['Suspend','⏸',C_.red,'w-suspend'],['New key','⚿',C_.violet,'w-rekey'],'|',['Record payment','₹',C_.teal,'pay']]);}
+  if(!W&&f){const s=fState(f);tools=tools.concat([
+    s==='DEMO'?['Make licensed','✓',C_.green,'f-licence']:['Add days','+',C_.orange,'f-days'],['+1 year','+1',C_.amber,'f-year'],['Seats','☺',C_.teal,'f-seats'],
+    s==='SUSPENDED'?['Restore','▶',C_.green,'f-restore']:['Suspend','⏸',C_.red,'f-suspend'],'|',['Record payment','₹',C_.teal,'pay']]);}
+  tools=tools.concat(['|',['Close','✕',C_.back,'close']]);
+  const subs=W?[['licence','Licence'],['features','Features'],['people','People'],['computers','Computers & phones'],['payments','Payments'],['more','More'],['history','History']]
+             :[['licence','Licence'],['people','People'],['computers','Computers & phones'],['payments','Payments'],['company','Company'],['history','History']];
+  if(!subs.some(s=>s[0]===WIN.sub))WIN.sub='licence';
+  const payN=custPayments(x).length;
+  const head='<div class="wtitle"><span class="av">'+esc(initials(x.name))+'</span><div><h2>'+esc(x.name)+'<span class="mode'+(E?' edit':'')+'">'+(E?'EDIT':'DISPLAY')+'</span></h2>'+
+    '<small>Customer · '+x.subs.length+' software'+(x.since?' · since '+fmt(x.since):'')+(x.self?' · registered by the plant itself':'')+'</small></div><div class="wx"><button data-wtool="close" title="Close (Esc)">✕</button></div></div>';
+  const idRow=(E&&W&&c)
+    ?'<div class="card"><div class="fgrid five">'+fin('Name','e-name',c.name)+fin('GSTIN','e-gstin',c.gstin||'','text',' maxlength="15" style="text-transform:uppercase"')+fv('Email',c.email)+fv('Mobile',c.phone)+fin('Note','e-note',c.notes||'')+'</div></div>'
+    :(E&&!W&&f)
+    ?'<div class="card"><div class="fgrid five">'+fin('Name','e-name',f.name)+fin('GSTIN','e-gstin',f.gstin||'','text',' maxlength="15" style="text-transform:uppercase"')+fin('Email','e-email',f.email||'')+fin('Mobile','e-phone',f.phone||'')+fin('Note','e-note',f.notes||'')+'</div></div>'
+    :'<div class="card"><div class="fgrid five">'+fv('Name',x.name)+fv('GSTIN',x.gstin?(x.gstin+(c&&c.gst_status==='VERIFIED'?' · verified':'')):'—')+fv('Email',x.email)+fv('Mobile',x.phone)+fv('Note',(W&&c?c.notes:(f&&f.notes))||'—')+'</div></div>';
+  const tabs='<div class="swtabs">'+
+    (c?'<button class="swt w'+(W?' on':'')+'" data-wtool="sw-weight"><span class="b">⚖</span><span><b>Sales & Costing</b><small>'+esc(planNameOf('weight',c.plan))+(ovCount(c)?' ± '+ovCount(c):'')+' · '+esc(daysText(wState(c),c.days_left,c.expires_at))+'</small></span></button>'
+       :'<button class="swt add" data-wtool="add-weight">+ Add Sales & Costing</button>')+
+    (f?'<button class="swt f'+(!W?' on':'')+'" data-wtool="sw-fabric"><span class="b">▤</span><span><b>Fabric Stock</b><small>'+esc(planNameOf('fabric',f.plan))+' · '+esc(daysText(fState(f),f.daysLeft,f.expiresAt))+'</small></span></button>'
+       :'<button class="swt add'+(!W?' on':'')+'" data-wtool="sw-fabric">+ Add Fabric Stock</button>')+
+    '<span class="swt j soon"><span class="b">⚙</span><span><b>Jobwork</b><small>coming — no licence yet</small></span></span></div>';
+  const subt=(W?c:f)?'<div class="subt">'+subs.map(s=>'<button class="'+(WIN.sub===s[0]?'on':'')+'" data-wtool="sub-'+s[0]+'">'+s[1]+(s[0]==='payments'&&payN?'<small>'+payN+'</small>':'')+(s[0]==='features'&&c&&ovCount(c)?'<small>± '+ovCount(c)+'</small>':'')+'</button>').join('')+'</div>':'';
+  let body='';
+  if(W&&!c)body='<div class="card"><h3>'+esc(x.name)+' does not use Sales & Costing yet</h3><p class="help">It gets a licence of its own; Fabric Stock is not touched.</p><div class="acts"><button class="primary" data-wtool="start-weight">Make licensed for 1 year</button></div></div>';
+  else if(!W&&!f)body='<div class="card">'+(c?fabricManage(null,c):'')+'</div>';
+  else body=W?wBody(x,c):fBody(x,f);
+  showWin('<div class="win">'+head+'<div class="tbar">'+tbHtml(tools,'data-wtool')+'</div><div class="wbody">'+idRow+tabs+subt+body+'</div></div>');
+  if(W&&c&&WIN.sub==='people'){const h=document.getElementById('users-'+c.id);if(h&&PEOPLE_KEPT[c.id])h.innerHTML=PEOPLE_KEPT[c.id];coUsers({dataset:{id:c.id}},true);}
+  if(!W&&f&&(WIN.sub==='people'||WIN.sub==='computers')&&!FDETAIL[f.id])fabricDetail(f.id);
+  if(WIN.sub==='history')loadHistory(x,W);
+}
+function wBody(x,c){
+  const E=WIN.edit, s=wState(c), sub=WIN.sub;
+  if(sub==='licence'){
+    const plans=wPlans().filter(p=>p.active!==false||p.code===String(c.plan||'PRO').toUpperCase());
+    const g=[
+      E?'<div class="fl"><span>Plan</span><select id="e-plan">'+plans.map(p=>'<option value="'+esc(p.code)+'"'+(p.code===String(c.plan||'PRO').toUpperCase()?' selected':'')+'>'+esc(p.name)+(p.note?' — '+esc(p.note):'')+(p.active===false?' (retired)':'')+'</option>').join('')+'</select></div>'
+       :fv('Plan',planNameOf('weight',c.plan)+(c.is_demo?' — a demo has every feature':'')),
+      fv('State','<b class="'+stCls(s)+'">'+stWord(s)+'</b>',true),
+      fv('Licence key','<code>'+esc(c.licence_key)+'</code> <button class="small" data-key="'+esc(c.licence_key)+'" onclick="copyKey(this)">Copy</button>',true),
+      fv('Company id (sign-in)',c.login_id||'—'),
+      fv(c.is_demo?'Demo started':'Licence started',fmt(c.period_started_at)+(c.period_days?' · '+c.period_days+'-day '+(c.is_demo?'demo':'licence'):'')),
+      fv(s==='EXPIRED'?'Ended':'Ends','<b'+(c.ending_soon?' class="c-warn"':'')+'>'+fmt(c.expires_at)+'</b>'+(s==='LICENSED'||s==='DEMO'?' · '+(c.days_left===0?'ends today':c.days_left+' days left'):''),true),
+      E?fin('Seats (people)','e-seats',c.seats,'number',' min="1" max="500"'):fv('Seats (people)',(+c.users_total||0)+' of '+c.seats+((+c.seats)-(+c.users_total||0)>0?' · '+((+c.seats)-(+c.users_total||0))+' free':' · full')),
+      E?fin('Offline days','e-grace',c.grace_days,'number',' min="0" max="365"'):fv('Offline days',c.grace_days>0?c.grace_days+' days':'none'),
+      E?fin('Nexora AI a day (0 = the service’s)','e-ai',c.ai_daily_limit||0,'number',' min="0"'):fv('Nexora AI a day',c.ai_daily_limit?c.ai_daily_limit:(DATA.aiDefaultDaily&&DATA.aiDefaultDaily<100000?DATA.aiDefaultDaily+' (the service’s)':'no limit')),
+      E?fin('Transaction limit (0 = none)','e-txn',c.txn_limit||0,'number',' min="0"'):fv('Transaction limit',c.txn_limit?c.txn_limit:'none'),
+      fv('Self-registered',c.self_registered?'yes · '+fmt(c.registered_at)+(c.registered_ip?' · '+c.registered_ip:''):'no'),
+      fv('GST check',c.gstin?(c.gst_status==='VERIFIED'?'verified':c.gst_status==='FAILED'?'failed':'not yet verified'):'no GSTIN')
+    ];
+    return '<div class="card"><div class="fgrid">'+g.join('')+'</div></div>'+
+      '<div class="figs"><div class="fig f1"><span>Computers &amp; phones</span><b>'+(c.machines_used||0)+'</b><small>not counted against seats</small></div>'+
+      '<div class="fig f2"><span>Nexora AI today</span><b>'+(c.ai_used_today||0)+'</b><small>'+(c.ai_daily_limit?'of '+c.ai_daily_limit+' a day':'questions asked today')+'</small></div>'+
+      '<div class="fig f3"><span>Transactions</span><b>'+(+c.txn_used||0)+'</b><small>'+(c.txn_limit?'of '+c.txn_limit:'no limit')+'</small></div>'+
+      '<div class="fig f4"><span>Hours in use</span><b>'+hoursText(c.usage_minutes)+'</b><small>summed over its machines</small></div></div>';
+  }
+  if(sub==='features'){
+    const plan=planOf('weight',c.plan)||{features:{}};
+    const own=Object.assign({},c.feature_overrides||{});
+    if(E)Object.keys(WIN.draft).forEach(k=>{if(WIN.draft[k]===null)delete own[k];else own[k]=WIN.draft[k];});
+    const feats=wFeatures(), groups=[];
+    feats.forEach(fe=>{if(groups.indexOf(fe.group)<0)groups.push(fe.group);});
+    groups.sort((a,b)=>GROUP_ORDER.indexOf(a)-GROUP_ORDER.indexOf(b));
+    let fromPlan=0,added=0,off=0,onN=0;
+    const cell=fe=>{
+      const p=plan.features[fe.id]===true, o=own[fe.id], eff=typeof o==='boolean'?o:p;
+      const cls=o===true&&!p?'add':o===false&&p?'off':p?'plan':'no';
+      if(p)fromPlan++;if(cls==='add')added++;if(cls==='off')off++;if(eff)onN++;
+      return '<button class="fx '+cls+(eff?' on':'')+'" data-wtool="feat-'+fe.id+'"'+(E?'':' disabled')+'><span class="cb">'+(eff?'✓':'')+'</span><span class="nm">'+esc(fe.label)+'</span><span class="tg">'+({plan:'from plan',add:'+ added',off:'− off',no:'not in plan'})[cls]+'</span></button>';
+    };
+    const grid=groups.map(g=>'<div class="fgh">'+esc(g)+'</div><div class="feat">'+feats.filter(fe=>fe.group===g).map(cell).join('')+'</div>').join('');
+    return '<div class="card" style="padding:10px 14px"><div class="sumline"><span><b>'+esc(plan.name||planNameOf('weight',c.plan))+'</b> gives '+fromPlan+' of '+feats.length+'</span>'+
+      '<span style="color:var(--accent);font-weight:700">+'+added+' added for '+esc(c.name)+'</span><span class="c-bad">−'+off+' turned off</span><span>→ <b>'+onN+' on</b></span><span style="flex:1"></span>'+
+      (c.is_demo?'<span class="sub">A demo has every feature; these apply once it is licensed.</span>':'<span class="sub">'+(E?'Click a feature to add it or take it off for this customer only.':'Grey until Edit (Ctrl+E). The plan itself stays as it is.')+'</span>')+
+      (E?'<button class="small" data-wtool="feat-reset">Back to the plan only</button>':'')+'</div></div><div class="card">'+grid+'</div>';
+  }
+  if(sub==='people')return '<div class="card"><div class="acts" style="margin-bottom:10px">'+
+      '<button data-id="'+c.id+'" data-name="'+esc(c.name)+'" onclick="coAdmin(this)">Set administrator…</button>'+
+      '<button data-id="'+c.id+'" data-name="'+esc(c.name)+'" data-login="'+esc(c.login_id||'')+'" onclick="coPasscode(this)">New company passcode…</button>'+
+      '<button data-id="'+c.id+'" data-name="'+esc(c.name)+'" onclick="coUsers(this)">Refresh</button><span class="why">the administrator adds everyone else and gives their rights inside Sales & Costing</span></div>'+
+      '<div id="users-'+c.id+'" class="users-panel"><p class="help">Reading…</p></div></div>';
+  if(sub==='computers')return '<div class="card"><div class="acts" style="margin-bottom:10px"><button data-id="'+c.id+'" onclick="closeWin();showInstallations(this)">Show in Installations</button><span class="why">computers and phones take no seat; withdraw one to stop that machine</span></div><div class="users-panel">'+machinesHtml(c)+'</div></div>';
+  if(sub==='payments')return payTab(x,'weight');
+  if(sub==='more')return '<div class="card">'+
+      (c.gstin?'<div class="group"><h4>GST</h4><div class="acts"><button data-id="'+c.id+'" onclick="gstVerify(this)">Verify online</button>'+(c.gst_status!=='VERIFIED'?'<button data-id="'+c.id+'" data-status="VERIFIED" onclick="gstMark(this)">Mark checked by hand</button>':'<button data-id="'+c.id+'" data-status="UNVERIFIED" onclick="gstMark(this)">Take the verified mark off</button>')+'</div></div>':'')+
+      '<div class="group"><h4>Masters</h4><div class="acts"><button data-id="'+c.id+'" onclick="coHistory(this)">Earlier copies…</button><span class="why">materials, routes, processes, recipes as they were before a change or a delete — any one can be put back</span><div id="hist-'+c.id+'" class="users-panel" style="display:none"></div></div></div>'+
+      '<div class="group"><h4>Usage</h4><div class="acts"><button data-id="'+c.id+'" data-name="'+esc(c.name)+'" onclick="coReset(this)">Reset usage</button><span class="why">count and hours from zero; nothing saved is touched</span></div></div>'+
+      '<div class="group"><h4>Stop</h4><div class="acts">'+(c.state==='SUSPENDED'?'<button data-id="'+c.id+'" data-action="restore" data-days="0" onclick="coAct(this)">Restore</button>':'<button class="danger" data-id="'+c.id+'" data-action="suspend" data-days="0" onclick="coAct(this)">Suspend</button>')+
+      '<button class="danger" data-id="'+c.id+'" data-name="'+esc(c.name)+'" onclick="coDelete(this)">Delete…</button><span class="why">stops it now and keeps it 30 days (Restore under Deleted); then it and everything that belongs to it are erased</span></div></div></div>';
+  return '<div class="card"><div id="whist"><p class="help">Reading…</p></div></div>';
+}
+function fBody(x,f){
+  const E=WIN.edit, s=fState(f), sub=WIN.sub, p=fabricProduct();
+  if(p&&!p.ok)return '<div class="card">'+fabricNote()+'</div>';
+  const d=FDETAIL[f.id];
+  if(sub==='licence'){
+    const g=[
+      fv('Plan',planNameOf('fabric',f.plan)+(f.isDemo?' — a demo has everything':'')),
+      fv('State','<b class="'+stCls(s)+'">'+stWord(s)+'</b>',true),
+      fv('Licence key','<code>'+esc(f.licenceKey)+'</code> <button class="small" data-key="'+esc(f.licenceKey)+'" onclick="copyKey(this)">Copy</button>',true),
+      fv('Company id (sign-in)',f.loginId||'—'),
+      fv(f.isDemo?'Demo started':'Licence started',fmt(f.periodStartedAt||f.createdAt)+(f.periodDays?' · '+f.periodDays+'-day '+(f.isDemo?'demo':'licence'):'')),
+      fv(s==='EXPIRED'?'Ended':'Ends','<b'+(f.endingSoon?' class="c-warn"':'')+'>'+fmt(f.expiresAt)+'</b>'+(s==='LICENSED'||s==='DEMO'?' · '+(f.daysLeft===0?'ends today':f.daysLeft+' days left'):''),true),
+      E?fin('Seats (people)','e-seats',f.seats,'number',' min="1" max="500"'):fv('Seats (people)',(+f.people||0)+' of '+f.seats),
+      E?fin('Offline days (0–30)','e-grace',f.graceDays,'number',' min="0" max="30"'):fv('Offline days',f.graceDays>0?f.graceDays+' days':'none')
+    ];
+    const sb=softBlock('fabric');
+    return '<div class="card"><div class="fgrid">'+g.join('')+'</div></div>'+
+      '<div class="figs"><div class="fig f1"><span>Computers &amp; phones</span><b>'+(+f.devices||0)+'</b><small>not counted against seats</small></div>'+
+      '<div class="fig f2"><span>People</span><b>'+(+f.people||0)+'</b><small>of '+f.seats+' seats</small></div>'+
+      '<div class="fig f3"><span>Linked</span><b style="font-size:16px">'+(x.w?(f.linkedBy==='gstin'?'same GSTIN':'by hand'):'Fabric Stock only')+'</b><small>'+(x.w?'shown with its Sales & Costing company':'not with a Sales & Costing company')+'</small></div>'+
+      '<div class="fig f4"><span>Plans</span><b style="font-size:16px">'+(sb&&sb.supported?'its own':'Standard')+'</b><small>'+(sb&&sb.supported?'made under Software & plans':'Fabric Stock has no plans yet')+'</small></div></div>';
+  }
+  if(sub==='people')return '<div class="card"><div class="acts" style="margin-bottom:10px"><button data-fid="'+f.id+'" data-name="'+esc(f.name)+'" onclick="fsAdmin(this)">Set administrator…</button>'+
+      '<button data-fid="'+f.id+'" data-login="'+esc(f.loginId||'')+'" onclick="fsPasscode(this)">New company passcode…</button><span class="why">the administrator adds everyone else and gives their rights inside Fabric Stock, apart from Sales & Costing</span></div>'+
+      '<div id="fsppl-'+f.id+'" class="users-panel">'+(d&&!d.error?fsPeopleHtml(f.id,d.users||[]):'<p class="help">Reading…</p>')+'</div></div>';
+  if(sub==='computers')return '<div class="card"><div id="fsdev-'+f.id+'" class="users-panel">'+(d&&!d.error?fsDevicesHtml(d.devices||[]):'<p class="help">Reading…</p>')+'</div></div>';
+  if(sub==='payments')return payTab(x,'fabric');
+  if(sub==='company')return '<div class="card"><div class="group"><h4>Which customer</h4><div class="acts">'+
+      (x.w?(f.linkedBy==='gstin'?'<span class="why">Shown with '+esc(x.w.name)+' because the GSTIN is the same.</span><button data-fid="'+f.id+'" data-action="apart" onclick="fsLink(this)">Not the same company</button>'
+                                :'<span class="why">Linked to '+esc(x.w.name)+' by hand.</span><button data-fid="'+f.id+'" data-action="unlink" onclick="fsLink(this)">Unlink</button>')
+          :linkSelect(f))+'</div></div>'+
+      '<div class="group"><h4>Stop</h4><div class="acts">'+(f.state==='SUSPENDED'?'<button data-fid="'+f.id+'" data-action="resume" onclick="fsStop(this)">Restore</button>':'<button class="danger" data-fid="'+f.id+'" data-action="suspend" onclick="fsStop(this)">Suspend</button>')+
+      '<span class="why">every Fabric Stock computer and phone stops at its next check; nothing is deleted, and Sales & Costing is not touched</span></div></div></div>';
+  return '<div class="card"><div id="whist"><p class="help">Reading…</p></div></div>';
+}
+async function loadHistory(x,W){
+  let r;try{r=await api('/admin/api/events?admin=1&limit=500');}catch(e){r={events:[]};}
+  const host=document.getElementById('whist');if(!host)return;
+  const cid=x.w?String(x.w.id):null, fid=x.f?String(x.f.id):null;
+  const rows=(r.events||[]).filter(ev=>{const d=ev.detail&&typeof ev.detail==='object'?ev.detail:{};
+    if(W)return cid&&(String(d.id)===cid||String(d.companyId)===cid)&&String(ev.event).indexOf('ADMIN_FABRIC_')<0;
+    return fid&&(String(d.fabricId)===fid||(String(ev.event).indexOf('ADMIN_PAYMENT_')===0&&String(d.fabricId)===fid));});
+  host.innerHTML=rows.length?'<table class="mini-tbl"><thead><tr><th>When</th><th>What</th><th>Details</th><th>From</th></tr></thead><tbody>'+rows.map(ev=>{
+    const d=ev.detail&&typeof ev.detail==='object'?ev.detail:{};const via=d.via||{};
+    const rest=Object.keys(d).filter(k=>k!=='via'&&k!=='id'&&k!=='companyId'&&k!=='fabricId').map(k=>k+': '+(d[k]!==null&&typeof d[k]==='object'?JSON.stringify(d[k]):String(d[k]))).join(' · ');
+    return '<tr><td class="why">'+esc(fmtTime(ev.at))+'</td><td><b>'+esc(ACT_WORDS[ev.event]||ev.event)+'</b></td><td class="why">'+esc(rest.slice(0,300))+'</td><td class="why">'+esc(via.app==='android'?'phone console':via.app?'web console':'the service')+'</td></tr>';}).join('')+'</tbody></table>'
+    :'<p class="help">Nothing done from the consoles on this licence yet (the Activity list keeps the last 500 entries).</p>';
+}
+function custPayments(x){return (PAYDATA&&PAYDATA.payments||[]).filter(p=>(x.w&&p.companyId===String(x.w.id))||(x.f&&p.fabricId===String(x.f.id)));}
+function payTab(x,sw){
+  const list=custPayments(x).filter(p=>p.software===sw);
+  const total=list.reduce((s,p)=>s+(p.amount||0),0);
+  return '<div class="card"><div class="ctitle"><h3>'+(sw==='weight'?'Sales & Costing':'Fabric Stock')+' payments · '+list.length+' · '+rupees(total)+'</h3><button class="primary small" data-wtool="pay">+ Record payment</button></div>'+
+    (list.length?'<table class="rec"><thead><tr><th>Paid on</th><th>For</th><th>Plan</th><th class="num">Amount</th><th>How</th><th>Reference</th><th>Validity it bought</th></tr></thead><tbody>'+
+      list.map(p=>'<tr data-open="p:'+p.id+'"><td><b>'+fmt(p.paidOn)+'</b></td><td>'+esc(KIND_WORDS[p.kind]||p.kind)+'</td><td>'+esc(p.planName||p.plan||'—')+'</td><td class="num"><b>'+rupees(p.amount)+'</b></td><td>'+esc(p.mode||'—')+'</td><td>'+esc(p.reference||'—')+'</td><td>'+(p.validTo?(p.validFrom?fmt(p.validFrom)+' → ':'to ')+'<b>'+fmt(p.validTo)+'</b>':'<span class="c-none">—</span>')+'</td></tr>').join('')+'</tbody></table>'
+      :'<p class="help">No payment recorded for this software yet. <b>Record payment</b> keeps when it came, how much, for which plan, and can renew the licence in the same step.</p>')+'</div>';
+}
+const GROUP_ORDER=['Calculation','Sales','Cost tools','Output','Company','Other','Features'];
+const KIND_WORDS={NEW:'New customer',RENEWAL:'Renewal',EXTRA_USERS:'Extra users',UPGRADE:'Plan upgrade',OTHER:'Other'};
+async function winTool(k){
+  if(!WIN)return;
+  if(WIN.type==='plan')return planTool(k);
+  if(WIN.type==='pay')return payTool(k);
+  if(WIN.type==='newcust')return newCustTool(k);
+  const x=custByKey(WIN.key);if(!x&&k!=='close')return closeWin();
+  const c=x&&x.w, f=x&&x.f;
+  if(k==='close')return closeWin();
+  if(k.indexOf('sub-')===0){if(WIN.edit&&!confirm('Leave Edit without saving?'))return;WIN.edit=false;WIN.draft={};WIN.sub=k.slice(4);return renderWin();}
+  if(k==='sw-weight'||k==='sw-fabric'){if(WIN.edit&&!confirm('Leave Edit without saving?'))return;WIN.edit=false;WIN.draft={};WIN.sw=k.slice(3);return renderWin();}
+  if(k==='prev'||k==='next'){if(WIN.edit&&!confirm('Leave Edit without saving?'))return;const i=CLIST.indexOf(WIN.key);const j=k==='prev'?i-1:i+1;if(j>=0&&j<CLIST.length){const sub=WIN.sub;openCustomer(CLIST[j],'',sub);}return;}
+  if(k==='edit'){WIN.edit=true;WIN.draft={};if(WIN.sub!=='licence'&&WIN.sub!=='features')WIN.sub='licence';return renderWin();}
+  if(k==='cancel'){WIN.edit=false;WIN.draft={};return renderWin();}
+  if(k==='save')return saveCustomer(x);
+  if(k.indexOf('feat-')===0&&WIN.edit){
+    const id=k.slice(5);
+    if(id==='reset'){wFeatures().forEach(fe=>{WIN.draft[fe.id]=null;});return renderWin();}
+    const plan=planOf('weight',c.plan)||{features:{}};const p=plan.features[id]===true;
+    const own=Object.assign({},c.feature_overrides||{});Object.keys(WIN.draft).forEach(z=>{if(WIN.draft[z]===null)delete own[z];else own[z]=WIN.draft[z];});
+    const eff=typeof own[id]==='boolean'?own[id]:p;const next=!eff;
+    WIN.draft[id]=next===p?null:next;return renderWin();
+  }
+  if(k==='pay')return openPayment(0,{key:x.key,software:WIN.sw==='fabric'&&f?'fabric':(c?'weight':'fabric')});
+  if(k==='add-weight')return startWeightFor(x);
+  if(k==='start-weight')return startWeightFor(x);
+  if(c&&k==='w-days')return coDays({dataset:{id:String(c.id)}});
+  if(c&&k==='w-year'){if(!confirm('Add a year to Sales & Costing for '+c.name+'?'))return;return coAct({dataset:{id:String(c.id),action:'extend',days:'365'}});}
+  if(c&&k==='w-licence'){if(!confirm('Make '+c.name+' a licensed Sales & Costing customer for 1 year?'))return;return coAct({dataset:{id:String(c.id),action:'licence',days:'365'}});}
+  if(c&&k==='w-suspend')return coAct({dataset:{id:String(c.id),action:'suspend',days:'0'}});
+  if(c&&k==='w-restore')return coAct({dataset:{id:String(c.id),action:'restore',days:'0'}});
+  if(c&&k==='w-rekey')return coRekey({dataset:{id:String(c.id),name:c.name}});
+  if(c&&(k==='w-plan'||k==='w-seats')){WIN.sub='licence';WIN.edit=true;WIN.draft={};renderWin();const el=document.getElementById(k==='w-plan'?'e-plan':'e-seats');if(el)el.focus();return;}
+  if(f&&k==='f-days')return fsRenew({dataset:{fid:String(f.id)}});
+  if(f&&k==='f-year')return fsRenew({dataset:{fid:String(f.id),days:'365'}});
+  if(f&&k==='f-licence')return fsLicense({dataset:{fid:String(f.id)}});
+  if(f&&k==='f-suspend')return fsStop({dataset:{fid:String(f.id),action:'suspend'}});
+  if(f&&k==='f-restore')return fsStop({dataset:{fid:String(f.id),action:'resume'}});
+  if(f&&k==='f-seats'){WIN.sub='licence';WIN.edit=true;WIN.draft={};renderWin();const el=document.getElementById('e-seats');if(el)el.focus();return;}
+}
+function val(id){const n=document.getElementById(id);return n?n.value:undefined;}
+async function saveCustomer(x){
+  const W=WIN.sw==='weight', c=x.w, f=x.f;
+  const post=(body)=>api('/admin/api/company',{method:'POST',body:JSON.stringify(body)});
+  const errs=[];
+  try{
+    if(W&&c){
+      const nm=val('e-name'),gs=val('e-gstin'),nt=val('e-note'),pl=val('e-plan'),se=val('e-seats'),gr=val('e-grace'),ai=val('e-ai'),tx=val('e-txn');
+      const steps=[];
+      if(nm!==undefined&&nm.trim()&&nm.trim()!==c.name)steps.push({id:c.id,action:'rename',name:nm.trim()});
+      if(gs!==undefined&&gs.trim().toUpperCase()!==String(c.gstin||''))steps.push({id:c.id,action:'gstin',gstin:gs.trim().toUpperCase()});
+      if(nt!==undefined&&nt!==String(c.notes||''))steps.push({id:c.id,action:'note',notes:nt});
+      if(pl!==undefined&&pl!==String(c.plan||'PRO').toUpperCase())steps.push({id:c.id,action:'plan',plan:pl});
+      if(se!==undefined&&+se!==+c.seats)steps.push({id:c.id,action:'seats',seats:+se});
+      if(gr!==undefined&&+gr!==+c.grace_days)steps.push({id:c.id,action:'grace',graceDays:+gr});
+      if(ai!==undefined&&+ai!==+(c.ai_daily_limit||0))steps.push({id:c.id,action:'ailimit',aiDailyLimit:+ai});
+      if(tx!==undefined&&+tx!==+(c.txn_limit||0))steps.push({id:c.id,action:'txnlimit',txnLimit:+tx});
+      const ch={};Object.keys(WIN.draft).forEach(k=>{ch[k]=WIN.draft[k];});
+      if(Object.keys(ch).length)steps.push({id:c.id,action:'features',overrides:ch});
+      for(const s of steps){const r=await post(s);if(r.error)errs.push(r.error);if(r.warning)errs.push(r.warning);}
+    }else if(f){
+      const body={action:'update',id:f.id};
+      const nm=val('e-name'),gs=val('e-gstin'),em=val('e-email'),phn=val('e-phone'),nt=val('e-note'),se=val('e-seats'),gr=val('e-grace');
+      if(nm!==undefined&&nm.trim()&&nm.trim()!==f.name)body.name=nm.trim();
+      if(gs!==undefined&&gs.trim().toUpperCase()!==String(f.gstin||''))body.gstin=gs.trim().toUpperCase();
+      if(em!==undefined&&em.trim()!==String(f.email||''))body.email=em.trim();
+      if(phn!==undefined&&phn.trim()!==String(f.phone||''))body.phone=phn.trim();
+      if(nt!==undefined&&nt!==String(f.notes||''))body.notes=nt;
+      if(se!==undefined&&+se!==+f.seats)body.seats=+se;
+      if(gr!==undefined&&+gr!==+f.graceDays)body.graceDays=+gr;
+      if(Object.keys(body).length>2){const r=await api('/admin/api/fabric',{method:'POST',body:JSON.stringify(body)});if(r.error)errs.push('Fabric Stock: '+(r.message||r.error));}
+    }
+  }catch(e){errs.push(e.message);}
+  WIN.edit=false;WIN.draft={};
+  if(errs.length)say('<div class="msg err">'+errs.map(esc).join('<br>')+'</div>');else say('<div class="msg ok">Saved.</div>');
+  await load();if(!W)await loadProducts();renderWin();
+}
+async function startWeightFor(x){
+  const f=x.f;if(!f)return;
+  if(!confirm('Make '+f.name+' a licensed Sales & Costing customer for 1 year?  It gets a Sales & Costing licence key of its own; Fabric Stock is not touched.'))return;
+  const r=await api('/admin/api/company',{method:'POST',body:JSON.stringify({action:'create',name:f.name,gstin:f.gstin||'',email:f.email||'',phone:f.phone||'',seats:f.seats||1,days:365,plan:'PRO'})});
+  if(r.error){say('<div class="msg err">'+esc(r.error)+'</div>');return;}
+  await api('/admin/api/fabric',{method:'POST',body:JSON.stringify({action:'link',id:f.id,companyId:r.company.id})});
+  say('<div class="msg ok"><b>'+esc(f.name)+'</b> now has Sales & Costing. Its Sales & Costing licence key is <span class="key">'+esc(r.company.licence_key)+'</span>.</div>');
+  WIN.key='w'+r.company.id;WIN.sw='weight';await load();await loadProducts();
+}
+
+/* ---------- validity & renewals ---------- */
+function vQuick(v){VQUICK=v;renderValidity();}
+function clearValidityFilter(){['vq','vFrom','vTo'].forEach(i=>{document.getElementById(i).value='';});document.getElementById('vSoft').value='';VQUICK='all';renderValidity();}
+function lastPay(sw,x){const l=custPayments(x).filter(p=>p.software===sw);return l[0]||null;}
+function validityRows(){
+  const out=[];
+  customers().forEach(x=>{
+    if(x.w)out.push({x,sw:'weight',plan:planNameOf('weight',x.w.plan),state:wState(x.w),start:x.w.period_started_at,ends:x.w.expires_at,left:x.w.days_left,seats:x.w.seats,pay:lastPay('weight',x)});
+    if(x.f)out.push({x,sw:'fabric',plan:planNameOf('fabric',x.f.plan),state:fState(x.f),start:x.f.periodStartedAt||x.f.createdAt,ends:x.f.expiresAt,left:x.f.daysLeft,seats:x.f.seats,pay:lastPay('fabric',x)});
+  });
+  return out.sort((a,b)=>new Date(a.ends)-new Date(b.ends));
+}
+function renderValidity(){
+  const host=document.getElementById('vlist');if(!host)return;
+  const all=validityRows();
+  const term=(document.getElementById('vq').value||'').toLowerCase().trim(), soft=document.getElementById('vSoft').value, from=document.getElementById('vFrom').value, to=document.getElementById('vTo').value;
+  const live=r=>r.state==='LICENSED'||r.state==='DEMO';
+  const Q=[['all','All',all.length],['30','Ending in 30 days',all.filter(r=>live(r)&&r.left<=30).length],['7','In 7 days',all.filter(r=>live(r)&&r.left<=7).length],['ended','Ended',all.filter(r=>r.state==='EXPIRED').length],['demo','Demos',all.filter(r=>r.state==='DEMO').length],['susp','Suspended',all.filter(r=>r.state==='SUSPENDED').length]];
+  document.getElementById('vQuick').innerHTML='<span>Quick:</span>'+Q.map(q=>'<span class="qb'+(VQUICK===q[0]?' on':'')+'" data-q="'+q[0]+'" onclick="vQuick(this.dataset.q)">'+q[1]+'<i>'+q[2]+'</i></span>').join('');
+  const n30=all.filter(r=>live(r)&&r.left<=30).length;
+  const jv=document.getElementById('jump-val');if(jv){jv.textContent=n30;jv.className=n30?'':'zero';}
+  document.getElementById('vFigs').innerHTML=
+    '<div class="fig f3"><span>Ending in 7 days</span><b>'+all.filter(r=>live(r)&&r.left<=7).length+'</b><small>ring them now</small></div>'+
+    '<div class="fig f1"><span>Ending in 30 days</span><b>'+n30+'</b><small>'+all.filter(r=>r.state==='LICENSED'&&r.left<=30).length+' paying · '+all.filter(r=>r.state==='DEMO'&&r.left<=30).length+' demos</small></div>'+
+    '<div class="fig f4"><span>Ended, not renewed</span><b>'+all.filter(r=>r.state==='EXPIRED').length+'</b><small>read-only until renewed</small></div>'+
+    '<div class="fig f2"><span>Licences</span><b>'+all.length+'</b><small>'+all.filter(r=>r.sw==='weight').length+' Sales & Costing · '+all.filter(r=>r.sw==='fabric').length+' Fabric Stock</small></div>';
+  const rows=all.filter(r=>{
+    if(term&&![r.x.name,r.x.gstin].some(v=>String(v||'').toLowerCase().includes(term)))return false;
+    if(soft&&r.sw!==soft)return false;
+    const d=String(r.ends||'').slice(0,10);if(from&&d<from)return false;if(to&&d>to)return false;
+    if(VQUICK==='30'&&!(live(r)&&r.left<=30))return false;if(VQUICK==='7'&&!(live(r)&&r.left<=7))return false;
+    if(VQUICK==='ended'&&r.state!=='EXPIRED')return false;if(VQUICK==='demo'&&r.state!=='DEMO')return false;if(VQUICK==='susp'&&r.state!=='SUSPENDED')return false;
+    return true;});
+  VLIST=rows;
+  document.getElementById('vCount').textContent=rows.length+' licence'+(rows.length===1?'':'s');
+  host.innerHTML=rows.length?'<table class="rec"><thead><tr><th>Customer</th><th>Software</th><th>Plan</th><th>State</th><th>Started</th><th>Ends</th><th class="num">Days left</th><th class="num">Seats</th><th>Last payment</th></tr></thead><tbody>'+
+    rows.map(r=>'<tr data-open="c:'+r.x.key+':'+r.sw+':payments"><td><b>'+esc(r.x.name)+'</b></td><td><span class="swd '+(r.sw==='weight'?'w':'f')+'"></span>'+(r.sw==='weight'?'Sales & Costing':'Fabric Stock')+'</td><td>'+esc(r.plan)+'</td>'+
+      '<td class="'+stCls(r.state)+'">'+stWord(r.state)+'</td><td>'+fmt(r.start)+'</td><td><b>'+fmt(r.ends)+'</b></td>'+
+      '<td class="num '+(live(r)&&r.left<=30?'c-warn':'')+'">'+(live(r)?r.left:'—')+'</td><td class="num">'+(r.seats||'—')+'</td>'+
+      '<td>'+(r.pay?'<b>'+rupees(r.pay.amount)+'</b><small>'+fmt(r.pay.paidOn)+' · '+esc(KIND_WORDS[r.pay.kind]||r.pay.kind)+'</small>':'<span class="c-none">none recorded</span>')+'</td></tr>').join('')+'</tbody></table>'
+    :'<div class="empty">Nothing in this view.</div>';
+}
+
+/* ---------- payments ---------- */
+function pQuick(v){PQUICK=v;renderPayments();}
+function clearPaymentFilter(){['pq','pFrom','pTo'].forEach(i=>{document.getElementById(i).value='';});['pSoft','pKind'].forEach(i=>{document.getElementById(i).value='';});PQUICK='all';renderPayments();}
+function renderPayments(){
+  const host=document.getElementById('plist');if(!host)return;
+  const all=(PAYDATA&&PAYDATA.payments)||[];
+  const term=(document.getElementById('pq').value||'').toLowerCase().trim(), soft=document.getElementById('pSoft').value, kind=document.getElementById('pKind').value;
+  let from=document.getElementById('pFrom').value, to=document.getElementById('pTo').value;
+  const t=isoToday(), m=t.slice(0,8)+'01', y=(+t.slice(5,7)>=4?t.slice(0,4):String(+t.slice(0,4)-1))+'-04-01';
+  if(PQUICK==='today'){from=t;to=t;}if(PQUICK==='month'){from=m;to=t;}if(PQUICK==='fy'){from=y;to=t;}
+  const d30=new Date(Date.now()-30*86400000);const l30=d30.getFullYear()+'-'+String(d30.getMonth()+1).padStart(2,'0')+'-'+String(d30.getDate()).padStart(2,'0');
+  if(PQUICK==='30'){from=l30;to=t;}
+  document.getElementById('pQuick').innerHTML='<span>Quick:</span>'+[['all','All'],['today','Today'],['30','Last 30 days'],['month','This month'],['fy','This financial year']].map(q=>'<span class="qb'+(PQUICK===q[0]?' on':'')+'" data-q="'+q[0]+'" onclick="pQuick(this.dataset.q)">'+q[1]+'</span>').join('');
+  const rows=all.filter(p=>{
+    if(term&&![p.customer,p.reference,p.note,p.planName].some(v=>String(v||'').toLowerCase().includes(term)))return false;
+    if(soft&&p.software!==soft)return false;if(kind&&p.kind!==kind)return false;
+    if(from&&p.paidOn<from)return false;if(to&&p.paidOn>to)return false;return true;});
+  PLIST=rows;
+  const sum=a=>a.reduce((s,p)=>s+(p.amount||0),0);
+  document.getElementById('pCount').textContent=rows.length+' payment'+(rows.length===1?'':'s')+' · '+rupees(sum(rows));
+  document.getElementById('pNote').textContent=from||to?(from?fmt(from):'…')+' → '+(to?fmt(to):'…'):'';
+  document.getElementById('pFigs').innerHTML=
+    '<div class="fig f1"><span>Sales & Costing</span><b>'+rupees(sum(rows.filter(p=>p.software==='weight')))+'</b><small>'+rows.filter(p=>p.software==='weight').length+' payments</small></div>'+
+    '<div class="fig f2"><span>Fabric Stock</span><b>'+rupees(sum(rows.filter(p=>p.software==='fabric')))+'</b><small>'+rows.filter(p=>p.software==='fabric').length+' payments</small></div>'+
+    '<div class="fig f3"><span>Renewals</span><b>'+rupees(sum(rows.filter(p=>p.kind==='RENEWAL')))+'</b><small>'+rows.filter(p=>p.kind==='RENEWAL').length+' renewals</small></div>'+
+    '<div class="fig f4"><span>New customers</span><b>'+rupees(sum(rows.filter(p=>p.kind==='NEW')))+'</b><small>'+rows.filter(p=>p.kind==='NEW').length+' first payments</small></div>';
+  host.innerHTML=rows.length?'<table class="rec"><thead><tr><th>Paid on</th><th>Customer</th><th>Software</th><th>Plan</th><th>For</th><th class="num">Amount</th><th>How</th><th>Reference</th><th>Validity it bought</th></tr></thead><tbody>'+
+    rows.map(p=>'<tr data-open="p:'+p.id+'"'+(SELKEY['sec-payments']==='p:'+p.id?' class="on"':'')+'><td><b>'+fmt(p.paidOn)+'</b></td><td><b>'+esc(p.customer)+'</b></td><td><span class="swd '+(p.software==='weight'?'w':'f')+'"></span>'+(p.software==='weight'?'Sales & Costing':'Fabric Stock')+'</td><td>'+esc(p.planName||p.plan||'—')+'</td>'+
+      '<td>'+esc(KIND_WORDS[p.kind]||p.kind)+'</td><td class="num"><b>'+rupees(p.amount)+'</b></td><td>'+esc(p.mode||'—')+'</td><td>'+esc(p.reference||'—')+'</td>'+
+      '<td>'+(p.validTo?(p.validFrom?fmt(p.validFrom)+' → ':'to ')+'<b>'+fmt(p.validTo)+'</b>':'<span class="c-none">—</span>')+'</td></tr>').join('')+
+    '</tbody><tfoot><tr><td colspan="5">Total</td><td class="num">'+rupees(sum(rows))+'</td><td colspan="3"></td></tr></tfoot></table>'
+    :'<div class="empty">No payment in this view. <b>Record payment</b> keeps one.</div>';
+}
+function openPayment(id,preset){
+  const p=id?((PAYDATA&&PAYDATA.payments)||[]).find(z=>z.id===id):null;
+  if(id&&!p){say('<div class="msg err">That payment is no longer there.</div>');return;}
+  WIN={type:'pay',id:id||0,edit:!id,preset:preset||null,back:WIN&&WIN.type==='cust'?{key:WIN.key,sw:WIN.sw,sub:'payments'}:null};
+  renderPayWin();
+}
+function payCustomers(){return customers().map(x=>({key:x.key,name:x.name,w:x.w,f:x.f}));}
+function renderPayWin(){
+  const p=WIN.id?((PAYDATA&&PAYDATA.payments)||[]).find(z=>z.id===WIN.id):null, E=WIN.edit, N=!p;
+  const pre=WIN.preset||{};
+  let custSel='', swSel='', planText='', extend='';
+  if(N){
+    const cs=payCustomers();
+    const first=pre.software?cs.find(c=>pre.software==='weight'?c.w:c.f):null;
+    const ck=pre.key||(first&&first.key)||(cs[0]&&cs[0].key)||'';
+    custSel='<div class="fl"><span>Customer</span><select id="p-cust" onchange="WIN.preset=Object.assign({},WIN.preset||{},{key:this.value,software:null});renderPayWin()">'+cs.map(c=>'<option value="'+c.key+'"'+(c.key===ck?' selected':'')+'>'+esc(c.name)+'</option>').join('')+'</select></div>';
+    const cx=cs.find(c=>c.key===ck)||{};
+    const sws=[];if(cx.w)sws.push('weight');if(cx.f)sws.push('fabric');
+    const sw=sws.indexOf(pre.software)>=0?pre.software:(sws[0]||'weight');
+    swSel='<div class="fl"><span>Software</span><select id="p-sw" onchange="WIN.preset=Object.assign({},WIN.preset||{},{key:document.getElementById(&quot;p-cust&quot;).value,software:this.value});renderPayWin()">'+sws.map(s=>'<option value="'+s+'"'+(s===sw?' selected':'')+'>'+(s==='weight'?'Sales & Costing':'Fabric Stock')+'</option>').join('')+'</select></div>';
+    const lic=sw==='weight'?cx.w:cx.f;
+    const st=lic?(sw==='weight'?wState(lic):fState(lic)):'';
+    planText=lic?fv('Plan',planNameOf(sw,lic.plan)+' · '+stWord(st)+' · ends '+fmt(sw==='weight'?lic.expires_at:lic.expiresAt)):fv('Plan','—');
+    extend='<div class="fl"><span>Renew the licence with it</span><select id="p-ext"><option value="0">No — only record the payment</option><option value="365" selected>Yes — 1 year'+(st==='DEMO'?' (makes it licensed)':' added')+'</option><option value="730">Yes — 2 years</option><option value="180">Yes — 6 months</option><option value="30">Yes — 30 days</option></select></div>';
+  }
+  const v=(k,d)=>p?(p[k]==null?'':p[k]):(d==null?'':d);
+  const kindSel='<div class="fl"><span>For</span>'+(E?'<select id="p-kind">'+Object.keys(KIND_WORDS).map(k=>'<option value="'+k+'"'+((p?p.kind:'RENEWAL')===k?' selected':'')+'>'+KIND_WORDS[k]+'</option>').join('')+'</select>':'<div class="ro">'+esc(KIND_WORDS[p.kind]||p.kind)+'</div>')+'</div>';
+  const modeSel='<div class="fl"><span>How it came</span>'+(E?'<select id="p-mode">'+['UPI','BANK','CASH','CHEQUE','CARD','OTHER'].map(k=>'<option value="'+k+'"'+((p?p.mode:'UPI')===k?' selected':'')+'>'+({UPI:'UPI',BANK:'Bank transfer',CASH:'Cash',CHEQUE:'Cheque',CARD:'Card',OTHER:'Other'})[k]+'</option>').join('')+'</select>':'<div class="ro">'+esc(p.mode||'—')+'</div>')+'</div>';
+  const fields=N
+    ?'<div class="fgrid">'+custSel+swSel+planText+kindSel+fin('Amount received (₹)','p-amount','','text',' placeholder="15,000" inputmode="decimal"')+fin('Paid on','p-date',isoToday(),'date')+modeSel+fin('Reference (UTR, cheque, invoice)','p-ref','')+extend+fin('Valid from (if not renewing)','p-from','','date')+fin('Valid to (if not renewing)','p-to','','date')+fin('Note','p-note','')+'</div>'
+    :'<div class="fgrid">'+fv('Customer',p.customer)+fv('Software',p.software==='weight'?'Sales & Costing':'Fabric Stock')+fv('Plan',p.planName||p.plan)+kindSel+
+      (E?fin('Amount received (₹)','p-amount',p.amount,'text',' inputmode="decimal"'):fv('Amount received',rupees(p.amount)))+
+      (E?fin('Paid on','p-date',p.paidOn,'date'):fv('Paid on',fmt(p.paidOn)))+modeSel+
+      (E?fin('Reference','p-ref',v('reference')):fv('Reference',p.reference||'—'))+
+      (E?fin('Valid from','p-from',v('validFrom'),'date'):fv('Valid from',p.validFrom?fmt(p.validFrom):'—'))+
+      (E?fin('Valid to','p-to',v('validTo'),'date'):fv('Valid to',p.validTo?fmt(p.validTo):'—'))+
+      (E?fin('Note','p-note',v('note')):fv('Note',p.note||'—'))+fv('Recorded',fmtTime(p.createdAt)+(p.via?' · '+(p.via==='android'?'phone console':'web console'):''))+'</div>';
+  const tools=N?[['Save','💾',C_.green,'save'],['Cancel','✕',C_.back,'close']]
+    :[['Edit','✎',C_.blue,'edit',E],['Save','💾',C_.green,'save',!E],['Cancel','✕',C_.back,'cancel',!E],'|',['Customer','☺',C_.teal,'customer'],['Delete','🗑',C_.red,'delete'],'|',['Close','✕',C_.back,'close']];
+  showWin('<div class="win small"><div class="wtitle"><span class="av" style="background:linear-gradient(135deg,#15803d,#34d399)">₹</span><div><h2>'+(N?'Record payment':esc(p.customer)+' · '+rupees(p.amount))+'<span class="mode'+(N?' new':E?' edit':'')+'">'+(N?'NEW':E?'EDIT':'DISPLAY')+'</span></h2><small>'+(N?'What came in, for which software and plan — and, if you like, the renewal it pays for':fmt(p.paidOn)+' · '+(p.software==='weight'?'Sales & Costing':'Fabric Stock'))+'</small></div><div class="wx"><button data-wtool="close">✕</button></div></div>'+
+    '<div class="tbar">'+tbHtml(tools,'data-wtool')+'</div><div class="wbody"><div class="card">'+fields+'</div>'+
+    (N?'<p class="help">With a renewal chosen, the licence is renewed in the same step and the payment keeps the validity it bought: Sales & Costing adds the time after what is left; Fabric Stock carries the days left into the new period. Without one, give the validity by hand if you know it.</p>':'')+'</div></div>');
+}
+async function payTool(k){
+  const p=WIN.id?((PAYDATA&&PAYDATA.payments)||[]).find(z=>z.id===WIN.id):null;
+  if(k==='close'){if(WIN.edit&&WIN.id&&!confirm('Close without saving?'))return;const b=WIN.back;WIN=null;document.getElementById('winLayer').innerHTML='';if(b)openCustomer(b.key,b.sw,b.sub);return;}
+  if(k==='edit'){WIN.edit=true;return renderPayWin();}
+  if(k==='cancel'){WIN.edit=false;return renderPayWin();}
+  if(k==='customer'&&p){const x=customers().find(c=>(c.w&&String(c.w.id)===p.companyId)||(c.f&&String(c.f.id)===p.fabricId));if(x)openCustomer(x.key,p.software,'payments');return;}
+  if(k==='delete'&&p){if(!confirm('Delete this payment of '+rupees(p.amount)+' from '+p.customer+'?  It leaves the list; the Activity list keeps that it was deleted.'))return;
+    const r=await api('/admin/api/payments',{method:'POST',body:JSON.stringify({action:'delete',id:p.id})});
+    if(r.error){say('<div class="msg err">'+esc(r.error)+'</div>');return;}say('<div class="msg ok">Deleted.</div>');WIN=null;document.getElementById('winLayer').innerHTML='';await loadPayments();return;}
+  if(k!=='save')return;
+  const body={amount:val('p-amount'),paidOn:val('p-date'),mode:val('p-mode'),reference:val('p-ref'),kind:val('p-kind'),note:val('p-note'),validFrom:val('p-from')||undefined,validTo:val('p-to')||undefined};
+  if(!WIN.id){
+    const ck=val('p-cust'), sw=val('p-sw');const x=custByKey(ck);if(!x){say('<div class="msg err">Choose the customer.</div>');return;}
+    Object.assign(body,{action:'add',software:sw,companyId:x.w?x.w.id:undefined,fabricId:sw==='fabric'&&x.f?x.f.id:undefined,extendDays:+val('p-ext')||undefined});
+    if(sw==='fabric'&&!x.f){say('<div class="msg err">This customer has no Fabric Stock licence.</div>');return;}
+  }else Object.assign(body,{action:'update',id:WIN.id});
+  let r;try{r=await api('/admin/api/payments',{method:'POST',body:JSON.stringify(body)});}catch(e){r={error:e.message};}
+  if(r.error){say('<div class="msg err">'+esc(r.message||r.error)+'</div>');return;}
+  say('<div class="msg '+(r.warning?'warn':'ok')+'">'+esc(r.warning||('Recorded '+rupees(r.payment.amount)+' from '+r.payment.customer+(r.payment.validTo?' — valid to '+fmt(r.payment.validTo):'')+'.'))+'</div>');
+  const b=WIN.back;WIN=null;document.getElementById('winLayer').innerHTML='';
+  await loadPayments();if(body.extendDays){await load();await loadProducts();}
+  if(b)openCustomer(b.key,b.sw,'payments');
+}
+
+/* ---------- software & plans ---------- */
+function renderPlanList(){
+  const host=document.getElementById('pllist');if(!host)return;
+  const soft=document.getElementById('plSoft').value, term=(document.getElementById('plq').value||'').toLowerCase().trim();
+  const wb=softBlock('weight'), fb=softBlock('fabric');
+  const wf=wFeatures().length;
+  document.getElementById('plFigs').innerHTML=
+    '<div class="fig f1"><span>Sales & Costing</span><b>'+wPlans().length+' plans</b><small>'+wf+' features · '+wPlans().reduce((s,p)=>s+(p.customers||0),0)+' paying customers</small></div>'+
+    '<div class="fig f2"><span>Fabric Stock</span><b>'+(fb&&fb.supported?fPlans().length+' plans':'—')+'</b><small>'+(fb?(fb.supported?(fb.features||[]).length+' features':(fb.ok?'no plans in its service yet':'not connected')):'reading…')+'</small></div>'+
+    '<div class="fig f3"><span>Jobwork</span><b>—</b><small>joins when it has a licence</small></div>'+
+    '<div class="fig f4"><span>Customer changes</span><b>'+wPlans().reduce((s,p)=>s+(p.changed||0),0)+'</b><small>customers with a feature added or off</small></div>';
+  const rows=allPlans().filter(p=>(!soft||p.sw===soft)&&(!term||[p.name,p.code,p.note].some(v=>String(v||'').toLowerCase().includes(term))||(p.sw==='weight'&&wFeatures().some(fe=>p.features[fe.id]&&fe.label.toLowerCase().includes(term)))));
+  PLLIST=rows;
+  document.getElementById('plCount').textContent=rows.length+' plan'+(rows.length===1?'':'s');
+  const fbNote=(!soft||soft==='fabric')&&fb&&!fb.supported?'<div class="msg warn" style="margin-bottom:10px"><b>Fabric Stock:</b> '+esc(fb.message||'its service did not answer')+'</div>':'';
+  host.innerHTML=fbNote+(rows.length?'<table class="rec"><thead><tr><th>Software</th><th>Plan</th><th>Gives</th><th class="num">First year</th><th class="num">Renewal / year</th><th class="num">Users included</th><th class="num">Extra user / year</th><th class="num">Features</th><th class="num">Customers</th><th>State</th></tr></thead><tbody>'+
+    rows.map(p=>{const fN=p.sw==='weight'?wf:((fb&&fb.features)||[]).length;const on=Object.keys(p.features||{}).filter(k=>p.features[k]).length;
+      return '<tr data-open="pl:'+p.sw+':'+esc(p.code)+'"'+(SELKEY['sec-plans']==='pl:'+p.sw+':'+p.code?' class="on"':'')+'><td><span class="swd '+(p.sw==='weight'?'w':'f')+'"></span>'+(p.sw==='weight'?'Sales & Costing':'Fabric Stock')+'</td><td><b>'+esc(p.name)+'</b><small>'+esc(p.code)+'</small></td><td>'+esc(p.note||'—')+'</td>'+
+      '<td class="num">'+rupees(p.priceFirst)+'</td><td class="num">'+rupees(p.priceRenewal)+'</td><td class="num">'+(p.usersIncluded||'—')+'</td><td class="num">'+rupees(p.extraUserPrice)+'</td>'+
+      '<td class="num">'+on+' of '+fN+'</td><td class="num"><b>'+(p.customers||0)+'</b>'+(p.changed?'<small>'+p.changed+' changed</small>':'')+'</td><td class="'+(p.active===false?'c-none':'c-ok')+'">'+(p.active===false?'retired':'in use')+'</td></tr>';}).join('')+'</tbody></table>'
+    :'<div class="empty">No plan here yet. <b>New plan</b> makes one.</div>');
+}
+async function openPlan(sw,code){
+  if(!PLANDATA)await loadPlans();
+  const b=softBlock(sw);
+  if(!b||!b.supported){say('<div class="msg warn"><b>'+(sw==='fabric'?'Fabric Stock':'Sales & Costing')+':</b> '+esc((b&&b.message)||'its plans could not be read')+'</div>');return;}
+  const p=code?planOf(sw,code):null;
+  if(code&&!p){say('<div class="msg err">That plan is no longer there.</div>');return;}
+  WIN={type:'plan',sw,code:p?p.code:'',edit:!p,draft:p?Object.assign({},p.features):{},tab:'features',copyFrom:''};
+  renderPlanWin();
+}
+function renderPlanWin(){
+  const b=softBlock(WIN.sw);if(!b)return;
+  const p=WIN.code?planOf(WIN.sw,WIN.code):null, E=WIN.edit, N=!p;
+  const feats=WIN.sw==='weight'?wFeatures():(b.features||[]);
+  const groups=[];feats.forEach(fe=>{const g=fe.group||'Features';if(groups.indexOf(g)<0)groups.push(g);});
+  const on=feats.filter(fe=>WIN.draft[fe.id]).length;
+  const g=E?[fin('Plan name','pl-name',p?p.name:''),fin('Gives (a few words)','pl-note',p?p.note:'','text',' placeholder="e.g. calculation, quotation and the cost tools"'),fin('First year (₹, + GST)','pl-first',p&&p.priceFirst!=null?p.priceFirst:'','text',' placeholder="open" inputmode="decimal"'),fin('Renewal / year (₹, + GST)','pl-renew',p&&p.priceRenewal!=null?p.priceRenewal:'','text',' placeholder="open" inputmode="decimal"'),
+      fin('Users included','pl-users',p&&p.usersIncluded!=null?p.usersIncluded:'','number',' min="1" max="500" placeholder="open"'),fin('Each extra user / year (₹)','pl-extra',p&&p.extraUserPrice!=null?p.extraUserPrice:'','text',' placeholder="open" inputmode="decimal"'),
+      N?'<div class="fl"><span>Start from the ticks of</span><select id="pl-copy" onchange="planCopy(this.value)"><option value="">nothing ticked</option>'+(WIN.sw==='weight'?wPlans():fPlans()).map(z=>'<option value="'+esc(z.code)+'"'+(WIN.copyFrom===z.code?' selected':'')+'>'+esc(z.name)+'</option>').join('')+'</select></div>':fv('Code',p.code),
+      fv('Software',WIN.sw==='weight'?'Sales & Costing':'Fabric Stock')]
+    :[fv('Plan name',p.name),fv('Gives',p.note||'—'),fv('First year',p.priceFirst!=null?rupees(p.priceFirst)+' + GST':'open — not set'),fv('Renewal / year',p.priceRenewal!=null?rupees(p.priceRenewal)+' + GST':'open — not set'),
+      fv('Users included',p.usersIncluded||'open'),fv('Each extra user / year',p.extraUserPrice!=null?rupees(p.extraUserPrice):'open'),fv('Customers on it',(p.customers||0)+(p.changed?' · '+p.changed+' with their own changes':'')),fv('State',p.active===false?'retired — not offered to new customers':'in use')];
+  const grid=groups.map(gr=>'<div class="fgh">'+esc(gr)+'</div><div class="feat">'+feats.filter(fe=>(fe.group||'Features')===gr).map(fe=>{const o=!!WIN.draft[fe.id];
+    return '<button class="fx '+(o?'on plan':'no')+'" data-wtool="pf-'+fe.id+'"'+(E?'':' disabled')+'><span class="cb">'+(o?'✓':'')+'</span><span class="nm">'+esc(fe.label)+'</span></button>';}).join('')+'</div>').join('');
+  const custs=p?customers().filter(x=>WIN.sw==='weight'?(x.w&&!x.w.is_demo&&String(x.w.plan||'PRO').toUpperCase()===p.code):(x.f&&String(x.f.plan||'STANDARD').toUpperCase()===p.code)):[];
+  const tab=WIN.tab==='customers'&&p?'<div class="card">'+(custs.length?'<table class="rec"><thead><tr><th>Customer</th><th>State</th><th>Ends</th><th>Own changes</th></tr></thead><tbody>'+custs.map(x=>{const l=WIN.sw==='weight'?x.w:x.f;const s=WIN.sw==='weight'?wState(l):fState(l);
+      return '<tr data-open="c:'+x.key+':'+WIN.sw+':licence"><td><b>'+esc(x.name)+'</b></td><td class="'+stCls(s)+'">'+stWord(s)+'</td><td>'+fmt(WIN.sw==='weight'?l.expires_at:l.expiresAt)+'</td><td>'+(WIN.sw==='weight'&&ovCount(l)?'± '+ovCount(l):'—')+'</td></tr>';}).join('')+'</tbody></table>':'<p class="help">No paying customer is on this plan.</p>')+'</div>'
+    :'<div class="card"><div class="sumline" style="margin-bottom:8px"><span><b>'+on+' of '+feats.length+'</b> features</span><span class="sub">'+(E?'Click to tick or untick. ':'')+'A tick changes every customer on this plan at their next check; a customer’s own additions and removals stay.</span></div>'+grid+'</div>';
+  const tools=N?[['Save','💾',C_.green,'save'],['Cancel','✕',C_.back,'close']]
+    :[['Edit','✎',C_.blue,'edit',E],['Save','💾',C_.green,'save',!E],['Cancel','✕',C_.back,'cancel',!E],'|',['Duplicate','⧉',C_.blue,'dup'],p.active===false?['Restore','▶',C_.green,'restore']:['Retire','⊘',C_.red,'retire'],['Delete','🗑',C_.red,'delete',p.builtIn||(p.customers||0)>0],'|',['Close','✕',C_.back,'close']];
+  showWin('<div class="win"><div class="wtitle"><span class="av" style="background:'+(WIN.sw==='weight'?'linear-gradient(135deg,#3366ff,#6a8cff)':'linear-gradient(135deg,#10a37f,#2cc6b0)')+'">◫</span><div><h2>'+(WIN.sw==='weight'?'Sales & Costing':'Fabric Stock')+' · '+esc(p?p.name:'New plan')+'<span class="mode'+(N?' new':E?' edit':'')+'">'+(N?'NEW':E?'EDIT':'DISPLAY')+'</span></h2><small>'+(p?'Plan · '+(p.customers||0)+' customer'+((p.customers||0)===1?'':'s')+' on it':'A name, a price (or leave it open), how many users, and which features it gives')+'</small></div><div class="wx"><button data-wtool="close">✕</button></div></div>'+
+    '<div class="tbar">'+tbHtml(tools,'data-wtool')+'</div><div class="wbody"><div class="card"><div class="fgrid">'+g.join('')+'</div></div>'+
+    (p?'<div class="subt"><button class="'+(WIN.tab!=='customers'?'on':'')+'" data-wtool="tab-features">Features<small>'+on+'</small></button><button class="'+(WIN.tab==='customers'?'on':'')+'" data-wtool="tab-customers">Customers<small>'+custs.length+'</small></button></div>':'')+tab+'</div></div>');
+}
+function planCopy(code){WIN.copyFrom=code;const z=planOf(WIN.sw,code);WIN.draft=z?Object.assign({},z.features):{};
+  const keep={};['pl-name','pl-note','pl-first','pl-renew','pl-users','pl-extra'].forEach(i=>{keep[i]=val(i);});renderPlanWin();Object.keys(keep).forEach(i=>{const n=document.getElementById(i);if(n&&keep[i]!==undefined)n.value=keep[i];});}
+async function planTool(k){
+  const p=WIN.code?planOf(WIN.sw,WIN.code):null;
+  if(k==='close'){if(WIN.edit&&p&&!confirm('Close without saving?'))return;WIN=null;document.getElementById('winLayer').innerHTML='';return;}
+  if(k==='edit'){WIN.edit=true;return renderPlanWin();}
+  if(k==='cancel'){WIN.edit=false;WIN.draft=Object.assign({},p.features);return renderPlanWin();}
+  if(k==='tab-features'||k==='tab-customers'){WIN.tab=k.slice(4);return renderPlanWin();}
+  if(k.indexOf('pf-')===0&&WIN.edit){const id=k.slice(3);const keep={};['pl-name','pl-note','pl-first','pl-renew','pl-users','pl-extra'].forEach(i=>{keep[i]=val(i);});
+    WIN.draft[id]=!WIN.draft[id];renderPlanWin();Object.keys(keep).forEach(i=>{const n=document.getElementById(i);if(n&&keep[i]!==undefined)n.value=keep[i];});return;}
+  if(k==='dup'&&p){WIN={type:'plan',sw:WIN.sw,code:'',edit:true,draft:Object.assign({},p.features),tab:'features',copyFrom:p.code};renderPlanWin();const n=document.getElementById('pl-name');if(n){n.value=p.name+' copy';n.focus();}return;}
+  const post=async(body)=>{let r;try{r=await api('/admin/api/plans',{method:'POST',body:JSON.stringify(Object.assign({software:WIN.sw},body))});}catch(e){r={error:e.message};}
+    if(r.error){say('<div class="msg err">'+esc(r.message||r.error)+'</div>');return null;}return r;};
+  if(k==='retire'&&p){if(!confirm('Retire '+p.name+'?  It is no longer offered to a new customer; the '+(p.customers||0)+' on it keep it.'))return;if(await post({action:'retire',code:p.code})){say('<div class="msg ok">Retired.</div>');await loadPlans();}return;}
+  if(k==='restore'&&p){if(await post({action:'restore',code:p.code})){say('<div class="msg ok">In use again.</div>');await loadPlans();}return;}
+  if(k==='delete'&&p){if(!confirm('Delete the plan '+p.name+'?'))return;if(await post({action:'delete',code:p.code})){say('<div class="msg ok">Deleted.</div>');WIN=null;document.getElementById('winLayer').innerHTML='';await loadPlans();}return;}
+  if(k!=='save')return;
+  const body={name:val('pl-name'),note:val('pl-note'),priceFirst:val('pl-first'),priceRenewal:val('pl-renew'),usersIncluded:val('pl-users'),extraUserPrice:val('pl-extra'),features:Object.assign({},WIN.draft)};
+  if(!String(body.name||'').trim()){say('<div class="msg err">Give the plan a name.</div>');return;}
+  const r=await post(Object.assign(body,p?{action:'update',code:p.code}:{action:'create',copyFrom:WIN.copyFrom||undefined}));
+  if(!r)return;
+  say('<div class="msg ok">'+(p?'Saved':'Made')+': '+esc(r.plan.name)+'. Every customer on it hears it at their next check.</div>');
+  WIN={type:'plan',sw:WIN.sw,code:r.plan.code,edit:false,draft:Object.assign({},r.plan.features),tab:'features'};
+  await loadPlans();
+}
+
+/* ---------- new customer: any software, each its own licence ---------- */
+/* the older page called it createCo; New customer is the window now */
+function createCo(){openNewCustomer();}
+function openNewCustomer(only){WIN={type:'newcust',only:only==='weight'||only==='fabric'?only:''};renderNewCust();}
+function renderNewCust(){
+  const wp=wPlans().filter(p=>p.active!==false), fb=softBlock('fabric'), fp=fabricProduct();
+  const fOk=!!(fp&&fp.ok);
+  showWin('<div class="win"><div class="wtitle"><span class="av" style="background:linear-gradient(135deg,#10b981,#34d399)">+</span><div><h2>New customer<span class="mode new">NEW</span></h2><small>One customer, any software — each gets its own licence key</small></div><div class="wx"><button data-wtool="close">✕</button></div></div>'+
+    '<div class="tbar">'+tbHtml([['Save','💾',C_.green,'save'],['Cancel','✕',C_.back,'close']],'data-wtool')+'</div><div class="wbody">'+
+    '<div class="card"><div class="fgrid">'+fin('Company name','n-name','')+fin('GSTIN','n-gstin','','text',' maxlength="15" style="text-transform:uppercase"')+fin('Email','n-email','')+fin('Mobile','n-phone','')+
+      fin('Administrator (optional)','n-admin','','text',' placeholder="the person who adds everyone else"')+fin('Administrator PIN','n-pin','','password',' placeholder="4 digits or more" autocomplete="new-password"')+'</div></div>'+
+    '<div class="card"><h3 style="margin:0 0 10px">Which software, on which plan</h3><table class="rec" style="cursor:default"><thead><tr><th style="width:36px"></th><th>Software</th><th>Plan</th><th>Start as</th><th class="num">Days</th><th class="num">Seats / users</th><th class="num">Offline days</th><th>Price</th></tr></thead><tbody>'+
+    '<tr style="cursor:default"><td><input type="checkbox" id="n-w" checked></td><td><span class="swd w"></span><b>Sales & Costing</b></td><td><select id="n-wplan">'+wp.map(p=>'<option value="'+esc(p.code)+'"'+(p.code==='PRO'?' selected':'')+'>'+esc(p.name)+(p.note?' — '+esc(p.note):'')+'</option>').join('')+'</select></td><td>Licensed</td>'+
+      '<td class="num"><input id="n-wdays" type="number" value="365" min="1" style="width:80px"></td><td class="num"><input id="n-wseats" type="number" value="1" min="1" style="width:70px"></td><td class="num"><input id="n-wgrace" type="number" value="3" min="0" style="width:70px"></td><td class="sub" id="n-wprice"></td></tr>'+
+    '<tr style="cursor:default"><td><input type="checkbox" id="n-f"'+(fOk?'':' disabled')+'></td><td><span class="swd f"></span><b>Fabric Stock</b></td><td>'+(fb&&fb.supported?'<select id="n-fplan">'+fPlans().filter(p=>p.active!==false).map(p=>'<option value="'+esc(p.code)+'">'+esc(p.name)+'</option>').join('')+'</select>':'Standard')+'</td>'+
+      '<td><select id="n-fstate"'+(fOk?'':' disabled')+'><option value="DEMO">Demo</option><option value="LICENSED">Licensed</option></select></td><td class="num"><input id="n-fdays" type="number" value="7" min="1" style="width:80px"'+(fOk?'':' disabled')+'></td>'+
+      '<td class="num"><input id="n-fseats" type="number" value="3" min="1" style="width:70px"'+(fOk?'':' disabled')+'></td><td class="num"><input id="n-fgrace" type="number" value="0" min="0" max="30" style="width:70px"'+(fOk?'':' disabled')+'></td><td class="sub">'+(fOk?'':'Fabric Stock is not connected')+'</td></tr>'+
+    '<tr style="cursor:default"><td><input type="checkbox" disabled></td><td class="c-none"><span class="swd j"></span>Jobwork</td><td colspan="6" class="c-none">coming — no licence yet</td></tr></tbody></table>'+
+    '<p class="help">On Save each software ticked gets its own licence key, made in its own service; they are shown with each other as one customer. A plant that registers itself from the application appears here on its own, as a demo.</p></div></div></div>');
+  const wsel=document.getElementById('n-wplan');const price=()=>{const p=planOf('weight',wsel.value);document.getElementById('n-wprice').textContent=p&&p.priceFirst!=null?rupees(p.priceFirst)+' first year':'price open';};
+  if(wsel){wsel.onchange=price;price();}
+  if(WIN.only==='fabric'){document.getElementById('n-w').checked=false;if(fOk)document.getElementById('n-f').checked=true;}
+}
+async function newCustTool(k){
+  if(k==='close'){WIN=null;document.getElementById('winLayer').innerHTML='';return;}
+  if(k!=='save')return;
+  const name=(val('n-name')||'').trim();if(!name){say('<div class="msg err">A company name is required.</div>');return;}
+  const W=document.getElementById('n-w').checked, F=document.getElementById('n-f').checked;
+  if(!W&&!F){say('<div class="msg err">Tick at least one software.</div>');return;}
+  const gstin=(val('n-gstin')||'').trim().toUpperCase(), email=(val('n-email')||'').trim(), phone=(val('n-phone')||'').trim(), admin=(val('n-admin')||'').trim(), pin=val('n-pin')||'';
+  let made=null, fmade=null;const notes=[];
+  if(W){
+    const r=await api('/admin/api/company',{method:'POST',body:JSON.stringify({action:'create',name,gstin,email,phone,plan:val('n-wplan'),days:+val('n-wdays')||365,seats:+val('n-wseats')||1,graceDays:+val('n-wgrace')||0})});
+    if(r.error){say('<div class="msg err">'+esc(r.error)+'</div>');return;}
+    made=r.company;
+    if(admin&&pin){const a=await api('/admin/api/company',{method:'POST',body:JSON.stringify({id:made.id,action:'adminuser',name:admin,pin,email})});if(a.error)notes.push('Sales & Costing administrator: '+a.error);}
+  }
+  if(F){
+    const body={action:'create',name,state:val('n-fstate'),days:+val('n-fdays')||7,seats:+val('n-fseats')||3,graceDays:+val('n-fgrace')||0,gstin:gstin||undefined,email:email||undefined,phone:phone||undefined,linkTo:made?made.id:undefined};
+    if(document.getElementById('n-fplan'))body.plan=val('n-fplan');
+    if(admin&&pin){body.adminName=admin;body.adminPin=pin;}
+    let r;try{r=await api('/admin/api/fabric',{method:'POST',body:JSON.stringify(body)});}catch(e){r={error:e.message};}
+    if(r.error)notes.push('Fabric Stock: '+(r.message||r.error));else fmade=r.company;
+  }
+  WIN=null;document.getElementById('winLayer').innerHTML='';
+  await load();await loadProducts();
+  say('<div class="msg '+(notes.length?'warn':'ok')+'"><b>'+esc(name)+'</b> made.'+(made?' Sales & Costing key <span class="key">'+esc(made.licence_key)+'</span>.':'')+(fmade?' Fabric Stock key <span class="key">'+esc(fmade.licenceKey)+'</span>.':'')+(notes.length?'<br>'+notes.map(esc).join('<br>'):'')+'</div>');
+  const key=made?'w'+made.id:(fmade?'f'+fmade.id:null);if(key)openCustomer(key,made?'weight':'fabric','licence');
+}
+
+/* ---------- dashboard ---------- */
+function renderDashboard(){
+  const s=document.getElementById('dashSoft');if(!s)return;
+  const all=customers(), fp=fabricProduct();
+  const ws=all.filter(x=>x.w).map(x=>wState(x.w)), fs=all.filter(x=>x.f).map(x=>fState(x.f));const n=(a,v)=>a.filter(z=>z===v).length;
+  const pays=(PAYDATA&&PAYDATA.payments)||[];const t=isoToday(), m=t.slice(0,8)+'01';
+  const month=pays.filter(p=>p.paidOn>=m).reduce((z,p)=>z+(p.amount||0),0);
+  s.innerHTML='<div class="fig f1"><span>Sales & Costing</span><b>'+ws.length+'</b><small>'+n(ws,'LICENSED')+' licensed · '+n(ws,'DEMO')+' demo · '+n(ws,'SUSPENDED')+' suspended</small></div>'+
+    '<div class="fig f2"><span>Fabric Stock</span><b>'+(fp&&fp.ok?fs.length:'—')+'</b><small>'+(fp&&fp.ok?n(fs,'LICENSED')+' licensed · '+n(fs,'DEMO')+' demo':(fp?'not connected':'reading…'))+'</small></div>'+
+    '<div class="fig f3"><span>Received this month</span><b>'+rupees(month)+'</b><small>'+pays.filter(p=>p.paidOn>=m).length+' payments</small></div>'+
+    '<div class="fig f4"><span>Plans</span><b>'+allPlans().length+'</b><small>'+wPlans().length+' Sales & Costing · '+fPlans().length+' Fabric Stock</small></div>';
+  document.getElementById('dashNote').textContent=all.length+' customers';
+  const end=validityRows().filter(r=>(r.state==='LICENSED'||r.state==='DEMO')&&r.left<=30).slice(0,10);
+  document.getElementById('dashEnding').innerHTML=end.length?'<table class="rec"><thead><tr><th>Customer</th><th>Software</th><th>Plan</th><th>State</th><th>Ends</th><th class="num">Days left</th></tr></thead><tbody>'+end.map(r=>'<tr data-open="c:'+r.x.key+':'+r.sw+':licence"><td><b>'+esc(r.x.name)+'</b></td><td><span class="swd '+(r.sw==='weight'?'w':'f')+'"></span>'+(r.sw==='weight'?'Sales & Costing':'Fabric Stock')+'</td><td>'+esc(r.plan)+'</td><td class="'+stCls(r.state)+'">'+stWord(r.state)+'</td><td><b>'+fmt(r.ends)+'</b></td><td class="num c-warn">'+r.left+'</td></tr>').join('')+'</tbody></table>':'<p class="help">Nothing ends within 30 days.</p>';
+  const lp=pays.slice(0,8);
+  document.getElementById('dashPay').innerHTML=lp.length?'<table class="rec"><thead><tr><th>Paid on</th><th>Customer</th><th>Software</th><th>Plan</th><th class="num">Amount</th><th>Valid to</th></tr></thead><tbody>'+lp.map(p=>'<tr data-open="p:'+p.id+'"><td>'+fmt(p.paidOn)+'</td><td><b>'+esc(p.customer)+'</b></td><td><span class="swd '+(p.software==='weight'?'w':'f')+'"></span>'+(p.software==='weight'?'Sales & Costing':'Fabric Stock')+'</td><td>'+esc(p.planName||'—')+'</td><td class="num"><b>'+rupees(p.amount)+'</b></td><td>'+(p.validTo?fmt(p.validTo):'—')+'</td></tr>').join('')+'</tbody></table>':'<p class="help">No payment recorded yet. <b>Record payment</b> keeps one.</p>';
+}
+
+/* ---------- Excel: the rows on screen, as a CSV Excel opens ---------- */
+function csvCell(v){const s=String(v==null?'':v);return /[",;]/.test(s)||s.indexOf(String.fromCharCode(10))>=0?'"'+s.replace(/"/g,'""')+'"':s;}
+function downloadCsv(name,rows){
+  const text=String.fromCharCode(65279)+rows.map(r=>r.map(csvCell).join(',')).join(NL);
+  const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([text],{type:'text/csv;charset=utf-8'}));a.download=name+'-'+isoToday()+'.csv';document.body.appendChild(a);a.click();setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove();},500);
+}
+function csvCustomers(){const all=customers().filter(x=>CLIST.indexOf(x.key)>=0);
+  downloadCsv('nexora-customers',[['Customer','GSTIN','Email','Mobile','Sales & Costing plan','Sales & Costing state','Sales & Costing ends','Fabric Stock plan','Fabric Stock state','Fabric Stock ends']].concat(all.map(x=>[x.name,x.gstin,x.email,x.phone,
+    x.w?planNameOf('weight',x.w.plan):'',x.w?stWord(wState(x.w)):'',x.w?String(x.w.expires_at||'').slice(0,10):'',x.f?planNameOf('fabric',x.f.plan):'',x.f?stWord(fState(x.f)):'',x.f?String(x.f.expiresAt||'').slice(0,10):''])));}
+function csvValidity(){downloadCsv('nexora-validity',[['Customer','Software','Plan','State','Started','Ends','Days left','Seats','Last payment','Paid on']].concat(VLIST.map(r=>[r.x.name,r.sw==='weight'?'Sales & Costing':'Fabric Stock',r.plan,stWord(r.state),String(r.start||'').slice(0,10),String(r.ends||'').slice(0,10),r.left,r.seats,r.pay?r.pay.amount:'',r.pay?r.pay.paidOn:''])));}
+function csvPayments(){downloadCsv('nexora-payments',[['Paid on','Customer','Software','Plan','For','Amount','How','Reference','Valid from','Valid to','Note']].concat(PLIST.map(p=>[p.paidOn,p.customer,p.software==='weight'?'Sales & Costing':'Fabric Stock',p.planName,KIND_WORDS[p.kind]||p.kind,p.amount,p.mode,p.reference,p.validFrom,p.validTo,p.note])));}
+
+/* ---------- by software (owner: "by customer pan joi sakay ane by software wise pan joi sakay") ----------
+   Sales & Costing alone, Fabric Stock alone: that software's customers, its plans and its payments. A row
+   opens the customer's window on that software's tab. */
+const SWF={weight:{quick:'all',tab:'customers'},fabric:{quick:'all',tab:'customers'}};
+const SWNAME={weight:'Sales & Costing',fabric:'Fabric Stock'};
+function swLic(x,sw){return sw==='weight'?x.w:x.f;}
+function swSt(sw,l){return sw==='weight'?wState(l):fState(l);}
+function swEnds(sw,l){return sw==='weight'?l.expires_at:l.expiresAt;}
+function swLeft(sw,l){return sw==='weight'?l.days_left:l.daysLeft;}
+function swStart(sw,l){return sw==='weight'?l.period_started_at:(l.periodStartedAt||l.createdAt);}
+function swQuick(sw,v){SWF[sw].quick=v;renderSoftware(sw);}
+function swTab(sw,v){SWF[sw].tab=v;renderSoftware(sw);}
+function clearSoftwareFilter(sw){['q','from','to','plan','state'].forEach(i=>{document.getElementById('sw-'+i+'-'+sw).value='';});SWF[sw].quick='all';renderSoftware(sw);}
+function fyStart(){const t=isoToday();return (+t.slice(5,7)>=4?t.slice(0,4):String(+t.slice(0,4)-1))+'-04-01';}
+function renderSoftware(sw){
+  const host=document.getElementById('sw-list-'+sw);if(!host)return;
+  const g=id=>document.getElementById('sw-'+id+'-'+sw);
+  const term=(g('q').value||'').toLowerCase().trim(), plan=g('plan').value, st=g('state').value, from=g('from').value, to=g('to').value;
+  const ps=g('plan'), keep=ps.value;
+  ps.innerHTML='<option value="">Any plan</option>'+(sw==='weight'?wPlans():fPlans()).map(p=>'<option value="'+esc(p.code)+'">'+esc(p.name)+'</option>').join('');ps.value=keep;
+  const fp=fabricProduct(), off=sw==='fabric'&&!(fp&&fp.ok);
+  const all=customers().filter(x=>swLic(x,sw));
+  const S=x=>swSt(sw,swLic(x,sw)), L=x=>swLeft(sw,swLic(x,sw)), live=x=>S(x)==='LICENSED'||S(x)==='DEMO';
+  const cnt=fn=>all.filter(fn).length;
+  const Q=[['all','All',all.length],['30','Ending in 30 days',cnt(x=>live(x)&&L(x)<=30)],['demo','On a demo',cnt(x=>S(x)==='DEMO')],['ended','Ended',cnt(x=>S(x)==='EXPIRED')],
+    ['susp','Suspended',cnt(x=>S(x)==='SUSPENDED')],['both','Also on '+(sw==='weight'?'Fabric Stock':'Sales & Costing'),cnt(x=>x.w&&x.f)]];
+  g('quick').innerHTML='<span>Quick:</span>'+Q.map(q=>'<span class="qb'+(SWF[sw].quick===q[0]?' on':'')+'" data-sw="'+sw+'" data-q="'+q[0]+'" onclick="swQuick(this.dataset.sw,this.dataset.q)">'+esc(q[1])+'<i>'+q[2]+'</i></span>').join('');
+  const j=document.getElementById('jump-sw-'+sw);if(j){j.textContent=off?'–':all.length;j.className=all.length?'':'zero';}
+  const pays=((PAYDATA&&PAYDATA.payments)||[]).filter(p=>p.software===sw), fy=fyStart();
+  const fyPays=pays.filter(p=>p.paidOn>=fy), sum=a=>a.reduce((z,p)=>z+(p.amount||0),0);
+  const plans=sw==='weight'?wPlans():fPlans(), sb=softBlock(sw);
+  g('count').textContent=SWNAME[sw]+' · '+all.length+' customer'+(all.length===1?'':'s');
+  g('note').textContent=off?'not connected':(sw==='weight'?(DATA.licences||[]).length+' computers and phones':all.reduce((z,x)=>z+(+x.f.devices||0),0)+' computers and phones');
+  g('figs').innerHTML=
+    '<div class="fig '+(sw==='weight'?'f1':'f2')+'"><span>Customers</span><b>'+(off?'—':all.length)+'</b><small>'+cnt(x=>S(x)==='LICENSED')+' licensed · '+cnt(x=>S(x)==='DEMO')+' demo · '+cnt(x=>S(x)==='SUSPENDED')+' suspended</small></div>'+
+    '<div class="fig f3"><span>Ending in 30 days</span><b>'+cnt(x=>live(x)&&L(x)<=30)+'</b><small>'+cnt(x=>S(x)==='LICENSED'&&L(x)<=30)+' paying · '+cnt(x=>S(x)==='DEMO'&&L(x)<=30)+' demos</small></div>'+
+    '<div class="fig f2"><span>Received this financial year</span><b>'+rupees(sum(fyPays))+'</b><small>'+fyPays.length+' payments since '+fmt(fy)+'</small></div>'+
+    '<div class="fig f4"><span>Plans</span><b>'+(sb&&sb.supported?plans.length:'—')+'</b><small>'+(sb&&sb.supported?plans.filter(p=>p.active!==false).length+' in use':(sb&&sb.message?'no plans in its service yet':'reading…'))+'</small></div>';
+  const tab=SWF[sw].tab;
+  g('tabs').innerHTML=[['customers','Customers',all.length],['plans','Plans',plans.length],['payments','Payments',pays.length]].map(t=>'<button class="'+(tab===t[0]?'on':'')+'" data-sw="'+sw+'" data-t="'+t[0]+'" onclick="swTab(this.dataset.sw,this.dataset.t)">'+t[1]+'<small>'+t[2]+'</small></button>').join('');
+  if(off&&tab!=='payments'){host.innerHTML=fabricNote();return;}
+  if(tab==='plans'){
+    if(!(sb&&sb.supported)){host.innerHTML='<div class="msg warn">'+esc((sb&&sb.message)||'Its plans could not be read.')+'</div>';return;}
+    const fN=sw==='weight'?wFeatures().length:(sb.features||[]).length;
+    host.innerHTML='<table class="rec"><thead><tr><th>Plan</th><th>Gives</th><th class="num">First year</th><th class="num">Renewal / year</th><th class="num">Users included</th><th class="num">Extra user / year</th><th class="num">Features</th><th class="num">Customers</th><th>State</th></tr></thead><tbody>'+
+      plans.map(p=>'<tr data-open="pl:'+sw+':'+esc(p.code)+'"><td><b>'+esc(p.name)+'</b><small>'+esc(p.code)+'</small></td><td>'+esc(p.note||'—')+'</td><td class="num">'+rupees(p.priceFirst)+'</td><td class="num">'+rupees(p.priceRenewal)+'</td><td class="num">'+(p.usersIncluded||'—')+'</td><td class="num">'+rupees(p.extraUserPrice)+'</td><td class="num">'+Object.keys(p.features||{}).filter(k=>p.features[k]).length+' of '+fN+'</td><td class="num"><b>'+(p.customers||0)+'</b></td><td class="'+(p.active===false?'c-none':'c-ok')+'">'+(p.active===false?'retired':'in use')+'</td></tr>').join('')+
+      '</tbody></table><div class="acts" style="margin-top:10px"><button class="primary" data-sw="'+sw+'" onclick="openPlan(this.dataset.sw,null)">+ New '+esc(SWNAME[sw])+' plan</button></div>';
+    return;
+  }
+  if(tab==='payments'){
+    const rows=pays.filter(p=>(!term||[p.customer,p.reference,p.note].some(v=>String(v||'').toLowerCase().includes(term)))&&(!from||p.paidOn>=from)&&(!to||p.paidOn<=to));
+    host.innerHTML=rows.length?'<table class="rec"><thead><tr><th>Paid on</th><th>Customer</th><th>Plan</th><th>For</th><th class="num">Amount</th><th>How</th><th>Reference</th><th>Valid to</th></tr></thead><tbody>'+
+      rows.map(p=>'<tr data-open="p:'+p.id+'"><td><b>'+fmt(p.paidOn)+'</b></td><td><b>'+esc(p.customer)+'</b></td><td>'+esc(p.planName||'—')+'</td><td>'+esc(KIND_WORDS[p.kind]||p.kind)+'</td><td class="num"><b>'+rupees(p.amount)+'</b></td><td>'+esc(p.mode||'—')+'</td><td>'+esc(p.reference||'—')+'</td><td>'+(p.validTo?fmt(p.validTo):'—')+'</td></tr>').join('')+
+      '</tbody><tfoot><tr><td colspan="4">Total</td><td class="num">'+rupees(sum(rows))+'</td><td colspan="3"></td></tr></tfoot></table>'
+      :'<div class="empty">No '+esc(SWNAME[sw])+' payment in this view.</div>';
+    return;
+  }
+  const rows=all.filter(x=>{const l=swLic(x,sw);
+    if(term&&![x.name,x.gstin,x.email,x.phone,sw==='weight'?l.licence_key:l.licenceKey,sw==='weight'?l.login_id:l.loginId].some(v=>String(v||'').toLowerCase().includes(term)))return false;
+    if(plan&&String(l.plan||(sw==='weight'?'PRO':'STANDARD')).toUpperCase()!==plan)return false;
+    if(st&&S(x)!==st)return false;
+    const d=String(swEnds(sw,l)||'').slice(0,10);if(from&&d<from)return false;if(to&&d>to)return false;
+    const q=SWF[sw].quick;
+    if(q==='30'&&!(live(x)&&L(x)<=30))return false;if(q==='demo'&&S(x)!=='DEMO')return false;if(q==='ended'&&S(x)!=='EXPIRED')return false;
+    if(q==='susp'&&S(x)!=='SUSPENDED')return false;if(q==='both'&&!(x.w&&x.f))return false;
+    return true;}).sort((a,b)=>new Date(swEnds(sw,swLic(a,sw)))-new Date(swEnds(sw,swLic(b,sw))));
+  host.innerHTML=rows.length?'<table class="rec"><thead><tr><th>Customer</th><th>Plan</th><th>State</th><th>Started</th><th>Ends</th><th class="num">Days left</th><th class="num">Seats</th><th class="num">Computers</th><th>Last payment</th><th>Also on</th></tr></thead><tbody>'+
+    rows.map(x=>{const l=swLic(x,sw), s=S(x), lp=lastPay(sw,x);
+      return '<tr data-open="c:'+x.key+':'+sw+':licence"><td><b>'+esc(x.name)+'</b><small>'+esc(x.gstin||'')+'</small></td>'+
+        '<td>'+esc(planNameOf(sw,l.plan))+(sw==='weight'&&ovCount(l)?' <span style="color:var(--accent)">± '+ovCount(l)+'</span>':'')+'</td><td class="'+stCls(s)+'">'+stWord(s)+'</td>'+
+        '<td>'+fmt(swStart(sw,l))+'</td><td><b>'+fmt(swEnds(sw,l))+'</b></td><td class="num '+(live(x)&&L(x)<=30?'c-warn':'')+'">'+(live(x)?L(x):'—')+'</td>'+
+        '<td class="num">'+(sw==='weight'?(+l.users_total||0):(+l.people||0))+' of '+l.seats+'</td><td class="num">'+(sw==='weight'?(l.machines_used||0):(+l.devices||0))+'</td>'+
+        '<td>'+(lp?'<b>'+rupees(lp.amount)+'</b><small>'+fmt(lp.paidOn)+'</small>':'<span class="c-none">none recorded</span>')+'</td>'+
+        '<td>'+(sw==='weight'?(x.f?'<span class="swd f"></span>Fabric Stock':'<span class="c-none">—</span>'):(x.w?'<span class="swd w"></span>Sales &amp; Costing':'<span class="c-none">—</span>'))+'</td></tr>';}).join('')+'</tbody></table>'
+    :'<div class="empty">No '+esc(SWNAME[sw])+' customer in this view.</div>';
+}
+function csvSoftware(sw){const all=customers().filter(x=>swLic(x,sw));
+  downloadCsv('nexora-'+(sw==='weight'?'sales-costing':'fabric-stock'),[['Customer','GSTIN','Plan','State','Started','Ends','Days left','Seats','Email','Mobile']].concat(all.map(x=>{const l=swLic(x,sw);
+    return [x.name,x.gstin,planNameOf(sw,l.plan),stWord(swSt(sw,l)),String(swStart(sw,l)||'').slice(0,10),String(swEnds(sw,l)||'').slice(0,10),swLeft(sw,l),l.seats,x.email,x.phone];})));}
+
 </script></body></html>`;

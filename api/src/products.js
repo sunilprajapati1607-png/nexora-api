@@ -27,7 +27,7 @@
 import { q, logEvent } from './db.js';
 
 export const PRODUCTS = [
-  { id: 'weight', name: 'Nexora Bag Weight Calculation', short: 'Weight Calc' },
+  { id: 'weight', name: 'Nexora Bag Weight Calculation', short: 'Sales & Costing' },
   { id: 'fabric', name: 'Nexora Loom & Fabric Stock', short: 'Fabric Stock' }
 ];
 
@@ -162,7 +162,7 @@ export async function fabricAction(body) {
       if (action === 'link') {
         to = parseInt(b.companyId, 10);
         const co = to ? (await q(`SELECT id FROM companies WHERE id = $1 AND deleted_at IS NULL`, [to]))[0] : null;
-        if (!co) return { httpStatus: 404, body: { error: 'No such Weight Calc company.' } };
+        if (!co) return { httpStatus: 404, body: { error: 'No such Sales & Costing company.' } };
       }
       await q(`INSERT INTO product_links (product, remote_id, company_id) VALUES ('fabric', $1, $2)
                ON CONFLICT (product, remote_id) DO UPDATE SET company_id = EXCLUDED.company_id, linked_at = now()`, [rid, to]);
