@@ -3397,10 +3397,10 @@ function renderWin(){
   const i=CLIST.indexOf(x.key);
   let tools=[['Edit','✎',C_.blue,'edit',E||(W?!c:!f)],['Save','💾',C_.green,'save',!E],['Cancel','✕',C_.back,'cancel',!E],'|',['Previous','‹',C_.back,'prev',i<=0],['Next','›',C_.back,'next',i<0||i>=CLIST.length-1],'|'];
   if(W&&c){const s=wState(c);tools=tools.concat([
-    s==='DEMO'?['Make licensed','✓',C_.green,'w-licence']:['Add days','+',C_.orange,'w-days'],['+1 year','+1',C_.amber,'w-year'],['Plan','◫',C_.violet,'w-plan'],['Seats','☺',C_.teal,'w-seats'],
+    ['Add days','+',C_.orange,'w-days'],c.is_demo?['Make licensed','✓',C_.green,'w-licence']:['+1 year','+1',C_.amber,'w-year'],['Plan','◫',C_.violet,'w-plan'],['Seats','☺',C_.teal,'w-seats'],
     s==='SUSPENDED'?['Restore','▶',C_.green,'w-restore']:['Suspend','⏸',C_.red,'w-suspend'],['New key','⚿',C_.violet,'w-rekey'],'|',['Record payment','₹',C_.teal,'pay']]);}
   if(!W&&f){const s=fState(f);tools=tools.concat([
-    s==='DEMO'?['Make licensed','✓',C_.green,'f-licence']:['Add days','+',C_.orange,'f-days'],['+1 year','+1',C_.amber,'f-year'],['Seats','☺',C_.teal,'f-seats'],
+    ['Add days','+',C_.orange,'f-days'],f.isDemo?['Make licensed','✓',C_.green,'f-licence']:['+1 year','+1',C_.amber,'f-year'],['Seats','☺',C_.teal,'f-seats'],
     s==='SUSPENDED'?['Restore','▶',C_.green,'f-restore']:['Suspend','⏸',C_.red,'f-suspend'],'|',['Record payment','₹',C_.teal,'pay']]);}
   tools=tools.concat(['|',['Close','✕',C_.back,'close']]);
   const subs=W?[['licence','Licence'],['features','Features'],['people','People'],['computers','Computers & phones'],['payments','Payments'],['more','More'],['history','History']]
