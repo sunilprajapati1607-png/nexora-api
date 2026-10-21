@@ -16,7 +16,7 @@
  */
 import { q, logEvent, getSettings } from './db.js';
 import { companyAction } from './admin.js';
-import { fabricCall } from './products.js';
+import { PRODUCTS, remoteCall, REMOTE_IDS } from './products.js';
 import { cleanPlan } from './plans.js';
 
 const KINDS = ['NEW', 'RENEWAL', 'EXTRA_USERS', 'UPGRADE', 'OTHER'];
@@ -50,7 +50,7 @@ export async function listPayments(params) {
   const p = params || {};
   const where = ['deleted_at IS NULL'], vals = [];
   const add = (sql, v) => { vals.push(v); where.push(sql.replace('$?', '$' + vals.length)); };
-  if (p.software === 'weight' || p.software === 'fabric') add('software = $?', p.software);
+  if (p.software === 'weight' || REMOTE_IDS.indexOf(p.software) >= 0) add('software = $?', p.software);
   if (p.companyId) add('company_id = $?', parseInt(p.companyId, 10) || 0);
   if (p.fabricId) add('fabric_id = $?', String(p.fabricId));
   if (isoDay(p.from)) add('paid_on >= $?::date', isoDay(p.from));
@@ -78,14 +78,15 @@ async function renew(b, cust) {
     const co = (await q(`SELECT to_char((expires_at AT TIME ZONE INTERVAL '+05:30')::date, 'YYYY-MM-DD') AS d FROM companies WHERE id = $1`, [cust.companyId]))[0];
     return { validTo: co ? co.d : null };
   }
-  /* Fabric Stock sets a new period from today, so the days still left go with the days paid for */
+  /* These services set a new period from today, so the days still left go with the days paid for */
   const now = Date.now();
   const left = cust.expiresAt && new Date(cust.expiresAt).getTime() > now && cust.state !== 'DEMO'
     ? Math.max(0, istDay(new Date(cust.expiresAt).getTime()) - istDay(now)) : 0;
-  const body = { action: 'update', id: parseInt(cust.fabricId, 10), days: left + days };
+  const body = { action: 'update', id: parseInt(cust.remoteId != null ? cust.remoteId : cust.fabricId, 10), days: left + days };
   if (cust.state === 'DEMO') body.state = 'LICENSED';
-  const r = await fabricCall('POST', '/admin/api/company', body);
-  if (r.status !== 200) return { warning: 'The payment is recorded, but Fabric Stock was not renewed: ' + (r.body.message || r.body.error || 'no answer') };
+  const soft = PRODUCTS.find((p) => p.id === b.software);
+  const r = await remoteCall(b.software, 'POST', '/admin/api/company', body);
+  if (r.status !== 200) return { warning: 'The payment is recorded, but ' + (soft ? soft.short : b.software) + ' was not renewed: ' + (r.body.message || r.body.error || 'no answer') };
   return { validTo: r.body.company && r.body.company.expiresAt ? new Date(new Date(r.body.company.expiresAt).getTime() + IST).toISOString().slice(0, 10) : null };
 }
 
@@ -100,12 +101,14 @@ async function customerOf(b) {
     const pl = (s.plans || []).find((x) => x.code === code);
     return { companyId: Number(co.id), name: co.name, plan: code, planName: pl ? pl.name : code, isDemo: co.is_demo === true };
   }
-  if (b.software === 'fabric') {
-    const r = await fabricCall('GET', '/admin/api/company?id=' + encodeURIComponent(parseInt(b.fabricId, 10) || 0));
+  if (REMOTE_IDS.indexOf(b.software) >= 0) {
+    /* fabricId is what the page has always sent; remoteId is the same thing said plainly */
+    const rid = parseInt(b.remoteId != null ? b.remoteId : b.fabricId, 10) || 0;
+    const r = await remoteCall(b.software, 'GET', '/admin/api/company?id=' + encodeURIComponent(rid));
     if (r.status !== 200 || !r.body || !r.body.name) return { error: r.body && (r.body.message || r.body.error) };
-    const link = (await q(`SELECT company_id FROM product_links WHERE product = 'fabric' AND remote_id = $1`, [String(r.body.id)]))[0];
+    const link = (await q(`SELECT company_id FROM product_links WHERE product = $1 AND remote_id = $2`, [b.software, String(r.body.id)]))[0];
     return { companyId: b.companyId ? parseInt(b.companyId, 10) : (link && link.company_id ? Number(link.company_id) : null),
-      fabricId: String(r.body.id), name: r.body.name, plan: String(r.body.plan || 'STANDARD').toUpperCase(),
+      remoteId: String(r.body.id), fabricId: String(r.body.id), name: r.body.name, plan: String(r.body.plan || 'STANDARD').toUpperCase(),
       planName: r.body.planName || (String(r.body.plan || 'Standard').charAt(0) + String(r.body.plan || 'Standard').slice(1).toLowerCase()),
       expiresAt: r.body.expiresAt, state: r.body.state };
   }
@@ -117,7 +120,7 @@ export async function paymentAction(body) {
   const action = String(b.action || '');
 
   if (action === 'add') {
-    if (b.software !== 'weight' && b.software !== 'fabric') return { httpStatus: 400, body: { error: 'Which software is it for?' } };
+    if (b.software !== 'weight' && REMOTE_IDS.indexOf(b.software) < 0) return { httpStatus: 400, body: { error: 'Which software is it for?' } };
     const amount = money(b.amount);
     if (amount === null || amount <= 0) return { httpStatus: 400, body: { error: 'Enter the amount received.' } };
     const paidOn = isoDay(b.paidOn) || istToday();

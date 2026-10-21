@@ -26,7 +26,7 @@
  */
 import { q, getSettings, forgetSettings, logEvent } from './db.js';
 import { PLAN_FEATURES, PLANS, cleanPlanRow, planCode, featureGroup, cleanPlanFeatures } from './plans.js';
-import { PRODUCTS, fabricCall } from './products.js';
+import { PRODUCTS, remoteCall, REMOTE_IDS } from './products.js';
 
 const NOT_YET = 'Fabric Stock’s own service has no plans yet. They are made there first (in its own window); until then every Fabric Stock company is on Standard.';
 
@@ -49,19 +49,19 @@ async function weightBlock() {
   });
 }
 
-async function fabricBlock() {
-  const base = Object.assign({}, PRODUCTS[1]);
-  const r = await fabricCall('GET', '/admin/api/plans');
+async function remoteBlock(id) {
+  const base = Object.assign({}, PRODUCTS.find((p) => p.id === id));
+  const r = await remoteCall(id, 'GET', '/admin/api/plans');
   if (r.status === 200 && Array.isArray(r.body.plans)) {
     return Object.assign(base, { ok: true, supported: true, features: r.body.features || [], plans: r.body.plans });
   }
   if (r.status === 404) return Object.assign(base, { ok: true, supported: false, message: NOT_YET, features: [], plans: [] });
-  return Object.assign(base, { ok: false, supported: false, error: r.body.error || 'FABRIC_DOWN', message: r.body.message || '', features: [], plans: [] });
+  return Object.assign(base, { ok: false, supported: false, error: r.body.error || id.toUpperCase() + '_DOWN', message: r.body.message || '', features: [], plans: [] });
 }
 
 export async function listPlans() {
-  const [weight, fabric] = await Promise.all([weightBlock(), fabricBlock()]);
-  return { software: [weight, fabric] };
+  const blocks = await Promise.all([weightBlock()].concat(REMOTE_IDS.map((id) => remoteBlock(id))));
+  return { software: blocks };
 }
 
 /* the plans written back: the owner's list, and Standard and Pro in the older matrix too (the phone console
@@ -139,7 +139,7 @@ async function weightAction(b) {
   return { httpStatus: 400, body: { error: 'Unknown action: ' + action } };
 }
 
-const FABRIC_PLAN_ACTIONS = new Set(['create', 'update', 'retire', 'restore', 'delete']);
+const REMOTE_PLAN_ACTIONS = new Set(['create', 'update', 'retire', 'restore', 'delete']);
 
 /** POST /admin/api/plans → { httpStatus, body } */
 export async function planAction(body) {
@@ -147,11 +147,11 @@ export async function planAction(body) {
   const software = String(b.software || 'weight');
   delete b.software;
   if (software === 'weight') return weightAction(b);
-  if (software === 'fabric') {
-    if (!FABRIC_PLAN_ACTIONS.has(String(b.action || ''))) return { httpStatus: 400, body: { error: 'Unknown action: ' + b.action } };
-    const r = await fabricCall('POST', '/admin/api/plans', b);
+  if (REMOTE_IDS.indexOf(software) >= 0) {
+    if (!REMOTE_PLAN_ACTIONS.has(String(b.action || ''))) return { httpStatus: 400, body: { error: 'Unknown action: ' + b.action } };
+    const r = await remoteCall(software, 'POST', '/admin/api/plans', b);
     if (r.status === 404) return { httpStatus: 501, body: { error: 'NOT_YET', message: NOT_YET } };
-    if (r.status === 200) await logEvent(null, 'ADMIN_PLAN_' + String(b.action).toUpperCase(), { software: 'fabric', code: b.code || b.name || null });
+    if (r.status === 200) await logEvent(null, 'ADMIN_PLAN_' + String(b.action).toUpperCase(), { software, code: b.code || b.name || null });
     return { httpStatus: r.status, body: r.body };
   }
   return { httpStatus: 400, body: { error: 'No such software: ' + software } };

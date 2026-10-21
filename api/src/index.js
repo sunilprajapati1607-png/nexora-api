@@ -34,7 +34,7 @@ import { listFeedback, feedbackShot, feedbackAction, publicFeedback, MAX_SHOT } 
 import { latestRelease, listReleases, releaseAction } from './appupdate.js';
 import { logoResponse } from './brand.js';
 import { customerCheck, sourcesOf } from './marketing.js';
-import { listProducts, fabricAction, consoleLinks } from './products.js';
+import { listProducts, remoteAction, REMOTE_IDS, consoleLinks } from './products.js';
 import { listPlans, planAction } from './softwareplans.js';
 import { listPayments, paymentAction } from './payments.js';
 
@@ -905,7 +905,11 @@ export default {
           /* 2026-10-07 (console) — every Nexora software in the one console (owner: "nexora console page single rahese badhi service
              tya thij update chalu bandh thase"): each keeps its own service and licence, products.js asks it */
           if (path === '/admin/api/products' && method === 'GET') return adminJson(await listProducts());
-          if (path === '/admin/api/fabric' && method === 'POST') { const out = await fabricAction(await readBody()); return adminJson(out.body, out.httpStatus); }
+          /* /admin/api/fabric, /admin/api/erp — the same call, one route per software (products.js) */
+          if (method === 'POST' && REMOTE_IDS.indexOf(path.slice('/admin/api/'.length)) >= 0) {
+            const out = await remoteAction(path.slice('/admin/api/'.length), await readBody());
+            return adminJson(out.body, out.httpStatus);
+          }
           /* 2026-10-08 — every software's plans, made by the owner (softwareplans.js) */
           if (path === '/admin/api/plans' && method === 'GET') return adminJson(await listPlans());
           if (path === '/admin/api/plans' && method === 'POST') { const out = await planAction(await readBody()); return adminJson(out.body, out.httpStatus); }
