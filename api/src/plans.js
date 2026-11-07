@@ -183,6 +183,8 @@ export function cleanPlanRow(p, was) {
     priceRenewal: keep('priceRenewal', money),
     usersIncluded: keep('usersIncluded', (v) => smallInt(v, 1, 500)),
     extraUserPrice: keep('extraUserPrice', money),
+    /* 2026-11-07 — how long one period of this plan runs (a payment by plan adds these days); none = 365 */
+    days: keep('days', (v) => smallInt(v, 1, 3660)),
     features: cleanFeatureRow(p.features && typeof p.features === 'object' ? Object.assign({}, w.features || {}, p.features) : w.features, def),
     active: p.active !== undefined ? p.active !== false : w.active !== false,
     sort: smallInt(p.sort, 0, 999) != null ? smallInt(p.sort, 0, 999) : (w.sort != null ? w.sort : 100),

@@ -182,7 +182,7 @@ export async function setRules(body, who) {
 
 /* ---- plans: Sales & Costing's from its service, the others' from theirs ---- */
 const NOT_YET = (id) => softwareOf(id).short + '’s own service has no plans yet. They are made there first (in its own window); until then every company is on Standard.';
-async function remotePlanBlock(id) {
+export async function remotePlanBlock(id) {
   const base = Object.assign({}, PRODUCTS.find((p) => p.id === id));
   const r = await softwareCall(id, 'GET', '/admin/api/plans');
   if (r.status === 200 && Array.isArray(r.body.plans)) return Object.assign(base, { ok: true, supported: true, features: r.body.features || [], plans: r.body.plans });

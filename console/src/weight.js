@@ -16,7 +16,7 @@ export async function weightCompanies(fresh) {
   if (r.status === 200 && Array.isArray(r.body.companies)) {
     out = { ok: true, companies: r.body.companies.filter((c) => !c.deleted_at).map((c) => ({
       id: String(c.id), name: c.name, gstin: c.gstin || '', plan: String(c.plan || 'PRO').toUpperCase(),
-      isDemo: c.is_demo === true, expiresAt: c.expires_at || null })) };
+      isDemo: c.is_demo === true, expiresAt: c.expires_at || null, seats: parseInt(c.seats, 10) || 1 })) };
   } else out = { ok: false, companies: [], error: r.body.error, message: r.body.message };
   companiesSeen = { at: Date.now(), out };
   return out;

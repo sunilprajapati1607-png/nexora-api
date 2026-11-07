@@ -77,7 +77,7 @@ async function savePlans(plans) {
 
 function diff(a, b) {
   const out = [];
-  ['name', 'note', 'priceFirst', 'priceRenewal', 'usersIncluded', 'extraUserPrice', 'active'].forEach((k) => {
+  ['name', 'note', 'priceFirst', 'priceRenewal', 'usersIncluded', 'extraUserPrice', 'days', 'active'].forEach((k) => {
     if ((a || {})[k] !== (b || {})[k]) out.push(k + ': ' + JSON.stringify((a || {})[k] === undefined ? null : a[k]) + ' → ' + JSON.stringify(b[k]));
   });
   PLAN_FEATURES.forEach((f) => {

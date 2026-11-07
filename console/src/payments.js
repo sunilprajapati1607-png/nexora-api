@@ -9,6 +9,7 @@
 import { q, logEvent } from './db.js';
 import { PRODUCTS, isRemote, softwareCall } from './software.js';
 import { weightCompanies, weightPlans, forgetWeight } from './weight.js';
+import { remotePlanBlock } from './products.js';
 
 const KINDS = ['NEW', 'RENEWAL', 'EXTRA_USERS', 'UPGRADE', 'OTHER'];
 const MODES = ['UPI', 'BANK', 'CASH', 'CHEQUE', 'CARD', 'OTHER'];
@@ -23,6 +24,7 @@ const isoDay = (v) => {
 };
 const istToday = () => new Date(Date.now() + IST).toISOString().slice(0, 10);
 const money = (v) => {
+  if (/-/.test(String(v == null ? '' : v))) return null;          /* a minus amount is never read as a plus one */
   const n = Number(String(v == null ? '' : v).replace(/[^\d.]/g, ''));
   return Number.isFinite(n) && n >= 0 && n <= 100000000 ? Math.round(n * 100) / 100 : null;
 };
@@ -102,9 +104,104 @@ async function customerOf(b) {
   return null;
 }
 
+/* ---- a payment BY PLAN (owner 2026-11-07: "when we can add payment as per plan so it can add days accordingly …
+   plan pn add krva jema ketla user, per extra user price") ----
+   The plan says how long one period runs (days, 365 when not set), its price for the first year and for a renewal,
+   how many users it includes and the price of each user beyond them. */
+const PLAN_DAYS = 365;
+async function planOf(software, code) {
+  const block = software === 'weight' ? await weightPlans(true) : await remotePlanBlock(software);
+  const plans = (block && block.plans) || [];
+  return { block, plan: plans.find((p) => String(p.code).toUpperCase() === String(code || '').toUpperCase()) || null, plans };
+}
+async function currentOf(b) {
+  if (b.software === 'weight') {
+    const w = await weightCompanies(true);
+    const co = w.companies.find((c) => c.id === String(parseInt(b.companyId, 10) || ''));
+    return co ? { plan: co.plan, seats: co.seats, isDemo: co.isDemo } : null;
+  }
+  const rid = parseInt(b.remoteId != null ? b.remoteId : b.fabricId, 10) || 0;
+  const r = await softwareCall(b.software, 'GET', '/admin/api/company?id=' + encodeURIComponent(rid));
+  return r.status === 200 && r.body && r.body.name ? { plan: String(r.body.plan || 'STANDARD').toUpperCase(), seats: parseInt(r.body.seats, 10) || 1, isDemo: r.body.state === 'DEMO' } : null;
+}
+
+/** What a payment by plan comes to — nothing is changed. */
+export async function quote(b) {
+  if (b.software !== 'weight' && !isRemote(b.software)) return { httpStatus: 400, body: { error: 'Which software is it for?' } };
+  const cur = await currentOf(b);
+  if (!cur) return { httpStatus: 404, body: { error: 'No such customer for that software.' } };
+  const { plan, plans } = await planOf(b.software, b.plan || cur.plan);
+  if (!plan) return { httpStatus: 404, body: { error: 'There is no plan ' + String(b.plan || cur.plan) + ' for this software.' + (plans.length ? '' : ' Make its plans under Software & plans first.') } };
+  const kind = KINDS.includes(String(b.kind)) ? String(b.kind) : (cur.isDemo ? 'NEW' : 'RENEWAL');
+  const users = Math.max(1, Math.min(500, parseInt(b.users, 10) || cur.seats || plan.usersIncluded || 1));
+  const periods = Math.max(1, Math.min(10, parseInt(b.periods, 10) || 1));
+  const included = plan.usersIncluded != null ? Number(plan.usersIncluded) : users;
+  const extraPrice = plan.extraUserPrice != null ? Number(plan.extraUserPrice) : null;
+  const one = plan.days != null ? Number(plan.days) : PLAN_DAYS;
+  let unitPrice, extraUsers, extraAmount, days, amount;
+  if (kind === 'EXTRA_USERS') {
+    /* more users on the period already paid: only the users beyond what the licence has now, no days */
+    extraUsers = Math.max(0, users - cur.seats);
+    unitPrice = 0; days = 0;
+    extraAmount = extraPrice != null ? extraUsers * extraPrice : null;
+    amount = extraAmount;
+  } else {
+    extraUsers = Math.max(0, users - included);
+    const first = plan.priceFirst != null ? Number(plan.priceFirst) : null, renew = plan.priceRenewal != null ? Number(plan.priceRenewal) : null;
+    unitPrice = kind === 'NEW' ? (first != null ? first : renew) : (renew != null ? renew : first);
+    extraAmount = extraUsers ? (extraPrice != null ? extraUsers * extraPrice : null) : 0;
+    days = one * periods;
+    amount = unitPrice != null && extraAmount != null ? Math.round((unitPrice + extraAmount) * periods * 100) / 100 : null;
+  }
+  const note = amount == null ? 'This plan has no price set for that — type the amount.' : null;
+  return { httpStatus: 200, body: { ok: true, software: b.software, kind, users, periods, extraUsers, unitPrice, extraUserPrice: extraPrice, extraAmount, days, amount, note,
+    currentPlan: cur.plan, currentSeats: cur.seats,
+    plan: { code: plan.code, name: plan.name, days: one, priceFirst: plan.priceFirst != null ? Number(plan.priceFirst) : null, priceRenewal: plan.priceRenewal != null ? Number(plan.priceRenewal) : null,
+      usersIncluded: plan.usersIncluded != null ? Number(plan.usersIncluded) : null, extraUserPrice: extraPrice } } };
+}
+
+/* the plan and the users the payment is for, set on the software's own service before its days are added */
+async function applyPlan(b, q) {
+  const warn = [];
+  const planChanged = q.plan.code !== q.currentPlan, usersChanged = q.users !== q.currentSeats;
+  if (!planChanged && !usersChanged) return warn;
+  if (b.software === 'weight') {
+    const id = Number(parseInt(b.companyId, 10));
+    if (planChanged) { const r = await softwareCall('weight', 'POST', '/admin/api/company', { id, action: 'plan', plan: q.plan.code }); if (r.status !== 200 || r.body.error) warn.push('the plan was not changed: ' + (r.body.message || r.body.error)); }
+    if (usersChanged) { const r = await softwareCall('weight', 'POST', '/admin/api/company', { id, action: 'seats', seats: q.users }); if (r.status !== 200 || r.body.error) warn.push('the users were not changed: ' + (r.body.message || r.body.error)); }
+    forgetWeight();
+  } else {
+    const body = { action: 'update', id: parseInt(b.remoteId != null ? b.remoteId : b.fabricId, 10) };
+    if (planChanged) body.plan = q.plan.code;
+    if (usersChanged) body.seats = q.users;
+    const r = await softwareCall(b.software, 'POST', '/admin/api/company', body);
+    if (r.status !== 200) warn.push('the plan and users were not changed: ' + (r.body.message || r.body.error || 'no answer'));
+  }
+  return warn;
+}
+
 export async function paymentAction(body, who) {
   const b = Object.assign({}, body || {});
   const action = String(b.action || '');
+  if (action === 'quote') return quote(b);
+  if (action === 'add' && b.byPlan) {
+    const qr = await quote(b);
+    if (qr.httpStatus !== 200) return qr;
+    const qq = qr.body;
+    const typed = b.amount !== undefined && b.amount !== null && String(b.amount).trim() !== '' ? money(b.amount) : null;
+    if (b.amount !== undefined && b.amount !== null && String(b.amount).trim() !== '' && (typed === null || typed <= 0)) return { httpStatus: 400, body: { error: 'Enter the amount received.' } };
+    const amount = typed != null ? typed : qq.amount;
+    if (amount == null || amount <= 0) return { httpStatus: 400, body: { error: qq.note || 'Enter the amount received.' } };
+    const warns = await applyPlan(b, qq);
+    const out = await paymentAction(Object.assign({}, b, { byPlan: false, amount, plan: qq.plan.code, planName: qq.plan.name, kind: qq.kind,
+      extendDays: qq.days > 0 ? qq.days : undefined,
+      note: b.note || (qq.plan.name + ' · ' + qq.users + ' user' + (qq.users === 1 ? '' : 's') + (qq.periods > 1 ? ' · ' + qq.periods + ' periods' : '') + (qq.extraUsers ? ' (' + qq.extraUsers + ' extra)' : '')) }), who);
+    if (out.httpStatus === 200) {
+      out.body.quote = qq;
+      if (warns.length) out.body.warning = [out.body.warning].concat(warns.map((w) => 'The payment is recorded, but ' + w)).filter(Boolean).join(' ');
+    }
+    return out;
+  }
   if (action === 'add') {
     if (b.software !== 'weight' && !isRemote(b.software)) return { httpStatus: 400, body: { error: 'Which software is it for?' } };
     const amount = money(b.amount);

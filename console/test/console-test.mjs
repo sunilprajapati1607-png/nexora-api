@@ -17,8 +17,8 @@ const seen = { weight: [], fabric: [], erp: [], consult: [] };
 const state = { weightDown: false };
 const W = {
   companies: [
-    { id: 1, name: 'Alpha Sacks', gstin: '24AAAAA0001A1Z1', plan: 'PRO', state: 'LICENSED', is_demo: false, expires_at: iso(100) },
-    { id: 2, name: 'Beta Bags', gstin: '27BBBBB0002B1Z2', plan: 'STANDARD', state: 'DEMO', is_demo: true, expires_at: iso(4) },
+    { id: 1, name: 'Alpha Sacks', gstin: '24AAAAA0001A1Z1', plan: 'PRO', state: 'LICENSED', is_demo: false, expires_at: iso(100), seats: 5 },
+    { id: 2, name: 'Beta Bags', gstin: '27BBBBB0002B1Z2', plan: 'STANDARD', state: 'DEMO', is_demo: true, expires_at: iso(4), seats: 2 },
     { id: 3, name: 'Gone Ltd', gstin: '24GGGGG0003G1Z3', plan: 'PRO', state: 'LICENSED', is_demo: false, expires_at: iso(50), deleted_at: iso(-1) }
   ],
   settings: { trialDays: 15, demoGraceDays: 0, signupsOpen: true, expiredMode: 'READONLY' },
@@ -48,13 +48,18 @@ function standIn(id) {
       const u = req.url;
       if (id === 'weight') {
         if (u === '/admin/api/licences') return send({ companies: W.companies, licences: [] });
-        if (u === '/admin/api/plans?software=weight') return send({ software: [{ id: 'weight', ok: true, supported: true, plans: [{ code: 'PRO', name: 'Pro' }, { code: 'STANDARD', name: 'Standard' }], features: [] }] });
+        if (u === '/admin/api/plans?software=weight') return send({ software: [{ id: 'weight', ok: true, supported: true, features: [], plans: [
+          { code: 'PRO', name: 'Pro', priceFirst: 25000, priceRenewal: 20000, usersIncluded: 5, extraUserPrice: 2000, days: 365 },
+          { code: 'STANDARD', name: 'Standard', priceFirst: 15000, priceRenewal: 12000, usersIncluded: 3, extraUserPrice: 1500, days: 180 },
+          { code: 'FREEBIE', name: 'Freebie', usersIncluded: 1 }] }] });
         if (u === '/admin/api/software-settings?software=weight') return send({ software: [{ id: 'weight', ok: true, settings: W.settings }] });
         if (u === '/admin/api/software-settings' && req.method === 'POST') { Object.assign(W.settings, body); delete W.settings.software; return send({ ok: true, id: 'weight', settings: W.settings }); }
         if (u.startsWith('/admin/api/events')) return send({ events: W.events });
         if (u === '/admin/api/company' && req.method === 'POST') {
           const c = W.companies.find((x) => x.id === body.id);
           if (!c) return send({ error: 'No such company.' }, 404);
+          if (body.action === 'plan') { c.plan = body.plan; return send({ ok: true }); }
+          if (body.action === 'seats') { c.seats = body.seats; return send({ ok: true }); }
           if (body.action === 'extend' || body.action === 'licence') { c.expires_at = new Date(new Date(c.expires_at).getTime() + body.days * day).toISOString(); c.is_demo = false; }
           return send({ ok: true, company: c });
         }
@@ -69,11 +74,11 @@ function standIn(id) {
       if (u === '/admin/api/company' && req.method === 'POST') {
         if (body.action === 'create') { const c = { id: 99, name: body.name, state: 'DEMO', expiresAt: iso(body.days || 7) }; S.companies.push(c); return send({ ok: true, company: c }); }
         const c = S.companies.find((x) => x.id === Number(body.id)); if (!c) return send({ error: 'No such company.' }, 404);
-        if (body.days) c.expiresAt = iso(body.days); if (body.state) c.state = body.state; if (body.action === 'suspend') c.state = 'SUSPENDED';
+        if (body.plan) c.plan = body.plan; if (body.seats) c.seats = body.seats; if (body.days) c.expiresAt = iso(body.days); if (body.state) c.state = body.state; if (body.action === 'suspend') c.state = 'SUSPENDED';
         return send({ ok: true, company: c });
       }
       if (u === '/admin/api/settings' && req.method === 'POST') { Object.assign(S.settings, body); return send({ ok: true, settings: Object.assign({ sessionMinutes: 30 }, S.settings) }); }
-      if (u === '/admin/api/plans') return id === 'consult' ? send({ error: 'No such console call.' }, 404) : send({ plans: [{ code: 'STANDARD', name: 'Standard' }], features: [] });
+      if (u === '/admin/api/plans') return id === 'consult' ? send({ error: 'No such console call.' }, 404) : send({ plans: [{ code: 'STANDARD', name: 'Standard', priceFirst: 10000, priceRenewal: 8000, usersIncluded: 2, extraUserPrice: 1000 }], features: [] });
       return send({ error: 'No such console call.' }, 404);
     });
   });
@@ -207,7 +212,47 @@ for (const [l, b] of [['0 days', { software: 'fabric', trialDays: 0 }], ['61 day
   r = await call('/admin/api/software-settings', { body: b }); ok('refused: ' + l, r.status === 400, r);
 }
 r = await call('/admin/api/plans');
-ok('plans: Sales & Costing from its own service, Consult says "no plans yet"', r.body.software.map((s) => s.id).join() === 'weight,fabric,erp,consult' && r.body.software[0].plans.length === 2 && r.body.software[3].supported === false, r.body.software.map((s) => s.id + ':' + s.supported));
+ok('plans: Sales & Costing from its own service, Consult says "no plans yet"', r.body.software.map((s) => s.id).join() === 'weight,fabric,erp,consult' && r.body.software[0].plans.length === 3 && r.body.software[3].supported === false, r.body.software.map((s) => s.id + ':' + s.supported));
+
+console.log('\nPAYMENT BY PLAN — users included, extra users, the plan\'s days');
+clear();
+const quote = (b) => call('/admin/api/payments', { body: Object.assign({ action: 'quote' }, b) });
+r = await quote({ software: 'weight', companyId: 1, users: 7 });
+ok('Alpha (Pro, renewal) 7 users: 5 included + 2 × ₹2,000 → ₹24,000 for 365 days', r.status === 200 && r.body.kind === 'RENEWAL' && r.body.extraUsers === 2 && r.body.amount === 24000 && r.body.days === 365, r.body);
+ok('…a quote changes nothing anywhere', !seen.weight.some((s) => s.method === 'POST'), seen.weight);
+r = await quote({ software: 'weight', companyId: 1, users: 7, periods: 2 });
+ok('two periods → ₹48,000 and 730 days', r.body.amount === 48000 && r.body.days === 730, r.body);
+r = await quote({ software: 'weight', companyId: 1, kind: 'NEW', users: 5 });
+ok('a new licence takes the first-year price: ₹25,000', r.body.amount === 25000 && r.body.unitPrice === 25000, r.body);
+r = await quote({ software: 'weight', companyId: 1, kind: 'EXTRA_USERS', users: 8 });
+ok('extra users only: 3 beyond the 5 it has × ₹2,000 = ₹6,000, no days', r.body.amount === 6000 && r.body.extraUsers === 3 && r.body.days === 0, r.body);
+r = await quote({ software: 'weight', companyId: 1, plan: 'STANDARD', users: 3 });
+ok('Standard runs 180 days, ₹12,000 renewal', r.body.days === 180 && r.body.amount === 12000, r.body);
+r = await quote({ software: 'weight', companyId: 1, plan: 'GOLD' });
+ok('a plan that does not exist → refused', r.status === 404, r);
+r = await quote({ software: 'weight', companyId: 1, plan: 'FREEBIE' });
+ok('a plan with no price → amount empty, "type the amount", 365 days', r.body.amount === null && /type the amount/.test(r.body.note) && r.body.days === 365, r.body);
+r = await call('/admin/api/payments', { body: { action: 'add', byPlan: true, software: 'weight', companyId: 1, plan: 'FREEBIE' } });
+ok('…and recording it with no amount is refused', r.status === 400, r);
+
+clear();
+const before1 = new Date(W.companies[0].expires_at).getTime();
+r = await call('/admin/api/payments', { body: { action: 'add', byPlan: true, software: 'weight', companyId: 1, plan: 'STANDARD', users: 4, mode: 'UPI' } });
+const posts = seen.weight.filter((s) => s.method === 'POST').map((s) => JSON.parse(s.body));
+ok('Alpha moves to Standard with 4 users: plan, then seats, then +180 days — on Sales & Costing', r.status === 200 && posts.map((p) => p.action).join() === 'plan,seats,extend' && posts[0].plan === 'STANDARD' && posts[1].seats === 4 && posts[2].days === 180, posts);
+ok('…₹12,000 + 1 extra × ₹1,500 = ₹13,500 recorded, plan Standard', r.body.payment.amount === 13500 && r.body.payment.plan === 'STANDARD' && r.body.payment.planName === 'Standard', r.body.payment);
+ok('…the licence really runs 180 days longer', Math.round((new Date(W.companies[0].expires_at).getTime() - before1) / day) === 180, W.companies[0]);
+ok('…and the payment says what it was for', /Standard · 4 users \(1 extra\)/.test(r.body.payment.note), r.body.payment.note);
+r = await call('/admin/api/payments', { body: { action: 'add', byPlan: true, software: 'weight', companyId: 1, plan: 'STANDARD', users: 4, amount: 13000 } });
+ok('an amount typed by hand (a discount) is kept instead of the quote', r.status === 200 && r.body.payment.amount === 13000, r.body);
+r = await call('/admin/api/payments', { body: { action: 'add', byPlan: true, software: 'weight', companyId: 1, amount: '-5' } });
+ok('a minus amount is refused', r.status === 400, r);
+
+clear();
+r = await call('/admin/api/payments', { body: { action: 'add', byPlan: true, software: 'fabric', remoteId: 11, users: 3 } });
+const fposts = seen.fabric.filter((s) => s.method === 'POST').map((s) => JSON.parse(s.body));
+ok('Fabric by plan: users 3 set first, then 365 days (its plan has no days → 365) — with Fabric\'s key', r.status === 200 && fposts[0].seats === 3 && fposts[0].days === undefined && fposts[1].days >= 365 && seen.fabric.every((s) => s.key === KEYS.fabric), fposts);
+ok('…₹8,000 + 1 extra × ₹1,000 = ₹9,000', r.body.payment.amount === 9000, r.body.payment);
 
 console.log('\nTHE ACTIVITY LIST');
 r = await call('/admin/api/events?limit=50');
