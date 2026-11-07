@@ -59,8 +59,9 @@ async function remoteBlock(id) {
   return Object.assign(base, { ok: false, supported: false, error: r.body.error || id.toUpperCase() + '_DOWN', message: r.body.message || '', features: [], plans: [] });
 }
 
-export async function listPlans() {
-  const blocks = await Promise.all([weightBlock()].concat(REMOTE_IDS.map((id) => remoteBlock(id))));
+/* ?software=weight → Sales & Costing's block only (the separate console service asks the others itself) */
+export async function listPlans(only) {
+  const blocks = await Promise.all([weightBlock()].concat(only === 'weight' ? [] : REMOTE_IDS.map((id) => remoteBlock(id))));
   return { software: blocks };
 }
 

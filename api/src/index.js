@@ -914,7 +914,8 @@ export default {
           /* 2026-11-07 — each software's OWN demo rules (demo days, offline days, seats, sign-ups, when a licence ends),
              read from and changed on that software's own service; Sales & Costing's are this service's settings */
           if (path === '/admin/api/software-settings' && method === 'GET') {
-            const remotes = await Promise.all(REMOTE_IDS.map((id) => remoteSettings(id)));
+            /* ?software=weight — Sales & Costing's own only (what the separate console service asks for) */
+            const remotes = url.searchParams.get('software') === 'weight' ? [] : await Promise.all(REMOTE_IDS.map((id) => remoteSettings(id)));
             return adminJson({ software: [{ id: 'weight', ok: true, settings: pickDemo(await weightSettings()) }].concat(remotes) });
           }
           if (path === '/admin/api/software-settings' && method === 'POST') {
@@ -934,7 +935,7 @@ export default {
             return adminJson(out.body, out.httpStatus);
           }
           /* 2026-10-08 — every software's plans, made by the owner (softwareplans.js) */
-          if (path === '/admin/api/plans' && method === 'GET') return adminJson(await listPlans());
+          if (path === '/admin/api/plans' && method === 'GET') return adminJson(await listPlans(url.searchParams.get('software')));
           if (path === '/admin/api/plans' && method === 'POST') { const out = await planAction(await readBody()); return adminJson(out.body, out.httpStatus); }
           /* 2026-10-08 — what each customer paid, and the validity it bought (payments.js) */
           if (path === '/admin/api/payments' && method === 'GET') return adminJson(await listPayments(Object.fromEntries(url.searchParams)));

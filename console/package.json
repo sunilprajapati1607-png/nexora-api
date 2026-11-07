@@ -1,0 +1,13 @@
+{
+  "name": "nexora-console-api",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Nexora Console — one console for every Nexora software, each reached with its own key",
+  "main": "server.js",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test/console-test.mjs"
+  }
+}
