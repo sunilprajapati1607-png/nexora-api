@@ -26,6 +26,11 @@
  * here (FABRIC_STOCK_ADMIN_KEY, MSME_ERP_ADMIN_KEY) overrides it, should any
  * two ever need to differ.
  *
+ *   consult Nexora Consult — nexora-consult-api (2026-11-07, owner: "Yes, add
+ *           them"). Its console API refuses any key shorter than 16 characters,
+ *           so it is reached with its OWN key: NEXORA_CONSULT_ADMIN_KEY here =
+ *           CONSULT_ADMIN_KEY there (falls back to the console key).
+ *
  * They all speak the same console API — /admin/api/companies, /company,
  * /device, /events — so this file is a table and one set of calls, not one
  * set per software. Jobwork has no licence yet (owner: "હમણાં બહાર રાખો")
@@ -36,7 +41,8 @@ import { q, logEvent } from './db.js';
 export const PRODUCTS = [
   { id: 'weight', name: 'Nexora Bag Weight Calculation', short: 'Sales & Costing' },
   { id: 'fabric', name: 'Nexora Loom & Fabric Stock', short: 'Fabric Stock' },
-  { id: 'erp', name: 'Nexora MSME ERP', short: 'MSME ERP' }
+  { id: 'erp', name: 'Nexora MSME ERP', short: 'MSME ERP' },
+  { id: 'consult', name: 'Nexora Consult', short: 'Nexora Consult' }
 ];
 
 /* Everything that differs between one remote software and the next. */
@@ -54,6 +60,15 @@ const REMOTE = {
     remoteKey: 'ERP_ADMIN_KEY',
     urlEnv: 'MSME_ERP_URL', defaultUrl: 'https://nexora-msme-erp-api.onrender.com',
     waitEnv: 'MSME_ERP_WAIT_MS', keyEnv: 'MSME_ERP_ADMIN_KEY'
+  },
+  consult: {
+    short: 'Nexora Consult',
+    service: 'nexora-consult-api',
+    remoteKey: 'CONSULT_ADMIN_KEY',
+    urlEnv: 'NEXORA_CONSULT_URL', defaultUrl: 'https://nexora-consult-api.onrender.com',
+    waitEnv: 'NEXORA_CONSULT_WAIT_MS', keyEnv: 'NEXORA_CONSULT_ADMIN_KEY',
+    /* Consult refuses a key under 16 characters, so it has a key of its own, not the console key */
+    keyHelp: 'On Render, copy CONSULT_ADMIN_KEY from nexora-consult-api → Environment and add it to nexora-api as NEXORA_CONSULT_ADMIN_KEY, then try again.'
   }
 };
 
@@ -69,8 +84,8 @@ const keyOf = (id) => process.env[REMOTE[id].keyEnv] || process.env.NEXORA_ADMIN
    per-software (FABRIC_KEY, ERP_DOWN …) so a page that already knows one keeps working. */
 const notConnected = (id) => ({
   error: id.toUpperCase() + '_KEY',
-  message: REMOTE[id].short + ' did not accept the console key. On Render, open ' + REMOTE[id].service +
-    ' → Environment and set ' + REMOTE[id].remoteKey + ' to the same key as this console, then try again.'
+  message: REMOTE[id].short + ' did not accept the console key. ' + (REMOTE[id].keyHelp || 'On Render, open ' + REMOTE[id].service +
+    ' → Environment and set ' + REMOTE[id].remoteKey + ' to the same key as this console, then try again.')
 });
 const asleep = (id) => ({
   error: id.toUpperCase() + '_DOWN',
@@ -256,3 +271,58 @@ export async function remoteAction(id, body) {
 
 /** POST /admin/api/fabric by its old name. */
 export const fabricAction = (body) => remoteAction('fabric', body);
+
+/* ---- each software's demo rules (2026-11-07, owner: "darek na subscription demo days badhu seperate rahese") ----
+   Every software keeps its OWN demo length, offline days for a demo, demo seats, sign-ups and what happens when a
+   licence ends, on its own service. The console reads them there and changes them there, one software at a time;
+   nothing is copied here. A remote's settings are read by POSTing nothing to its /admin/api/settings, which
+   answers with what it has (and notes an empty CONSOLE_SETTINGS in its own log). */
+const DEMO_FIELDS = ['trialDays', 'demoGraceDays', 'demoSeats', 'signupsOpen', 'expiredMode'];
+const pickDemo = (s) => {
+  const o = {};
+  DEMO_FIELDS.forEach((k) => { if (s && s[k] !== undefined) o[k] = s[k]; });
+  return o;
+};
+export { pickDemo, DEMO_FIELDS };
+
+/** One remote software's demo rules: { id, ok, settings } or { id, ok:false, error, message }. */
+export async function remoteSettings(id) {
+  if (!isRemote(id)) return { id, ok: false, error: 'NO_SUCH', message: 'No such software: ' + id };
+  const r = await remoteCall(id, 'POST', '/admin/api/settings', {});
+  if (r.status === 200 && r.body && r.body.settings) return { id, ok: true, settings: pickDemo(r.body.settings) };
+  return { id, ok: false, error: (r.body && r.body.error) || id.toUpperCase() + '_DOWN', message: (r.body && r.body.message) || asleep(id).message };
+}
+
+/** Change one remote software's demo rules. Only the demo fields travel; each is checked here first. */
+export async function setRemoteSettings(id, body) {
+  if (!isRemote(id)) return { httpStatus: 400, body: { error: 'No such software: ' + id } };
+  const b = body || {}, out = {};
+  if (b.trialDays !== undefined) {
+    const n = parseInt(b.trialDays, 10);
+    if (!(n >= 1 && n <= 60)) return { httpStatus: 400, body: { error: 'Demo days must be 1 to 60.' } };
+    out.trialDays = n;
+  }
+  if (b.demoGraceDays !== undefined) {
+    const n = parseInt(b.demoGraceDays, 10);
+    if (!(n >= 0 && n <= 30)) return { httpStatus: 400, body: { error: 'Offline days for a demo must be 0 to 30.' } };
+    out.demoGraceDays = n;
+  }
+  if (b.demoSeats !== undefined) {
+    const n = parseInt(b.demoSeats, 10);
+    if (!(n >= 1 && n <= 50)) return { httpStatus: 400, body: { error: 'Demo seats must be 1 to 50.' } };
+    out.demoSeats = n;
+  }
+  if (b.signupsOpen !== undefined) out.signupsOpen = b.signupsOpen === true || b.signupsOpen === 'yes';
+  if (b.expiredMode !== undefined) {
+    if (b.expiredMode !== 'READONLY' && b.expiredMode !== 'HARDSTOP') return { httpStatus: 400, body: { error: 'When a licence ends: READONLY or HARDSTOP.' } };
+    out.expiredMode = b.expiredMode;
+  }
+  if (!Object.keys(out).length) return { httpStatus: 400, body: { error: 'Nothing to change.' } };
+  const before = await remoteSettings(id);
+  const r = await remoteCall(id, 'POST', '/admin/api/settings', out);
+  if (r.status !== 200 || !r.body || !r.body.settings) return { httpStatus: r.status === 200 ? 502 : r.status, body: r.body };
+  const after = pickDemo(r.body.settings), was = {}, now = {};
+  Object.keys(out).forEach((k) => { if (!before.ok || before.settings[k] !== after[k]) { was[k] = before.ok ? before.settings[k] : null; now[k] = after[k]; } });
+  if (Object.keys(now).length) await logEvent(null, 'ADMIN_' + id.toUpperCase() + '_SETTINGS', { was, now });
+  return { httpStatus: 200, body: { ok: true, id, settings: after } };
+}

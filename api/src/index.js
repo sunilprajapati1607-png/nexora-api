@@ -34,7 +34,8 @@ import { listFeedback, feedbackShot, feedbackAction, publicFeedback, MAX_SHOT } 
 import { latestRelease, listReleases, releaseAction } from './appupdate.js';
 import { logoResponse } from './brand.js';
 import { customerCheck, sourcesOf } from './marketing.js';
-import { listProducts, remoteAction, REMOTE_IDS, consoleLinks } from './products.js';
+import { listProducts, remoteAction, REMOTE_IDS, consoleLinks, remoteSettings, setRemoteSettings, pickDemo } from './products.js';
+import { getSettings as weightSettings } from './db.js';
 import { listPlans, planAction } from './softwareplans.js';
 import { listPayments, paymentAction } from './payments.js';
 
@@ -908,6 +909,28 @@ export default {
           /* /admin/api/fabric, /admin/api/erp — the same call, one route per software (products.js) */
           if (method === 'POST' && REMOTE_IDS.indexOf(path.slice('/admin/api/'.length)) >= 0) {
             const out = await remoteAction(path.slice('/admin/api/'.length), await readBody());
+            return adminJson(out.body, out.httpStatus);
+          }
+          /* 2026-11-07 — each software's OWN demo rules (demo days, offline days, seats, sign-ups, when a licence ends),
+             read from and changed on that software's own service; Sales & Costing's are this service's settings */
+          if (path === '/admin/api/software-settings' && method === 'GET') {
+            const remotes = await Promise.all(REMOTE_IDS.map((id) => remoteSettings(id)));
+            return adminJson({ software: [{ id: 'weight', ok: true, settings: pickDemo(await weightSettings()) }].concat(remotes) });
+          }
+          if (path === '/admin/api/software-settings' && method === 'POST') {
+            const b = await readBody() || {};
+            if (b.software === 'weight') {
+              if (b.trialDays !== undefined && !(parseInt(b.trialDays, 10) >= 1 && parseInt(b.trialDays, 10) <= 365)) return adminJson({ error: 'Demo days must be 1 to 365.' }, 400);
+              if (b.demoGraceDays !== undefined && !(parseInt(b.demoGraceDays, 10) >= 0 && parseInt(b.demoGraceDays, 10) <= 365)) return adminJson({ error: 'Offline days for a demo must be 0 to 365.' }, 400);
+              if (b.expiredMode !== undefined && b.expiredMode !== 'READONLY' && b.expiredMode !== 'HARDSTOP') return adminJson({ error: 'When a licence ends: READONLY or HARDSTOP.' }, 400);
+              const s = {};
+              ['trialDays', 'demoGraceDays', 'expiredMode'].forEach((k) => { if (b[k] !== undefined) s[k] = b[k]; });
+              if (b.signupsOpen !== undefined) s.signupsOpen = b.signupsOpen === true || b.signupsOpen === 'yes';
+              if (!Object.keys(s).length) return adminJson({ error: 'Nothing to change.' }, 400);
+              await saveSettings(s);
+              return adminJson({ ok: true, id: 'weight', settings: pickDemo(await weightSettings()) });
+            }
+            const out = await setRemoteSettings(String(b.software || ''), b);
             return adminJson(out.body, out.httpStatus);
           }
           /* 2026-10-08 — every software's plans, made by the owner (softwareplans.js) */
