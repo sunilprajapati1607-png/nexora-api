@@ -17,6 +17,7 @@ import { ensureSchema, q, logEvent } from './db.js';
 import { softwareCall } from './software.js';
 import { listProducts, remoteAction, consoleLinks, listRules, setRules, listPlans, planAction } from './products.js';
 import { listPayments, paymentAction } from './payments.js';
+import { getSettings as invoiceSettings, saveSettings as saveInvoiceSettings, listInvoices, invoiceAction } from './invoices.js';
 import { REMOTE_IDS } from './software.js';
 import { timingSafeEqual, createHash } from 'node:crypto';
 
@@ -133,6 +134,10 @@ export default {
       if (path === '/admin/api/plans' && method === 'POST') { const b = await readJson(request); const o = await own(() => planAction(b, who)); return json(o.body, o.httpStatus); }
       if (path === '/admin/api/payments' && method === 'GET') return json(await own(() => listPayments(Object.fromEntries(url.searchParams.entries()))));
       if (path === '/admin/api/payments' && method === 'POST') { const b = await readJson(request); const o = await own(() => paymentAction(b, who)); return json(o.body, o.httpStatus); }
+      if (path === '/admin/api/invoice-settings' && method === 'GET') return json(await own(invoiceSettings));
+      if (path === '/admin/api/invoice-settings' && method === 'POST') { const b = await readJson(request); const o = await own(() => saveInvoiceSettings(b, who)); return json(o.body, o.httpStatus); }
+      if (path === '/admin/api/invoices' && method === 'GET') return json(await own(() => listInvoices(Object.fromEntries(url.searchParams.entries()))));
+      if (path === '/admin/api/invoices' && method === 'POST') { const b = await readJson(request); const o = await own(() => invoiceAction(b, who)); return json(o.body, o.httpStatus); }
       if (path === '/admin/api/events' && method === 'GET') { await ensureSchema().catch(() => {}); return events(request, url); }
       /* Sales & Costing's own console calls */
       return passOn(request, path, url.search);

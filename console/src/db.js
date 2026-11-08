@@ -50,8 +50,19 @@ export function ensureSchema() {
         detail  JSONB
       )`);
       await q(`CREATE INDEX IF NOT EXISTS console_events_at ON console.events (at DESC)`);
+      /* 2026-11-08 — invoices: the seller's settings, the numbers per series and year, the invoices themselves */
+      await q(`CREATE TABLE IF NOT EXISTS console.settings (key TEXT PRIMARY KEY, value JSONB NOT NULL, changed_at TIMESTAMPTZ NOT NULL DEFAULT now())`);
+      await q(`CREATE TABLE IF NOT EXISTS console.invoice_counters (series TEXT NOT NULL, fy TEXT NOT NULL, last INTEGER NOT NULL, PRIMARY KEY (series, fy))`);
+      await q(`CREATE TABLE IF NOT EXISTS console.invoices (
+        id BIGSERIAL PRIMARY KEY, number TEXT NOT NULL UNIQUE, series TEXT NOT NULL, kind TEXT NOT NULL, gst BOOLEAN NOT NULL, fy TEXT NOT NULL, seq INTEGER NOT NULL,
+        day DATE NOT NULL, payment_id BIGINT, software TEXT NOT NULL, company_id BIGINT, remote_id TEXT,
+        seller JSONB NOT NULL, customer JSONB NOT NULL, lines JSONB NOT NULL, inclusive BOOLEAN NOT NULL,
+        taxable NUMERIC(14,2) NOT NULL, cgst_rate NUMERIC(5,2), cgst NUMERIC(14,2), sgst_rate NUMERIC(5,2), sgst NUMERIC(14,2), igst_rate NUMERIC(5,2), igst NUMERIC(14,2),
+        round_off NUMERIC(6,2) NOT NULL DEFAULT 0, total NUMERIC(14,2) NOT NULL, total_words TEXT, intra BOOLEAN, place TEXT, notes TEXT,
+        via TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), cancelled_at TIMESTAMPTZ, cancel_reason TEXT)`);
+      await q(`CREATE INDEX IF NOT EXISTS console_invoices_payment ON console.invoices (payment_id)`);
       /* Supabase: nobody but this service reaches these through the public API */
-      for (const t of ['product_links', 'customer_payments', 'events']) {
+      for (const t of ['product_links', 'customer_payments', 'events', 'settings', 'invoice_counters', 'invoices']) {
         try { await q(`ALTER TABLE console.${t} ENABLE ROW LEVEL SECURITY`); } catch (e) { /* not Supabase */ }
       }
     })().catch((e) => { ready = null; throw e; });
