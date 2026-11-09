@@ -36,5 +36,12 @@ export const server = createServer(async (req, res) => {
 
 if (process.argv[1] && process.argv[1].endsWith('server.js')) {
   server.listen(PORT, () => console.log('[console] listening on ' + PORT));
+  /* 2026-11-09 — the console woke, so someone is opening it: wake every software at once (free services sleep
+     after 15 idle minutes), instead of each waking only when its turn comes. Nothing is read, no key is sent. */
+  import('./src/software.js').then(({ SOFTWARE, urlOf }) => SOFTWARE.forEach((s) => {
+    const t = Date.now();
+    fetch(urlOf(s.id) + '/health', { signal: AbortSignal.timeout(90000) })
+      .then((r) => console.log('[console] woke ' + s.id + ' ' + r.status + ' in ' + Math.round((Date.now() - t) / 1000) + ' s'), () => console.log('[console] ' + s.id + ' did not answer'));
+  }), () => {});
   if (process.env.DATABASE_URL) ensureSchema().then(() => console.log('[console] schema ready'), (e) => console.error('[console] schema', e.message));
 }
