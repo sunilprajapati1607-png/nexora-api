@@ -31,6 +31,7 @@ export const urlOf = (id) => String(process.env[softwareOf(id).urlEnv] || softwa
 export const keyOf = (id) => String(process.env[softwareOf(id).keyEnv] || '');
 /* a free Render service that has gone to sleep takes up to about a minute to wake */
 const waitOf = (id) => Math.max(1500, parseInt(process.env[id.toUpperCase() + '_WAIT_MS'], 10) || 55000);
+const RETRY_MS = 4000;
 
 export const notConnected = (id) => {
   const s = softwareOf(id);
@@ -52,6 +53,7 @@ export async function softwareCall(id, method, path, body, opts) {
   const key = keyOf(id);
   if (!key) return { status: 502, body: notConnected(id) };
   const ctl = new AbortController();
+  const until = Date.now() + (o.wait || waitOf(id));
   const timer = setTimeout(() => ctl.abort(), o.wait || waitOf(id));
   try {
     const headers = Object.assign({ 'x-admin-key': key, accept: 'application/json' }, o.headers || {});
@@ -60,7 +62,19 @@ export async function softwareCall(id, method, path, body, opts) {
       if (typeof body === 'string' || body instanceof Uint8Array) payload = body;
       else { payload = JSON.stringify(body); headers['content-type'] = 'application/json'; }
     }
-    const r = await fetch(urlOf(id) + path, { method, headers, body: payload, signal: ctl.signal, redirect: 'manual' });
+    /* 2026-11-09 — A FREE SERVICE THAT IS ASLEEP. While Render wakes it, its front door answers 429 / 502 / 503 /
+       504 by itself (not JSON — the request never reached the service). Those are asked again every few seconds
+       until the service answers or the wait runs out; a POST is safe to repeat because it never arrived. An
+       answer from the service itself (JSON, e.g. its own TOO_MANY) is never repeated. */
+    let r;
+    for (let n = 0; ; n++) {
+      r = await fetch(urlOf(id) + path, { method, headers, body: payload, signal: ctl.signal, redirect: 'manual' });
+      const waking = [429, 502, 503, 504].includes(r.status) && !/json/i.test(r.headers.get('content-type') || '');
+      const pause = Math.min(RETRY_MS, 500 * (n + 1));
+      if (!waking || Date.now() + pause > until) break;
+      try { await r.arrayBuffer(); } catch (e) { /* drained */ }
+      await new Promise((ok) => setTimeout(ok, pause));
+    }
     if (o.raw) return { status: r.status, response: r };
     let out = null;
     try { out = await r.json(); } catch (e) { out = null; }

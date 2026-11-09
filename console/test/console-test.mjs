@@ -14,7 +14,7 @@ const KEYS = { weight: 'weight-own-key', fabric: 'fabric-own-key-xyz', erp: 'erp
 
 const day = 86400000, iso = (n) => new Date(Date.now() + n * day).toISOString();
 const seen = { weight: [], fabric: [], erp: [], consult: [] };
-const state = { weightDown: false };
+const state = { weightDown: false, sleepy: 0, erpSleepy: 0 };
 const W = {
   companies: [
     { id: 1, name: 'Alpha Sacks', gstin: '24AAAAA0001A1Z1', plan: 'PRO', state: 'LICENSED', is_demo: false, expires_at: iso(100), seats: 5 },
@@ -41,6 +41,7 @@ function standIn(id) {
       const send = (o, s, type) => { res.writeHead(s || 200, { 'content-type': type || 'application/json' }); res.end(type ? o : JSON.stringify(o)); };
       seen[id].push({ method: req.method, url: req.url, key: req.headers['x-admin-key'], body: raw, console: req.headers['x-console'] });
       if (id === 'weight' && state.weightDown) { req.socket.destroy(); return; }
+      if ((id === 'weight' && state.sleepy > 0) || (id === 'erp' && state.erpSleepy > 0)) { if (id === 'weight') state.sleepy--; else state.erpSleepy--; res.writeHead(429, { 'content-type': 'text/plain' }); res.end('Too Many Requests'); return; }
       if (id === 'weight' && req.url === '/admin') return send('<html>Enter the admin key (NEXORA_ADMIN_KEY on the service).</html>', 200, 'text/html; charset=utf-8');
       if (id === 'weight' && req.url === '/logo.png') return send('PNG', 200, 'image/png');
       if (req.headers['x-admin-key'] !== KEYS[id]) return send({ error: 'Not allowed.' }, 403);
@@ -162,6 +163,18 @@ state.weightDown = true;
 r = await call('/admin/api/inquiries');
 ok('Sales & Costing asleep → 502 WEIGHT_DOWN in plain words, no crash', r.status === 502 && r.body.error === 'WEIGHT_DOWN', r);
 state.weightDown = false;
+
+console.log('\nA SLEEPING SERVICE IS WAITED FOR');
+clear(); state.sleepy = 2;
+r = await call('/admin/api/inquiries');
+ok('Render\'s 429 while Sales & Costing wakes → asked again, then its answer', r.status === 200 && r.body.inquiries && seen.weight.length === 3, [r.status, seen.weight.length]);
+clear(); state.erpSleepy = 2;
+r = await call('/admin/api/products');
+ok('…the same for ERP inside the products list', r.body.products.find((p) => p.id === 'erp').ok === true, r.body.products[2]);
+clear();
+r = await call('/admin/api/erp', { body: { action: 'suspend', id: 21 } });
+ok('an answer from the service itself is never repeated (one POST)', seen.erp.filter((s) => s.method === 'POST').length === 1, seen.erp.length);
+R.erp.companies[0].state = 'DEMO';
 
 console.log('\nACTIONS AND LINKS');
 clear();
