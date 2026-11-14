@@ -175,6 +175,9 @@ clear();
 r = await call('/admin/api/erp', { body: { action: 'suspend', id: 21 } });
 ok('an answer from the service itself is never repeated (one POST)', seen.erp.filter((s) => s.method === 'POST').length === 1, seen.erp.length);
 R.erp.companies[0].state = 'DEMO';
+clear();
+r = await call('/admin/api/products?software=erp');
+ok('…after a change to ERP only ERP is read again (?software=erp): Sales & Costing + ERP, no Fabric or Consult call', r.status === 200 && r.body.products.map((p) => p.id).join() === 'weight,erp' && seen.erp.length === 1 && !seen.fabric.length && !seen.consult.length, [r.body.products && r.body.products.map((p) => p.id), allSeen()]);
 
 console.log('\nACTIONS AND LINKS');
 clear();

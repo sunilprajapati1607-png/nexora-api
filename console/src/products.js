@@ -52,10 +52,12 @@ async function remoteProduct(id, ours, known) {
 }
 
 /** GET /admin/api/products */
-export async function listProducts() {
+/* only = one software: after a change to it the consoles read only that one again (2026-11-14 — faster) */
+export async function listProducts(only) {
   const w = await weightCompanies();
   const known = new Set(w.companies.map((c) => c.id));
-  const remotes = await Promise.all(REMOTE_IDS.map((id) => remoteProduct(id, w.companies, known)));
+  const ids = only && REMOTE_IDS.includes(only) ? [only] : REMOTE_IDS;
+  const remotes = await Promise.all(ids.map((id) => remoteProduct(id, w.companies, known)));
   const weight = Object.assign({}, PRODUCTS[0], w.ok ? { ok: true } : { ok: false, error: w.error || 'WEIGHT_DOWN', message: w.message || asleep('weight').message });
   return { products: [weight].concat(remotes) };
 }

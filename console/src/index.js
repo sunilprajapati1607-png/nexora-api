@@ -122,7 +122,7 @@ export default {
       const who = caller(request).app;
       const own = async (fn) => { await ensureSchema(); return fn(); };
 
-      if (path === '/admin/api/products' && method === 'GET') return json(await own(listProducts));
+      if (path === '/admin/api/products' && method === 'GET') return json(await own(() => listProducts(url.searchParams.get('software'))));
       if (method === 'POST' && REMOTE_IDS.indexOf(path.slice('/admin/api/'.length)) >= 0) {
         const b = await readJson(request);
         const o = await own(() => remoteAction(path.slice('/admin/api/'.length), b, who));
